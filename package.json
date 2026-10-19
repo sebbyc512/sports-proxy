@@ -1,0 +1,14 @@
+{
+  "name": "sports-proxy",
+  "version": "0.1.0",
+  "description": "Public HTTPS proxy for ESPN + DraftKings odds data, so cloud-run Parlay Desk routines can reach it via WebFetch. The real ODDS_API_KEY lives only here, server-side.",
+  "type": "module",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.3.0"
+  }
+}
