@@ -308,6 +308,97 @@ app.get("/internal/telegram/chats", async (req, res) => {
   }
 });
 
+// --- Telegram alerting, ported from production (Phase 2, item 1) ---
+// Captions ported verbatim from MAIN's real tgConfig/captions doc (read via ArtifactData
+// 2026-10-21). Timing/dedup logic ported from the real "Friends Desk · requests, new bets &
+// Telegram" task prompt (handbooks/friends-desk-tasks.md). Slip-picture rendering (Playwright)
+// is NOT ported yet -- it needs Chromium on Render, which this host doesn't have and which may
+// not fit the current 512MB plan; falls back to the plain-text caption, same as production's
+// own documented fallback behavior when rendering/sendPhoto fails. Scoped to desk "uat" only.
+const TELEGRAM_CAPTIONS = {
+  placed: "{emoji} {name} placed a bet",
+  won: "🎉💰 THIS BET HAS CASHED! 💰🎉\n{emoji} {name} hits it! 🔥🍾🙌",
+  cashout: "💵 BET CASHED 💵",
+  lost: "❌ {name}'s bet LOST · {odds}",
+  push: "↩️ {name}'s bet PUSHED · {odds}",
+  livePrefix: "🔴 IN LIVE 🔴\n",
+};
+const TELEGRAM_PERSON_EMOJI = { main: "🏈", steve: "🏀", lela: "⚽️" };
+
+function buildTelegramCaption({ kind, person, odds, live, lowConfidenceLegs }) {
+  const template = TELEGRAM_CAPTIONS[kind];
+  if (!template) throw new Error(`Unknown alert kind "${kind}" -- expected placed/won/cashout/lost/push.`);
+  const name = person === "main" ? "Seb" : person.charAt(0).toUpperCase() + person.slice(1);
+  const emoji = TELEGRAM_PERSON_EMOJI[person] || "";
+  let text = template.replace(/\{name\}/g, name).replace(/\{odds\}/g, odds || "").replace(/\{emoji\}/g, emoji);
+  if (live) text = TELEGRAM_CAPTIONS.livePrefix + text;
+  for (const leg of lowConfidenceLegs || []) {
+    text += `\n⚠️ *the ${leg} leg is at or under the confidence level*`;
+  }
+  return text;
+}
+
+// WAIT FOR FINALS: LOST/PUSH only send once every game on the bet is over (last game start +
+// 4h), unless Seb graded it himself (gradedBy "seb"), which sends immediately. WON/CASHOUT/
+// PLACED always send immediately -- there's no loss being prematurely announced in those cases.
+function telegramShouldSendNow({ kind, gradedBy, lastGameStart }) {
+  if (kind !== "lost" && kind !== "push") return { ok: true };
+  if (gradedBy === "seb") return { ok: true };
+  if (!lastGameStart) return { ok: true }; // no game-start info to wait on -- don't block forever
+  const readyAt = new Date(lastGameStart).getTime() + 4 * 60 * 60 * 1000;
+  if (Date.now() >= readyAt) return { ok: true };
+  return { ok: false, reason: "waiting_for_finals", readyAt: new Date(readyAt).toISOString() };
+}
+
+// Dedup: claims the alert (desk/tgAlerts/<entryId>:<kind>) before sending. Unlike upsertDoc,
+// this is insert-only (ignore-duplicates) so a second claim attempt fails harmlessly instead of
+// overwriting -- same "first writer wins" semantics as production's MAIN tgAlerts doc.
+async function claimTelegramAlert(deskId, alertId) {
+  const res = await supabaseFetch(`/docs?on_conflict=desk_id,collection,doc_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=ignore-duplicates,return=representation" },
+    body: JSON.stringify([
+      { desk_id: deskId, collection: "tgAlerts", doc_id: alertId, data: { sentAt: new Date().toISOString() } },
+    ]),
+  });
+  const rows = await res.json();
+  return rows.length > 0; // true = we claimed it; false = already claimed by an earlier call
+}
+
+// desk (query param, dedup scope) is UAT-only for now, same discipline as the grader/write
+// endpoints -- this is Part C/Part E test wiring, not production alerting (that's still the
+// real Friends/Sebas Desk tasks until Part F cutover). person (body) is who the alert is
+// ABOUT (main/steve/lela, for the caption name+emoji) and is independent of desk -- so a UAT
+// test can exercise any of the three real caption identities. Body: { kind:
+// placed|won|cashout|lost|push, person, chatId, odds, live, lowConfidenceLegs: [string],
+// gradedBy, lastGameStart (ISO), entryId (for dedup), dryRun }.
+// dryRun defaults to true -- builds the caption and runs the timing/dedup checks (including
+// actually claiming the dedup doc, so repeat-call behavior is real) but does NOT call Telegram,
+// so testing this never risks pinging the real group chat with test traffic. Pass dryRun:false
+// only once Seb has confirmed which chat id is safe to actually send to.
+app.post("/internal/jobs/telegram-alert", async (req, res) => {
+  try {
+    const desk = req.query.desk;
+    if (desk !== "uat") return res.status(400).json({ error: 'Only desk "uat" allowed for now -- see handbooks/phase2-log.md.' });
+    const { kind, person, chatId, odds, live, lowConfidenceLegs, gradedBy, lastGameStart, entryId, dryRun = true } = req.body || {};
+    if (!kind || !entryId || !person) return res.status(400).json({ error: "kind, person and entryId are required." });
+    if (!TELEGRAM_CAPTIONS[kind]) return res.status(400).json({ error: `Unknown alert kind "${kind}" -- expected placed/won/cashout/lost/push.` });
+    if (!dryRun && !chatId) return res.status(400).json({ error: "chatId is required unless dryRun." });
+
+    const timing = telegramShouldSendNow({ kind, gradedBy, lastGameStart });
+    if (!timing.ok) return res.json({ sent: false, dryRun, reason: timing.reason, readyAt: timing.readyAt });
+
+    const claimed = await claimTelegramAlert(desk, `${entryId}:${kind}`);
+    if (!claimed) return res.json({ sent: false, dryRun, reason: "already_sent" });
+
+    const text = buildTelegramCaption({ kind, person, odds, live, lowConfidenceLegs });
+    if (!dryRun) await sendTelegram(chatId, text);
+    res.json({ sent: !dryRun, dryRun, text });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Grader (Part C) ---
 // Settles ml/spread/game-total legs from real ESPN box scores using fixed rules (see
 // grader.js/matcher.js, validated against ~70 real historical bets in handbooks/phase2-log.md
