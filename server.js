@@ -449,6 +449,20 @@ app.get("/internal/jobs/grader", async (req, res) => {
   }
 });
 
+// Part E: pure read-only dry-run of the grader for the daily engine-vs-production comparison.
+// Takes a leg's text/type/date, returns the engine's independent verdict, touches no desk at all
+// (no Supabase read/write) -- safe to call against any desk's real settled legs for comparison.
+app.get("/internal/jobs/grade-dry-run", async (req, res) => {
+  const { text, type, date } = req.query;
+  if (!text) return res.status(400).json({ error: "text is required" });
+  try {
+    const graded = await gradeOneLeg({ text, type }, date);
+    res.json(graded);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Desk-facing API + Claude's Supabase access (Part C) ---
 // Generic docs CRUD mirroring ArtifactData's own shape, so both desk pages (Part D) and
 // Claude cloud tasks (via a plain WebFetch instead of the ArtifactData tool) can read/write
