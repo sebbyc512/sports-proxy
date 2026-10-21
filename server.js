@@ -5,6 +5,8 @@
 // only protects this proxy's own rate limit, not the real odds-api quota.
 
 import express from "express";
+import { parseLeg } from "./grader.js";
+import { teamMatches, findGame } from "./matcher.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -265,6 +267,147 @@ app.get("/api/:desk/live-scores", async (req, res) => {
     const doc = await getDoc(req.params.desk, "liveScores", "now");
     if (!doc) return res.status(404).json({ error: "not found" });
     res.json(doc.data);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Grader (Part C) ---
+// Settles ml/spread/game-total legs from real ESPN box scores using fixed rules (see
+// grader.js/matcher.js, validated against ~70 real historical bets in handbooks/phase2-log.md
+// — 100% accuracy on every leg it was confident about, zero wrong grades). Anything it can't
+// confidently parse or match -> needs_review, never a guess. Scoped to desk "uat" only for
+// now (Supabase-side; UAT's real ArtifactData desk isn't connected to this yet — that's
+// Part D) so nothing live can be affected by this endpoint.
+const GRADER_LEAGUES = [
+  ["football", "nfl"], ["football", "college-football"], ["basketball", "nba"],
+  ["hockey", "nhl"], ["baseball", "mlb"],
+  ["soccer", "eng.1"], ["soccer", "esp.1"], ["soccer", "ita.1"], ["soccer", "ger.1"],
+  ["soccer", "fra.1"], ["soccer", "usa.1"], ["soccer", "uefa.champions"], ["soccer", "uefa.europa"],
+];
+
+async function fetchGamesForDate(date) {
+  const yyyymmdd = date.replace(/-/g, "");
+  const games = [];
+  for (const [sport, league] of GRADER_LEAGUES) {
+    try {
+      const data = await getJson(`${ESPN_BASE}/${sport}/${league}/scoreboard?dates=${yyyymmdd}`);
+      for (const ev of data.events || []) {
+        const comp = ev.competitions?.[0];
+        if (!comp) continue;
+        const competitors = (comp.competitors || []).map((c) => ({
+          score: Number(c.score),
+          displayName: c.team?.displayName,
+          shortDisplayName: c.team?.shortDisplayName,
+          abbreviation: c.team?.abbreviation,
+          location: c.team?.location,
+          name: c.team?.name,
+        }));
+        if (competitors.length === 2) {
+          games.push({ sport, league, competitors, state: ev.status?.type?.state });
+        }
+      }
+    } catch (err) {
+      // skip this league/date combo, keep going
+    }
+  }
+  return games;
+}
+
+function scoreLeg(parsed, game) {
+  const comps = game.competitors;
+  const isSoccer = game.sport === "soccer";
+  if (parsed.category === "ml") {
+    const mine = comps.find((c) => teamMatches(parsed.team, c));
+    const other = comps.find((c) => c !== mine);
+    if (!mine || !other) return null;
+    if (mine.score === other.score) return isSoccer ? "miss" : "push";
+    return mine.score > other.score ? "hit" : "miss";
+  }
+  if (parsed.category === "spread") {
+    const mine = comps.find((c) => teamMatches(parsed.team, c));
+    const other = comps.find((c) => c !== mine);
+    if (!mine || !other) return null;
+    const margin = mine.score - other.score + parsed.line;
+    if (margin === 0) return "push";
+    return margin > 0 ? "hit" : "miss";
+  }
+  if (parsed.category === "total") {
+    const combined = comps[0].score + comps[1].score;
+    if (combined === parsed.line) return "push";
+    const over = combined > parsed.line;
+    return (parsed.direction === "over") === over ? "hit" : "miss";
+  }
+  return null;
+}
+
+async function gradeOneLeg(leg, ticketDate) {
+  const parsed = parseLeg(leg.text, leg.type);
+  if (parsed.category === "unsupported") return { status: "needs_review", reason: parsed.reason };
+
+  const base = ticketDate ? new Date(ticketDate + "T12:00:00Z") : new Date();
+  const dates = [-1, 0, 1].map((delta) => {
+    const dd = new Date(base);
+    dd.setUTCDate(dd.getUTCDate() + delta);
+    return dd.toISOString().slice(0, 10);
+  });
+  const gameLists = await Promise.all(dates.map(fetchGamesForDate));
+  const games = gameLists.flat();
+
+  const teamQuery = parsed.team || parsed.rawA;
+  const oppQuery = parsed.opponent || parsed.rawB;
+  const game = findGame(games, teamQuery || "", oppQuery || "");
+  if (!game) return { status: "needs_review", reason: "no confident game match" };
+  if (game.state !== "post") return { status: "pending", reason: "game not final yet" };
+
+  const verdict = scoreLeg(parsed, game);
+  if (!verdict) return { status: "needs_review", reason: "matched game but could not score it" };
+  return { status: verdict };
+}
+
+function rollUpTicketStatus(legs) {
+  if (legs.some((l) => l.status === "needs_review")) return "needs_review";
+  if (legs.some((l) => l.status === "pending")) return "pending";
+  if (legs.some((l) => l.status === "miss")) return "lost";
+  return "won"; // every leg is hit or push
+}
+
+app.get("/internal/jobs/grader", async (req, res) => {
+  const desk = req.query.desk;
+  if (desk !== "uat") {
+    return res.status(400).json({ error: 'This endpoint only grades desk "uat" for now — see handbooks/phase2-log.md.' });
+  }
+  try {
+    const listRes = await supabaseFetch(
+      `/docs?desk_id=eq.uat&collection=eq.parlays&select=doc_id,data,version`
+    );
+    const docs = await listRes.json();
+    const results = [];
+    for (const doc of docs) {
+      const data = doc.data;
+      const legs = data.legs || [];
+      const pendingIdx = legs
+        .map((l, i) => ({ l, i }))
+        .filter(({ l }) => !l.status || l.status === "pending");
+      if (pendingIdx.length === 0) continue;
+
+      let changed = false;
+      const newLegs = [...legs];
+      for (const { l, i } of pendingIdx) {
+        const graded = await gradeOneLeg(l, data.date);
+        if (graded.status !== (l.status || "pending")) {
+          newLegs[i] = { ...l, status: graded.status };
+          changed = true;
+        }
+      }
+      if (!changed) continue;
+
+      const newTicketStatus = rollUpTicketStatus(newLegs);
+      const newData = { ...data, legs: newLegs, status: newTicketStatus };
+      await upsertDoc("uat", "parlays", doc.doc_id, newData);
+      results.push({ ticketId: doc.doc_id, newStatus: newTicketStatus, legStatuses: newLegs.map((l) => l.status) });
+    }
+    res.json({ ok: true, ticketsChecked: docs.length, ticketsUpdated: results.length, results });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
