@@ -28,6 +28,7 @@ function requireToken(req, res, next) {
 }
 
 app.use(requireToken);
+app.use(express.json());
 
 async function getJson(url) {
   const res = await fetch(url, { headers: { "User-Agent": "sports-proxy/0.1" } });
@@ -272,6 +273,41 @@ app.get("/api/:desk/live-scores", async (req, res) => {
   }
 });
 
+// --- Telegram (Part C) ---
+// Not wired to any trigger yet — blocked on the real Friends Desk message formats and the
+// target chat id (see handbooks/phase2-log.md). This is just the reusable send primitive,
+// ready to use once both are known.
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+async function sendTelegram(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN not configured on the server.");
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Telegram sendMessage failed: ${JSON.stringify(data)}`);
+  return data.result;
+}
+
+// One-time helper: once the bot has been added to a chat and sent at least one message
+// there, this surfaces that chat's id so it can go into Supabase/task config.
+app.get("/internal/telegram/chats", async (req, res) => {
+  try {
+    if (!TELEGRAM_BOT_TOKEN) return res.status(500).json({ error: "TELEGRAM_BOT_TOKEN not configured." });
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`);
+    const data = await r.json();
+    const chats = (data.result || []).map((u) => {
+      const m = u.message || u.channel_post;
+      return m ? { chatId: m.chat.id, type: m.chat.type, title: m.chat.title || m.chat.first_name } : null;
+    }).filter(Boolean);
+    res.json({ ok: true, chats: [...new Map(chats.map((c) => [c.chatId, c])).values()] });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Grader (Part C) ---
 // Settles ml/spread/game-total legs from real ESPN box scores using fixed rules (see
 // grader.js/matcher.js, validated against ~70 real historical bets in handbooks/phase2-log.md
@@ -412,6 +448,64 @@ app.get("/internal/jobs/grader", async (req, res) => {
     res.status(502).json({ error: err.message });
   }
 });
+
+// --- Desk-facing API + Claude's Supabase access (Part C) ---
+// Generic docs CRUD mirroring ArtifactData's own shape, so both desk pages (Part D) and
+// Claude cloud tasks (via a plain WebFetch instead of the ArtifactData tool) can read/write
+// Supabase through this one proxy-token-protected surface. Reads are open to all desks (same
+// exposure as /api/:desk/live-scores already has). Writes are UAT-only for now, same
+// discipline as the grader — nothing here can touch a live desk's real data until Part D/E.
+
+app.get("/api/:desk/docs/:collection", async (req, res) => {
+  try {
+    if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
+    const r = await supabaseFetch(
+      `/docs?desk_id=eq.${encodeURIComponent(req.params.desk)}&collection=eq.${encodeURIComponent(req.params.collection)}&select=doc_id,data,version,updated_at`
+    );
+    res.json(await r.json());
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/api/:desk/docs/:collection/:docId", async (req, res) => {
+  try {
+    if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
+    const doc = await getDoc(req.params.desk, req.params.collection, req.params.docId);
+    if (!doc) return res.status(404).json({ error: "not found" });
+    res.json(doc);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.post("/api/:desk/docs/:collection/:docId", async (req, res) => {
+  try {
+    if (req.params.desk !== "uat") {
+      return res.status(400).json({ error: 'Writes only allowed for desk "uat" for now — see handbooks/phase2-log.md.' });
+    }
+    if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "JSON body required" });
+    await upsertDoc(req.params.desk, req.params.collection, req.params.docId, req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Convenience read-only shortcuts for the desk's most-used collections.
+for (const collection of ["parlays", "pnlEntries", "rules", "requests"]) {
+  app.get(`/api/:desk/${collection}`, async (req, res) => {
+    try {
+      if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
+      const r = await supabaseFetch(
+        `/docs?desk_id=eq.${encodeURIComponent(req.params.desk)}&collection=eq.${collection}&select=doc_id,data,version,updated_at`
+      );
+      res.json(await r.json());
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+}
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
