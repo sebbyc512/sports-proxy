@@ -149,6 +149,127 @@ app.get("/odds/props", async (req, res) => {
   }
 });
 
+// --- Phase 2 engine additions ---
+// These read/write the shared Supabase "docs" table (desk_id, collection, doc_id, data,
+// version) instead of ArtifactData, so the engine can run without any Claude usage.
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+const DESKS = ["main", "steve", "lela", "uat"];
+
+async function supabaseFetch(pathAndQuery, options = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    throw new Error("SUPABASE_URL / SUPABASE_SECRET_KEY not configured on the server.");
+  }
+  const res = await fetch(`${SUPABASE_URL}/rest/v1${pathAndQuery}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  if (!res.ok) throw new Error(`Supabase ${res.status}: ${await res.text()}`);
+  return res;
+}
+
+async function upsertDoc(deskId, collection, docId, data) {
+  await supabaseFetch(`/docs?on_conflict=desk_id,collection,doc_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([
+      { desk_id: deskId, collection, doc_id: docId, data, updated_at: new Date().toISOString() },
+    ]),
+  });
+}
+
+async function getDoc(deskId, collection, docId) {
+  const res = await supabaseFetch(
+    `/docs?desk_id=eq.${encodeURIComponent(deskId)}&collection=eq.${encodeURIComponent(
+      collection
+    )}&doc_id=eq.${encodeURIComponent(docId)}&select=data,version,updated_at`
+  );
+  const rows = await res.json();
+  return rows[0] || null;
+}
+
+const LIVE_SCORE_SPORTS = [
+  { key: "NFL", sport: "football", league: "nfl" },
+  { key: "CFB", sport: "football", league: "college-football" },
+  { key: "NBA", sport: "basketball", league: "nba" },
+  { key: "NHL", sport: "hockey", league: "nhl" },
+  { key: "other", sport: "baseball", league: "mlb" },
+];
+const SOCCER_LEAGUES = ["eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "usa.1", "uefa.champions", "uefa.europa"];
+
+// Same event shape as the "Parlay Desk · live scores" cloud tasks this replaces.
+async function fetchScoreboardEvents(sport, league) {
+  const data = await getJson(`${ESPN_BASE}/${sport}/${league}/scoreboard`);
+  return (data.events || [])
+    .map((ev) => {
+      const comp = ev.competitions?.[0];
+      const away = comp?.competitors?.find((c) => c.homeAway === "away");
+      const home = comp?.competitors?.find((c) => c.homeAway === "home");
+      return {
+        state: ev.status?.type?.state,
+        detail: ev.status?.type?.shortDetail,
+        start: ev.date,
+        away: away?.team?.abbreviation,
+        awayName: away?.team?.shortDisplayName,
+        awayScore: away?.score,
+        home: home?.team?.abbreviation,
+        homeName: home?.team?.shortDisplayName,
+        homeScore: home?.score,
+      };
+    })
+    .filter((e) => ["pre", "in", "post"].includes(e.state));
+}
+
+// Pulled on a schedule by an external cron (not Claude usage) — see handbooks/phase2-log.md.
+app.get("/internal/jobs/live-scores", async (req, res) => {
+  try {
+    const sports = { NFL: [], CFB: [], NBA: [], NHL: [], other: [], Soccer: [] };
+    for (const s of LIVE_SCORE_SPORTS) {
+      try {
+        sports[s.key] = await fetchScoreboardEvents(s.sport, s.league);
+      } catch (err) {
+        console.error(`live-scores: ${s.key} failed: ${err.message}`);
+      }
+    }
+    for (const lg of SOCCER_LEAGUES) {
+      try {
+        sports.Soccer.push(...(await fetchScoreboardEvents("soccer", lg)));
+      } catch (err) {
+        console.error(`live-scores: soccer/${lg} failed: ${err.message}`);
+      }
+    }
+    const payload = { updatedAt: new Date().toISOString(), source: "espn", sports };
+    for (const desk of DESKS) {
+      await upsertDoc(desk, "liveScores", "now", payload);
+    }
+    res.json({
+      ok: true,
+      updatedAt: payload.updatedAt,
+      counts: Object.fromEntries(Object.entries(sports).map(([k, v]) => [k, v.length])),
+      desksUpdated: DESKS,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Desk-facing read API (Part D connects the desk pages to this instead of ArtifactData).
+app.get("/api/:desk/live-scores", async (req, res) => {
+  try {
+    if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
+    const doc = await getDoc(req.params.desk, "liveScores", "now");
+    if (!doc) return res.status(404).json({ error: "not found" });
+    res.json(doc.data);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`sports-proxy listening on ${PORT}`));
