@@ -492,6 +492,21 @@ app.post("/api/:desk/docs/:collection/:docId", async (req, res) => {
   }
 });
 
+app.delete("/api/:desk/docs/:collection/:docId", async (req, res) => {
+  try {
+    if (req.params.desk !== "uat") {
+      return res.status(400).json({ error: 'Deletes only allowed for desk "uat" for now — see handbooks/phase2-log.md.' });
+    }
+    await supabaseFetch(
+      `/docs?desk_id=eq.${encodeURIComponent(req.params.desk)}&collection=eq.${encodeURIComponent(req.params.collection)}&doc_id=eq.${encodeURIComponent(req.params.docId)}`,
+      { method: "DELETE" }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // Convenience read-only shortcuts for the desk's most-used collections.
 for (const collection of ["parlays", "pnlEntries", "rules", "requests"]) {
   app.get(`/api/:desk/${collection}`, async (req, res) => {
