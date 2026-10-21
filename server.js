@@ -340,7 +340,7 @@ async function fetchGamesForDate(date) {
           name: c.team?.name,
         }));
         if (competitors.length === 2) {
-          games.push({ sport, league, competitors, state: ev.status?.type?.state });
+          games.push({ sport, league, id: ev.id, competitors, state: ev.status?.type?.state });
         }
       }
     } catch (err) {
@@ -377,6 +377,202 @@ function scoreLeg(parsed, game) {
   return null;
 }
 
+// --- Player props + anytime TD (box-score lookups) ---
+// ml/spread/total only ever need the two final scores, already on the scoreboard payload.
+// Props need an individual player's box-score line, which is a separate ESPN endpoint per
+// game (.../summary?event=<id>) — fetched lazily, only for the one matched game, never for a
+// whole date's slate at once.
+
+function normalizePlayerName(name) {
+  return (name || "").toLowerCase().replace(/\./g, "").replace(/\s+/g, " ").trim();
+}
+
+const boxScoreCache = new Map(); // "sport/league/id" -> parsed boxscore.players, shared across legs within one process lifetime (cheap, read-only data for a final game)
+
+async function fetchBoxScorePlayers(game) {
+  const key = `${game.sport}/${game.league}/${game.id}`;
+  if (boxScoreCache.has(key)) return boxScoreCache.get(key);
+  const data = await getJson(`${ESPN_BASE}/${game.sport}/${game.league}/summary?event=${game.id}`);
+  const players = data.boxscore?.players || [];
+  boxScoreCache.set(key, players);
+  return players;
+}
+
+function findAthlete(categories, playerName, labelFilter) {
+  const target = normalizePlayerName(playerName);
+  for (const cat of categories) {
+    if (labelFilter && !labelFilter(cat)) continue;
+    for (const ath of cat.athletes || []) {
+      if (normalizePlayerName(ath.athlete?.displayName) === target) return { cat, ath };
+    }
+  }
+  return null;
+}
+
+// NFL: labels differ per category (passing/rushing/receiving), each with its own athlete list.
+const NFL_FIELD = {
+  recYds: { cat: "receiving", label: "YDS" },
+  rushYds: { cat: "rushing", label: "YDS" },
+  rushAtt: { cat: "rushing", label: "CAR" },
+  receptions: { cat: "receiving", label: "REC" },
+  passYds: { cat: "passing", label: "YDS" },
+  passTd: { cat: "passing", label: "TD" },
+  completions: { cat: "passing", label: "C/ATT" }, // "19/33" -> take completions (first number)
+};
+
+async function nflStatValue(game, playerName, statKey) {
+  const players = await fetchBoxScorePlayers(game);
+  // "anyTdCount" backs the bare counting prop ("CeeDee Lamb 2+ touchdowns") — rushing +
+  // receiving only. A QB's passing TDs never belong here: he didn't personally cross the goal
+  // line, so a passing TD doesn't make him "the scorer" (that's what broke "Anytime TD Scorer"
+  // grading before this fix — Josh Allen throwing 2 TDs with 0 rush/rec TDs was coming back
+  // "hit" when the real bet was a miss). Passing TDs still count on their own via "passTd".
+  if (statKey === "anyTdCount") {
+    let total = null;
+    for (const team of players) {
+      for (const cat of team.statistics) {
+        if (!["rushing", "receiving"].includes(cat.name)) continue;
+        const iTD = cat.labels.indexOf("TD");
+        if (iTD < 0) continue;
+        const hit = findAthlete([cat], playerName);
+        if (hit) total = (total || 0) + (Number(hit.ath.stats[iTD]) || 0);
+      }
+    }
+    return total;
+  }
+  const field = NFL_FIELD[statKey];
+  if (!field) return null;
+  for (const team of players) {
+    const cat = team.statistics.find((c) => c.name === field.cat);
+    if (!cat) continue;
+    const idx = cat.labels.indexOf(field.label);
+    if (idx < 0) continue;
+    const hit = findAthlete([cat], playerName);
+    if (hit) {
+      const raw = hit.ath.stats[idx];
+      return field.label === "C/ATT" ? Number(raw.split("/")[0]) : Number(raw);
+    }
+  }
+  return null;
+}
+
+async function nflAnytimeTd(game, playerName) {
+  const n = await nflStatValue(game, playerName, "anyTdCount");
+  return n === null ? null : n >= 1;
+}
+
+// NBA: one flat athlete list per team, labels shared: MIN,PTS,FG,3PT,FT,REB,AST,TO,STL,BLK,OREB,DREB,PF,+/-
+const NBA_LABEL = { points: "PTS", rebounds: "REB", assists: "AST", blocks: "BLK", steals: "STL" };
+
+async function nbaStatValue(game, playerName, statKey) {
+  const players = await fetchBoxScorePlayers(game);
+  for (const team of players) {
+    const cat = team.statistics[0];
+    if (!cat) continue;
+    const hit = findAthlete([cat], playerName);
+    if (!hit) continue;
+    if (statKey === "threes") {
+      const idx = cat.labels.indexOf("3PT");
+      return idx < 0 ? null : Number(hit.ath.stats[idx].split("-")[0]); // "3-7" made-attempted -> made
+    }
+    const label = NBA_LABEL[statKey];
+    const idx = label ? cat.labels.indexOf(label) : -1;
+    return idx < 0 ? null : Number(hit.ath.stats[idx]);
+  }
+  return null;
+}
+
+// NHL: players split across forwards/defenses/skaters/goalies categories, shared skater labels.
+// Verified against a real game: summed "S" per team == the opposing goalie's shots-against, so
+// "S" is shots on goal (the column named "SOG" here is shootout goals, almost always 0 and NOT
+// what a "shots on goal" prop means — do not use it).
+const NHL_LABEL = { goals: "G", assists: "A", shotsOnGoal: "S" };
+
+async function nhlStatValue(game, playerName, statKey) {
+  const players = await fetchBoxScorePlayers(game);
+  const skaterCats = (team) => team.statistics.filter((c) => c.name !== "goalies");
+  for (const team of players) {
+    const hit = findAthlete(skaterCats(team), playerName);
+    if (!hit) continue;
+    if (statKey === "points") {
+      const iG = hit.cat.labels.indexOf("G");
+      const iA = hit.cat.labels.indexOf("A");
+      if (iG < 0 || iA < 0) return null;
+      return (Number(hit.ath.stats[iG]) || 0) + (Number(hit.ath.stats[iA]) || 0);
+    }
+    const label = NHL_LABEL[statKey];
+    const idx = label ? hit.cat.labels.indexOf(label) : -1;
+    return idx < 0 ? null : Number(hit.ath.stats[idx]);
+  }
+  return null;
+}
+
+// MLB: category.name is unlabeled ("undefined") on this endpoint — distinguish batting vs
+// pitching by which labels are present instead.
+async function mlbStatValue(game, playerName, statKey) {
+  const players = await fetchBoxScorePlayers(game);
+  for (const team of players) {
+    for (const cat of team.statistics) {
+      const isPitching = cat.labels.includes("IP");
+      const isBatting = cat.labels.includes("AB");
+      if (statKey === "hits" && isBatting) {
+        const hit = findAthlete([cat], playerName);
+        if (hit) return Number(hit.ath.stats[cat.labels.indexOf("H")]);
+      }
+      if (statKey === "strikeouts" && isPitching) {
+        const hit = findAthlete([cat], playerName);
+        if (hit) return Number(hit.ath.stats[cat.labels.indexOf("K")]);
+      }
+      if (statKey === "outsRecorded" && isPitching) {
+        const hit = findAthlete([cat], playerName);
+        if (hit) {
+          const ip = hit.ath.stats[cat.labels.indexOf("IP")]; // "5.1" = 5 innings + 1 out
+          const [whole, part] = ip.split(".").map(Number);
+          return whole * 3 + (part || 0);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+const SPORT_STAT_FN = { nfl: nflStatValue, nba: nbaStatValue, nhl: nhlStatValue, mlb: mlbStatValue };
+const STAT_SPORT_CANDIDATES = {
+  recYds: [["football", "nfl"]], rushYds: [["football", "nfl"]], rushAtt: [["football", "nfl"]],
+  receptions: [["football", "nfl"]], passYds: [["football", "nfl"]], passTd: [["football", "nfl"]],
+  completions: [["football", "nfl"]], anyTdCount: [["football", "nfl"]],
+  rebounds: [["basketball", "nba"]], blocks: [["basketball", "nba"]], steals: [["basketball", "nba"]], threes: [["basketball", "nba"]],
+  shotsOnGoal: [["hockey", "nhl"]], goals: [["hockey", "nhl"]],
+  strikeouts: [["baseball", "mlb"]], outsRecorded: [["baseball", "mlb"]], hits: [["baseball", "mlb"]],
+  points: [["basketball", "nba"], ["hockey", "nhl"]], assists: [["basketball", "nba"], ["hockey", "nhl"]],
+};
+
+// Resolve which game a prop leg is about. If the text had team context, this is exactly the
+// same team-matching the ml/spread/total legs already use. If it didn't (an older, bare
+// "Player anytime TD" with no matchup in the text), fall back to scanning the plausible
+// sport(s)' box scores for that date for the player by name — more expensive, only hit when
+// the cheap path has nothing to go on, and returns no match (never a guess) if the player turns
+// up in more than one game that date.
+async function resolveGameForProp(parsed, games, statKey) {
+  if (parsed.rawA || parsed.rawB) {
+    const game = findGame(games, parsed.rawA || "", parsed.rawB || "");
+    if (game) return game;
+  }
+  const candidates = STAT_SPORT_CANDIDATES[statKey] || (statKey === "anytimeTd" ? [["football", "nfl"]] : []);
+  const candidateGames = games.filter((g) => candidates.some(([sport, league]) => g.sport === sport && g.league === league));
+  let found = null;
+  for (const g of candidateGames) {
+    if (g.state !== "post") continue; // can't confirm a player's a box-score match pregame anyway
+    const players = await fetchBoxScorePlayers(g);
+    const flatCats = players.flatMap((t) => t.statistics);
+    if (findAthlete(flatCats, parsed.player)) {
+      if (found) return null; // ambiguous — same-named player in two of today's games, never guess
+      found = g;
+    }
+  }
+  return found;
+}
+
 async function gradeOneLeg(leg, ticketDate) {
   const parsed = parseLeg(leg.text, leg.type);
   if (parsed.category === "unsupported") return { status: "needs_review", reason: parsed.reason };
@@ -389,6 +585,33 @@ async function gradeOneLeg(leg, ticketDate) {
   });
   const gameLists = await Promise.all(dates.map(fetchGamesForDate));
   const games = gameLists.flat();
+
+  if (parsed.category === "stat" || parsed.category === "anytimeTd") {
+    const statKey = parsed.category === "anytimeTd" ? "anytimeTd" : parsed.statKey;
+    const game = await resolveGameForProp(parsed, games, statKey);
+    if (!game) return { status: "needs_review", reason: "no confident game match for this player" };
+    if (game.state !== "post") return { status: "pending", reason: "game not final yet" };
+
+    if (parsed.category === "anytimeTd") {
+      if (game.sport !== "football") return { status: "needs_review", reason: "anytime-scorer grading only supports NFL for now" };
+      const scored = await nflAnytimeTd(game, parsed.player);
+      if (scored === null) return { status: "needs_review", reason: "player not found in box score" };
+      return { status: scored ? "hit" : "miss" };
+    }
+
+    const sportFn = SPORT_STAT_FN[game.sport === "football" ? "nfl" : game.sport === "basketball" ? "nba" : game.sport === "hockey" ? "nhl" : game.sport === "baseball" ? "mlb" : null];
+    if (!sportFn) return { status: "needs_review", reason: `prop grading not supported for sport "${game.sport}"` };
+    const value = await sportFn(game, parsed.player, parsed.statKey);
+    if (value === null) return { status: "needs_review", reason: "player not found in box score, or stat not tracked for this sport/position" };
+
+    if (parsed.direction === "atleast") {
+      return { status: value >= parsed.line ? "hit" : "miss" };
+    }
+    // Over/Under: a whole-number line can push (actual === line); a half-point line never can.
+    if (Number.isInteger(parsed.line) && value === parsed.line) return { status: "push" };
+    const over = value > parsed.line;
+    return { status: (parsed.direction === "over") === over ? "hit" : "miss" };
+  }
 
   const teamQuery = parsed.team || parsed.rawA;
   const oppQuery = parsed.opponent || parsed.rawB;
