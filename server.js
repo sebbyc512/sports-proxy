@@ -399,6 +399,145 @@ app.post("/internal/jobs/telegram-alert", async (req, res) => {
   }
 });
 
+// --- Telegram private-chat routing (2026-10-22, Seb's request) ---
+// The group chat (real chat_id, passed by the caller as before) keeps getting ONLY the 5
+// bet-lifecycle captions above -- unchanged. Everything below always goes to Seb's own DM
+// (TELEGRAM_SEB_CHAT_ID), regardless of what a caller passes, so these can never leak into the
+// group by a caller mistake. Inbound button taps/commands are only ever acted on if they come
+// from that same chat id (see /telegram/webhook below).
+const TELEGRAM_SEB_CHAT_ID = process.env.TELEGRAM_SEB_CHAT_ID;
+
+function isSebChat(id) {
+  return !!TELEGRAM_SEB_CHAT_ID && String(id) === String(TELEGRAM_SEB_CHAT_ID);
+}
+
+async function telegramApi(method, body) {
+  if (!TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN not configured on the server.");
+  const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Telegram ${method} failed: ${JSON.stringify(data)}`);
+  return data.result;
+}
+
+const PRIVATE_CAPTIONS = {
+  newRequest: "📝 New {desk} request\n{summary}",
+  backupRun: "⚠️ {task} needs a manual “Run now”\n{reason}",
+  failure: "🚨 {task} failed\n{reason}",
+  usageReport: "{text}",
+  test: "✅ Test DM from sports-proxy — private-chat routing is working.",
+};
+
+function buildPrivateText({ kind, desk, task, summary, reason, text }) {
+  const template = PRIVATE_CAPTIONS[kind];
+  if (!template) throw new Error(`Unknown private alert kind "${kind}".`);
+  return template
+    .replace(/\{desk\}/g, desk || "")
+    .replace(/\{task\}/g, task || "")
+    .replace(/\{summary\}/g, summary || "")
+    .replace(/\{reason\}/g, reason || "")
+    .replace(/\{text\}/g, text || "");
+}
+
+// kind: newRequest/backupRun/failure/usageReport/test. desk+requestId are required for
+// "newRequest" -- they get encoded into the Approve/Skip buttons' callback_data so the webhook
+// knows which request a tap refers to. dryRun defaults to true, same convention as
+// telegram-alert above, so testing this can't accidentally DM Seb.
+app.post("/internal/jobs/telegram-private", async (req, res) => {
+  try {
+    if (!TELEGRAM_SEB_CHAT_ID) return res.status(500).json({ error: "TELEGRAM_SEB_CHAT_ID not configured on the server." });
+    const { kind, desk, task, summary, reason, text, requestId, dryRun = true } = req.body || {};
+    if (!PRIVATE_CAPTIONS[kind]) {
+      return res.status(400).json({ error: `Unknown kind "${kind}" -- expected newRequest/backupRun/failure/usageReport/test.` });
+    }
+    const body = buildPrivateText({ kind, desk, task, summary, reason, text });
+    let reply_markup;
+    if (kind === "newRequest") {
+      if (!desk || !requestId) return res.status(400).json({ error: 'desk and requestId are required for kind "newRequest".' });
+      reply_markup = {
+        inline_keyboard: [[
+          { text: "✅ Approve", callback_data: `approve:${desk}:${requestId}` },
+          { text: "⏭ Skip", callback_data: `skip:${desk}:${requestId}` },
+        ]],
+      };
+    }
+    if (!dryRun) await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text: body, parse_mode: "HTML", reply_markup });
+    res.json({ sent: !dryRun, dryRun, text: body });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Inbound updates from Telegram. Registered once via /internal/telegram/set-webhook below.
+// Hard rule (Seb's own requirement): only ever act on an update whose chat/user id matches
+// TELEGRAM_SEB_CHAT_ID. Anything else is acknowledged (200, so Telegram doesn't retry) and
+// otherwise ignored. Approve/Skip write a flag doc to a new, narrow "requestApprovals"
+// collection (desk-scoped but NOT behind the general uat-only write guard, since this is a
+// server-internal upsertDoc call, not the public /api/:desk/docs write route) -- it does not
+// by itself make the real pick-request/prime-time/Friends-picks tasks build or skip anything
+// yet; their prompts need a small added check against this collection before that's true (not
+// done in this pass -- see handbooks note).
+app.post("/telegram/webhook", async (req, res) => {
+  try {
+    const update = req.body || {};
+    if (update.callback_query) {
+      const cq = update.callback_query;
+      if (!isSebChat(cq.from?.id)) {
+        await telegramApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Not authorized.", show_alert: true });
+        return res.json({ ok: true, ignored: true });
+      }
+      const [action, desk, requestId] = String(cq.data || "").split(":");
+      if ((action === "approve" || action === "skip") && desk && requestId) {
+        await upsertDoc(desk, "requestApprovals", requestId, {
+          approval: action === "approve" ? "approved" : "skipped",
+          decidedAt: new Date().toISOString(),
+          decidedBy: "seb-telegram",
+        });
+        await telegramApi("answerCallbackQuery", { callback_query_id: cq.id, text: action === "approve" ? "Approved" : "Skipped" });
+        await telegramApi("editMessageText", {
+          chat_id: cq.message.chat.id,
+          message_id: cq.message.message_id,
+          text: `${cq.message.text}\n\n${action === "approve" ? "✅ Approved" : "⏭ Skipped"}`,
+        });
+      } else {
+        await telegramApi("answerCallbackQuery", { callback_query_id: cq.id });
+      }
+      return res.json({ ok: true });
+    }
+    if (update.message) {
+      const msg = update.message;
+      if (!isSebChat(msg.chat?.id)) return res.json({ ok: true, ignored: true });
+      if ((msg.text || "").trim() === "/usage") {
+        const doc = await getDoc("main", "opsReports", "usage-latest");
+        const reply = doc?.data?.text || "No usage report yet — the nightly report task hasn't run.";
+        await telegramApi("sendMessage", { chat_id: msg.chat.id, text: reply });
+      }
+      return res.json({ ok: true });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("telegram webhook error:", err.message);
+    res.status(200).json({ ok: false }); // 200 so Telegram doesn't retry-storm on a server bug
+  }
+});
+
+// One-time setup (safe to re-call any time -- Telegram just re-registers the same URL). Points
+// Telegram's webhook at this same server, reusing PROXY_TOKEN in the query string so the global
+// requireToken middleware still protects the inbound endpoint above.
+app.get("/internal/telegram/set-webhook", async (req, res) => {
+  try {
+    const base = req.query.url || `https://${req.get("host")}`;
+    const webhookUrl = `${base}/telegram/webhook?token=${encodeURIComponent(PROXY_TOKEN)}`;
+    const result = await telegramApi("setWebhook", { url: webhookUrl, allowed_updates: ["message", "callback_query"] });
+    res.json({ ok: true, webhookUrl, result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Grader (Part C) ---
 // Settles ml/spread/game-total legs from real ESPN box scores using fixed rules (see
 // grader.js/matcher.js, validated against ~70 real historical bets in handbooks/phase2-log.md
