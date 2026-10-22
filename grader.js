@@ -94,9 +94,14 @@ const TOTAL_PATTERNS = [
   new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*)\\s*(?:\\(Total\\s*\\)|Total)?$`, "iu"),
 ];
 
-// Explicitly excluded from TOTAL_PATTERNS on purpose — these are a single TEAM's total, not
-// the combined game total, and need different settlement data (that team's score alone).
+// A single TEAM's own total, not the combined game total — needs that team's score alone
+// (TEAM_TOTAL_RE routes these to TEAM_TOTAL_PATTERNS below instead of TOTAL_PATTERNS).
 const TEAM_TOTAL_RE = /Team Total (?:Goals|Points|Runs)/i;
+
+const TEAM_TOTAL_PATTERNS = [
+  // "Real Madrid Over 1.5 Team Total Goals (RB Leipzig vs Real Madrid)" / "... (Real Betis v Feyenoord) -140"
+  new RegExp(`^(?<team>${TEAM}) (?<dir>Over|Under) (?<num>\\d+\\.?\\d*) Team Total (?:Goals|Points|Runs)\\s*(?:\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\))?\\s*([+-]\\d+)?$`, "iu"),
+];
 
 // --- Player props + anytime TD ---
 // Same character class as TEAM — player names use the same punctuation (apostrophes, periods,
@@ -125,6 +130,7 @@ const STAT_PHRASES = [
   ["Blocks", "blocks", "nba"],
   ["Steals", "steals", "nba"],
   ["3-Pointers Made", "threes", "nba"],
+  ["Three Pointers Made", "threes", "nba"],
   ["Threes", "threes", "nba"],
   ["3PM", "threes", "nba"],
   ["Shots on Goal", "shotsOnGoal", "nhl"],
@@ -194,9 +200,14 @@ function parseLeg(text, legType) {
     if (g) return { category: "spread", team: g.team.trim(), line: parseFloat(g.num), opponent: (g.opp || g.a === g.team ? g.b : g.a)?.trim() || null };
   }
 
-  if ((legType === "over" || legType === "under" || legType === "total") && !TEAM_TOTAL_RE.test(raw)) {
-    const g = tryPatterns(t, TOTAL_PATTERNS);
-    if (g) return { category: "total", direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
+  if (legType === "over" || legType === "under" || legType === "total") {
+    if (TEAM_TOTAL_RE.test(raw)) {
+      const g = tryPatterns(t, TEAM_TOTAL_PATTERNS);
+      if (g) return { category: "teamTotal", team: g.team.trim(), direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
+    } else {
+      const g = tryPatterns(t, TOTAL_PATTERNS);
+      if (g) return { category: "total", direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
+    }
   }
 
   // Player props and anytime TD are tried regardless of legType: real data mislabels these
@@ -208,9 +219,14 @@ function parseLeg(text, legType) {
   // Try TOTAL_PATTERNS here too, defensively: a mislabeled game-total leg ("Over 45.5 total
   // points" under some other type) must settle as a game total, never get swallowed by the
   // STAT reversed-order pattern as a fake player named "total".
-  if (legType !== "ftd" && legType !== "over" && legType !== "under" && legType !== "total" && !TEAM_TOTAL_RE.test(raw)) {
-    const tot = tryPatterns(t, TOTAL_PATTERNS);
-    if (tot) return { category: "total", direction: tot.dir.toLowerCase(), line: parseFloat(tot.num), rawA: tot.a?.trim() || null, rawB: tot.b?.trim() || null };
+  if (legType !== "ftd" && legType !== "over" && legType !== "under" && legType !== "total") {
+    if (TEAM_TOTAL_RE.test(raw)) {
+      const g = tryPatterns(t, TEAM_TOTAL_PATTERNS);
+      if (g) return { category: "teamTotal", team: g.team.trim(), direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
+    } else {
+      const tot = tryPatterns(t, TOTAL_PATTERNS);
+      if (tot) return { category: "total", direction: tot.dir.toLowerCase(), line: parseFloat(tot.num), rawA: tot.a?.trim() || null, rawB: tot.b?.trim() || null };
+    }
   }
   if (legType !== "ftd") {
     const td = tryPatterns(t, ANYTIME_TD_PATTERNS);

@@ -465,6 +465,13 @@ function scoreLeg(parsed, game) {
     const over = combined > parsed.line;
     return (parsed.direction === "over") === over ? "hit" : "miss";
   }
+  if (parsed.category === "teamTotal") {
+    const mine = comps.find((c) => teamMatches(parsed.team, c));
+    if (!mine) return null;
+    if (mine.score === parsed.line) return "push";
+    const over = mine.score > parsed.line;
+    return (parsed.direction === "over") === over ? "hit" : "miss";
+  }
   return null;
 }
 
