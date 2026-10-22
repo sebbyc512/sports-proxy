@@ -850,6 +850,54 @@ for (const collection of ["parlays", "pnlEntries", "rules", "requests"]) {
   });
 }
 
+// --- Phase 3 prep tables (model_versions, learning_log, pick_sources) ---
+// These have no desk_id column (schema.sql) -- they're global learning-history tables, not
+// per-desk docs, so no UAT-only write gate applies (nothing live reads from them yet).
+async function insertRow(table, row) {
+  await supabaseFetch(`/${table}`, {
+    method: "POST",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify([row]),
+  });
+}
+
+const LEARNING_TABLES = {
+  "model-versions": { table: "model_versions", fields: ["spec", "version", "what_changed"], orderBy: "date" },
+  "learning-log": {
+    table: "learning_log",
+    fields: ["task", "what_it_learned", "data_used", "hit_rate_before", "hit_rate_after"],
+    orderBy: "created_at",
+  },
+  "pick-sources": {
+    table: "pick_sources",
+    fields: ["pick_id", "source_type", "url_or_ref"],
+    orderBy: "created_at",
+  },
+};
+
+for (const [route, { table, fields, orderBy }] of Object.entries(LEARNING_TABLES)) {
+  app.post(`/api/learning/${route}`, async (req, res) => {
+    try {
+      if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "JSON body required" });
+      const row = {};
+      for (const f of fields) if (req.body[f] !== undefined) row[f] = req.body[f];
+      await insertRow(table, row);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+
+  app.get(`/api/learning/${route}`, async (req, res) => {
+    try {
+      const r = await supabaseFetch(`/${table}?order=${orderBy}.desc&limit=${req.query.limit || 100}`);
+      res.json(await r.json());
+    } catch (err) {
+      res.status(502).json({ error: err.message });
+    }
+  });
+}
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`sports-proxy listening on ${PORT}`));
