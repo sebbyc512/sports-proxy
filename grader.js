@@ -203,7 +203,11 @@ function parseLeg(text, legType) {
   if (legType === "over" || legType === "under" || legType === "total") {
     if (TEAM_TOTAL_RE.test(raw)) {
       const g = tryPatterns(t, TEAM_TOTAL_PATTERNS);
-      if (g) return { category: "teamTotal", team: g.team.trim(), direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
+      // opponent must be whichever of a/b is NOT the queried team — the team can land in either
+      // matchup slot ("(Team vs Opp)" or "(Opp @ Team)"), and querying findGame with the same
+      // team as both the team and the opponent makes a same-day second fixture for that team
+      // (common for e.g. Real Madrid across UCL + La Liga) look falsely ambiguous.
+      if (g) return { category: "teamTotal", team: g.team.trim(), opponent: (g.a && sameTeam(g.a, g.team) ? g.b : g.a)?.trim() || null, direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
     } else {
       const g = tryPatterns(t, TOTAL_PATTERNS);
       if (g) return { category: "total", direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
@@ -222,7 +226,7 @@ function parseLeg(text, legType) {
   if (legType !== "ftd" && legType !== "over" && legType !== "under" && legType !== "total") {
     if (TEAM_TOTAL_RE.test(raw)) {
       const g = tryPatterns(t, TEAM_TOTAL_PATTERNS);
-      if (g) return { category: "teamTotal", team: g.team.trim(), direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
+      if (g) return { category: "teamTotal", team: g.team.trim(), opponent: (g.a && sameTeam(g.a, g.team) ? g.b : g.a)?.trim() || null, direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
     } else {
       const tot = tryPatterns(t, TOTAL_PATTERNS);
       if (tot) return { category: "total", direction: tot.dir.toLowerCase(), line: parseFloat(tot.num), rawA: tot.a?.trim() || null, rawB: tot.b?.trim() || null };
