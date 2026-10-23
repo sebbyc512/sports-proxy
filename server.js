@@ -399,6 +399,22 @@ app.post("/internal/jobs/telegram-alert", async (req, res) => {
   }
 });
 
+// Free-text send for manual corrections only (e.g. retracting a bad telegram-alert send) --
+// no caption template, no dedup, no timing hold. Not called by any automated task; this exists
+// so a mistaken post can be corrected without inventing a fake "kind" to abuse telegram-alert's
+// templates. dryRun defaults to true, same convention as the other Telegram endpoints.
+app.post("/internal/jobs/telegram-send-raw", async (req, res) => {
+  try {
+    const { chatId, text, dryRun = true } = req.body || {};
+    if (!text) return res.status(400).json({ error: "text is required." });
+    if (!dryRun && !chatId) return res.status(400).json({ error: "chatId is required unless dryRun." });
+    if (!dryRun) await sendTelegram(chatId, text);
+    res.json({ sent: !dryRun, dryRun, text });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Telegram private-chat routing (2026-10-22, Seb's request) ---
 // The group chat (real chat_id, passed by the caller as before) keeps getting ONLY the 5
 // bet-lifecycle captions above -- unchanged. Everything below always goes to Seb's own DM
