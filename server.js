@@ -365,11 +365,11 @@ async function claimTelegramAlert(deskId, alertId) {
   return rows.length > 0; // true = we claimed it; false = already claimed by an earlier call
 }
 
-// desk (query param, dedup scope) is UAT-only for now, same discipline as the grader/write
-// endpoints -- this is Part C/Part E test wiring, not production alerting (that's still the
-// real Friends/Sebas Desk tasks until Part F cutover). person (body) is who the alert is
+// desk (query param, dedup scope) can be any real desk post-Part F cutover (main/steve/lela)
+// or uat for testing -- the dedup doc (desk/tgAlerts/<entryId>:<kind>) is scoped per desk so
+// the same entryId never collides across desks. person (body) is who the alert is
 // ABOUT (main/steve/lela, for the caption name+emoji) and is independent of desk -- so a UAT
-// test can exercise any of the three real caption identities. Body: { kind:
+// test can still exercise any of the three real caption identities. Body: { kind:
 // placed|won|cashout|lost|push, person, chatId, odds, live, lowConfidenceLegs: [string],
 // gradedBy, lastGameStart (ISO), entryId (for dedup), dryRun }.
 // dryRun defaults to true -- builds the caption and runs the timing/dedup checks (including
@@ -379,7 +379,7 @@ async function claimTelegramAlert(deskId, alertId) {
 app.post("/internal/jobs/telegram-alert", async (req, res) => {
   try {
     const desk = req.query.desk;
-    if (desk !== "uat") return res.status(400).json({ error: 'Only desk "uat" allowed for now -- see handbooks/phase2-log.md.' });
+    if (!DESKS.includes(desk)) return res.status(404).json({ error: "unknown desk" });
     const { kind, person, chatId, odds, live, lowConfidenceLegs, gradedBy, lastGameStart, entryId, dryRun = true } = req.body || {};
     if (!kind || !entryId || !person) return res.status(400).json({ error: "kind, person and entryId are required." });
     if (!TELEGRAM_CAPTIONS[kind]) return res.status(400).json({ error: `Unknown alert kind "${kind}" -- expected placed/won/cashout/lost/push.` });
@@ -870,12 +870,10 @@ function rollUpTicketStatus(legs) {
 
 app.get("/internal/jobs/grader", async (req, res) => {
   const desk = req.query.desk;
-  if (desk !== "uat") {
-    return res.status(400).json({ error: 'This endpoint only grades desk "uat" for now — see handbooks/phase2-log.md.' });
-  }
+  if (!DESKS.includes(desk)) return res.status(404).json({ error: "unknown desk" });
   try {
     const listRes = await supabaseFetch(
-      `/docs?desk_id=eq.uat&collection=eq.parlays&select=doc_id,data,version`
+      `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.parlays&select=doc_id,data,version`
     );
     const docs = await listRes.json();
     const results = [];
@@ -900,7 +898,7 @@ app.get("/internal/jobs/grader", async (req, res) => {
 
       const newTicketStatus = rollUpTicketStatus(newLegs);
       const newData = { ...data, legs: newLegs, status: newTicketStatus };
-      await upsertDoc("uat", "parlays", doc.doc_id, newData);
+      await upsertDoc(desk, "parlays", doc.doc_id, newData);
       results.push({ ticketId: doc.doc_id, newStatus: newTicketStatus, legStatuses: newLegs.map((l) => l.status) });
     }
     res.json({ ok: true, ticketsChecked: docs.length, ticketsUpdated: results.length, results });
@@ -927,8 +925,11 @@ app.get("/internal/jobs/grade-dry-run", async (req, res) => {
 // Generic docs CRUD mirroring ArtifactData's own shape, so both desk pages (Part D) and
 // Claude cloud tasks (via a plain WebFetch instead of the ArtifactData tool) can read/write
 // Supabase through this one proxy-token-protected surface. Reads are open to all desks (same
-// exposure as /api/:desk/live-scores already has). Writes are UAT-only for now, same
-// discipline as the grader — nothing here can touch a live desk's real data until Part D/E.
+// exposure as /api/:desk/live-scores already has). Writes are open to all desks as of Part F
+// cutover (2026-10-23) -- note this only ever writes the ENGINE's own Supabase mirror for that
+// desk_id, never the real claude.ai artifact's ArtifactData store directly; a real desk's
+// actual data only changes via the separate Post-Cutover Sync task, which writes through the
+// ArtifactData tool with if_version pinning.
 
 app.get("/api/:desk/docs/:collection", async (req, res) => {
   try {
@@ -955,9 +956,7 @@ app.get("/api/:desk/docs/:collection/:docId", async (req, res) => {
 
 app.post("/api/:desk/docs/:collection/:docId", async (req, res) => {
   try {
-    if (req.params.desk !== "uat") {
-      return res.status(400).json({ error: 'Writes only allowed for desk "uat" for now — see handbooks/phase2-log.md.' });
-    }
+    if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
     if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "JSON body required" });
     await upsertDoc(req.params.desk, req.params.collection, req.params.docId, req.body);
     res.json({ ok: true });
@@ -968,9 +967,7 @@ app.post("/api/:desk/docs/:collection/:docId", async (req, res) => {
 
 app.delete("/api/:desk/docs/:collection/:docId", async (req, res) => {
   try {
-    if (req.params.desk !== "uat") {
-      return res.status(400).json({ error: 'Deletes only allowed for desk "uat" for now — see handbooks/phase2-log.md.' });
-    }
+    if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
     await supabaseFetch(
       `/docs?desk_id=eq.${encodeURIComponent(req.params.desk)}&collection=eq.${encodeURIComponent(req.params.collection)}&doc_id=eq.${encodeURIComponent(req.params.docId)}`,
       { method: "DELETE" }
