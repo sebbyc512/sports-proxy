@@ -809,26 +809,52 @@ const STAT_SPORT_CANDIDATES = {
 async function resolveGameForProp(parsed, games, statKey) {
   if (parsed.rawA || parsed.rawB) {
     const game = findGame(games, parsed.rawA || "", parsed.rawB || "");
-    if (game) return game;
+    if (game) return { game };
   }
   const candidates = STAT_SPORT_CANDIDATES[statKey] || (statKey === "anytimeTd" ? [["football", "nfl"]] : []);
   const candidateGames = games.filter((g) => candidates.some(([sport, league]) => g.sport === sport && g.league === league));
   let found = null;
+  let anyNotFinal = false;
   for (const g of candidateGames) {
-    if (g.state !== "post") continue; // can't confirm a player's a box-score match pregame anyway
+    if (g.state !== "post") { anyNotFinal = true; continue; } // can't confirm a player's a box-score match pregame anyway
     const players = await fetchBoxScorePlayers(g);
     const flatCats = players.flatMap((t) => t.statistics);
     if (findAthlete(flatCats, parsed.player)) {
-      if (found) return null; // ambiguous — same-named player in two of today's games, never guess
+      if (found) return { game: null }; // ambiguous — same-named player in two of today's games, never guess
       found = g;
     }
   }
-  return found;
+  // No completed box score has this player, but a same-sport game today/this window hasn't
+  // finished yet -- it's too early to call this unresolvable, so say so rather than guessing
+  // the player's game is simply unfindable.
+  if (!found && anyNotFinal) return { game: null, pending: true };
+  return { game: found };
+}
+
+// A leg's game hasn't necessarily started or finished just because we can't grade the market
+// (unsupported) or can't confidently match a game (ambiguous/missing team text). Before calling
+// any of that needs_review, check whether the relevant game is even over yet -- first by
+// spotting a team abbreviation/name token from the leg text among the fetched games, then by
+// falling back to the ticket's own date vs. today. Only once we have reason to believe the game
+// is actually final does "we still can't resolve this" mean needs_review; otherwise it's pending.
+function stillAwaitingResult(text, games, ticketDate) {
+  const tokens = new Set();
+  for (const m of (text || "").match(/\(([^)]+)\)/g) || []) {
+    for (const part of m.slice(1, -1).split(/[,@/]/)) {
+      const tok = part.trim();
+      if (tok && tok.length <= 5 && /^[A-Za-z.]+$/.test(tok)) tokens.add(tok.toUpperCase());
+    }
+  }
+  if (tokens.size > 0) {
+    const matched = games.filter((g) => g.competitors.some((c) => tokens.has((c.abbreviation || "").toUpperCase())));
+    if (matched.length > 0) return matched.some((g) => g.state !== "post");
+  }
+  const todayStr = new Date().toISOString().slice(0, 10);
+  return Boolean(ticketDate && ticketDate >= todayStr);
 }
 
 async function gradeOneLeg(leg, ticketDate) {
   const parsed = parseLeg(leg.text, leg.type);
-  if (parsed.category === "unsupported") return { status: "needs_review", reason: parsed.reason };
 
   const base = ticketDate ? new Date(ticketDate + "T12:00:00Z") : new Date();
   const dates = [-1, 0, 1].map((delta) => {
@@ -839,10 +865,22 @@ async function gradeOneLeg(leg, ticketDate) {
   const gameLists = await Promise.all(dates.map(fetchGamesForDate));
   const games = gameLists.flat();
 
+  if (parsed.category === "unsupported") {
+    if (stillAwaitingResult(leg.text, games, ticketDate)) {
+      return { status: "pending", reason: `${parsed.reason} (game not final yet, so not calling this needs_review)` };
+    }
+    return { status: "needs_review", reason: parsed.reason };
+  }
+
   if (parsed.category === "stat" || parsed.category === "anytimeTd") {
     const statKey = parsed.category === "anytimeTd" ? "anytimeTd" : parsed.statKey;
-    const game = await resolveGameForProp(parsed, games, statKey);
-    if (!game) return { status: "needs_review", reason: "no confident game match for this player" };
+    const resolved = await resolveGameForProp(parsed, games, statKey);
+    if (resolved.pending) return { status: "pending", reason: "game not final yet" };
+    const game = resolved.game;
+    if (!game) {
+      if (stillAwaitingResult(leg.text, games, ticketDate)) return { status: "pending", reason: "no confident game match yet, but game not final" };
+      return { status: "needs_review", reason: "no confident game match for this player" };
+    }
     if (game.state !== "post") return { status: "pending", reason: "game not final yet" };
 
     if (parsed.category === "anytimeTd") {
@@ -869,7 +907,10 @@ async function gradeOneLeg(leg, ticketDate) {
   const teamQuery = parsed.team || parsed.rawA;
   const oppQuery = parsed.opponent || parsed.rawB;
   const game = findGame(games, teamQuery || "", oppQuery || "");
-  if (!game) return { status: "needs_review", reason: "no confident game match" };
+  if (!game) {
+    if (stillAwaitingResult(leg.text, games, ticketDate)) return { status: "pending", reason: "no confident game match yet, but game not final" };
+    return { status: "needs_review", reason: "no confident game match" };
+  }
   if (game.state !== "post") return { status: "pending", reason: "game not final yet" };
 
   const verdict = scoreLeg(parsed, game);
