@@ -36,6 +36,24 @@ async function getJson(url) {
   return res.json();
 }
 
+// Same as getJson, but for the-odds-api.com calls specifically: captures the
+// x-requests-used/x-requests-remaining/x-requests-last headers it returns on every
+// response (even a 4xx) and records them, so the odds-credit alert job always has the
+// latest real usage without needing its own separate call to the-odds-api.com.
+async function getOddsJson(url) {
+  const res = await fetch(url, { headers: { "User-Agent": "sports-proxy/0.1" } });
+  const usage = {
+    requestsUsed: res.headers.get("x-requests-used"),
+    requestsRemaining: res.headers.get("x-requests-remaining"),
+    requestsLast: res.headers.get("x-requests-last"),
+  };
+  if (usage.requestsUsed != null || usage.requestsRemaining != null) {
+    recordOddsUsage(usage).catch((err) => console.error("odds-usage record failed:", err.message));
+  }
+  if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
+  return res.json();
+}
+
 app.get("/espn/scoreboard", async (req, res) => {
   try {
     const { sport, league, date } = req.query;
@@ -93,7 +111,7 @@ app.get("/odds", async (req, res) => {
     url.searchParams.set("markets", markets || "h2h,spreads,totals");
     url.searchParams.set("oddsFormat", "american");
     url.searchParams.set("bookmakers", bookmakers || "draftkings");
-    const data = await getJson(url.toString());
+    const data = await getOddsJson(url.toString());
     const games = data.map((g) => ({
       event_id: g.id,
       matchup: `${g.away_team} @ ${g.home_team}`,
@@ -122,7 +140,7 @@ app.get("/odds/props", async (req, res) => {
       }
       const eventsUrl = new URL(`${ODDS_BASE}/sports/${sport_key}/events`);
       eventsUrl.searchParams.set("apiKey", ODDS_API_KEY);
-      const events = await getJson(eventsUrl.toString());
+      const events = await getOddsJson(eventsUrl.toString());
       const match = events.find(
         (e) =>
           (!home_team || e.home_team?.toLowerCase().includes(String(home_team).toLowerCase())) &&
@@ -137,7 +155,7 @@ app.get("/odds/props", async (req, res) => {
     url.searchParams.set("markets", markets);
     url.searchParams.set("oddsFormat", "american");
     url.searchParams.set("bookmakers", bookmakers || "draftkings");
-    const data = await getJson(url.toString());
+    const data = await getOddsJson(url.toString());
     const books = (data.bookmakers || []).map((b) => ({
       book: b.title,
       markets: (b.markets || []).map((m) => ({
@@ -195,6 +213,85 @@ async function getDoc(deskId, collection, docId) {
   const rows = await res.json();
   return rows[0] || null;
 }
+
+// --- Odds API credit tracking + alert (2026-10-23, Seb's request) ---
+// Every the-odds-api.com call (via getOddsJson above) reports its own current
+// requests-used/requests-remaining here. Stored once, under desk "main" (this is
+// account-wide usage, not desk-scoped data, but reuses the same docs table rather than
+// adding a new table). "quota" is used+remaining, recomputed every call, so it tracks
+// itself up automatically the moment Seb's plan is upgraded -- nothing here is a
+// hardcoded 500/month number. alertedThresholds resets itself the next time usage is
+// LOWER than last seen (the-odds-api resets requests-used at the start of each billing
+// cycle), so the same two DMs fire again next cycle instead of staying silenced forever.
+async function recordOddsUsage({ requestsUsed, requestsRemaining, requestsLast }) {
+  if (requestsUsed == null && requestsRemaining == null) return;
+  const used = requestsUsed != null ? Number(requestsUsed) : null;
+  const remaining = requestsRemaining != null ? Number(requestsRemaining) : null;
+  const prev = await getDoc("main", "oddsApiUsage", "current");
+  const prevData = prev?.data || {};
+  const cycleReset = prevData.requestsUsed != null && used != null && used < prevData.requestsUsed;
+  const alertedThresholds = cycleReset ? [] : prevData.alertedThresholds || [];
+  await upsertDoc("main", "oddsApiUsage", "current", {
+    requestsUsed: used,
+    requestsRemaining: remaining,
+    requestsLast: requestsLast != null ? Number(requestsLast) : prevData.requestsLast ?? null,
+    quota: used != null && remaining != null ? used + remaining : prevData.quota ?? null,
+    alertedThresholds,
+    updatedAt: new Date().toISOString(),
+  });
+}
+
+const ODDS_USAGE_ALERT_THRESHOLDS = [75, 90];
+
+// Pulled daily by a Supabase pg_cron job (see sports-proxy/sql/odds-usage-cron.sql) --
+// not Claude usage, same pattern as /internal/jobs/live-scores above. Reads the usage
+// doc recordOddsUsage keeps current, sends Seb a private DM the first time usage
+// crosses 75% or 90% of the current cycle's quota (used+remaining from the real
+// the-odds-api.com headers, so it adjusts itself the moment Seb's plan changes), and
+// remembers which thresholds it already sent so it never repeats one in the same cycle.
+// ?test=<percent> sends one clearly-labeled fake DM to prove the wiring works, without
+// touching the real usage doc or its dedup state at all -- use this once, manually, not
+// from the cron job.
+app.get("/internal/jobs/odds-usage-check", async (req, res) => {
+  try {
+    if (!TELEGRAM_SEB_CHAT_ID) return res.status(500).json({ error: "TELEGRAM_SEB_CHAT_ID not configured on the server." });
+    const dryRun = req.query.dryRun === "true";
+
+    if (req.query.test != null) {
+      const testPercent = Number(req.query.test);
+      const text =
+        `🧪 TEST — odds-credit alert wiring check.\n` +
+        `Simulated usage: ${testPercent}% of this cycle's the-odds-api quota.\n` +
+        `This is a test DM only -- no real usage data or dedup state was touched.`;
+      if (!dryRun) await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text, parse_mode: "HTML" });
+      return res.json({ ok: true, test: true, testPercent, sent: !dryRun, dryRun });
+    }
+
+    const doc = await getDoc("main", "oddsApiUsage", "current");
+    if (!doc || doc.data.requestsUsed == null || doc.data.requestsRemaining == null) {
+      return res.json({ ok: true, checked: false, reason: "no real odds-api usage recorded yet" });
+    }
+    const { requestsUsed: used, requestsRemaining: remaining, alertedThresholds = [] } = doc.data;
+    const quota = used + remaining;
+    const percent = quota > 0 ? (used / quota) * 100 : 0;
+    const newlyAlerted = [];
+    for (const threshold of ODDS_USAGE_ALERT_THRESHOLDS) {
+      if (percent >= threshold && !alertedThresholds.includes(threshold)) {
+        const text =
+          `⚠️ the-odds-api usage at ${percent.toFixed(1)}% (${used}/${quota} credits this cycle) ` +
+          `-- crossed the ${threshold}% alert line.`;
+        if (!dryRun) await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text, parse_mode: "HTML" });
+        newlyAlerted.push(threshold);
+      }
+    }
+    if (newlyAlerted.length && !dryRun) {
+      await upsertDoc("main", "oddsApiUsage", "current", { ...doc.data, alertedThresholds: [...alertedThresholds, ...newlyAlerted] });
+    }
+    res.json({ ok: true, checked: true, percent, used, remaining, quota, newlyAlerted, dryRun });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
 
 const LIVE_SCORE_SPORTS = [
   { key: "NFL", sport: "football", league: "nfl" },
