@@ -55,3 +55,26 @@ create table if not exists pick_sources (
   created_at timestamptz default now()
 );
 alter table pick_sources enable row level security;
+
+-- NBA blowout tracker (2026-10-24, Seb's request, rule nba-blowout-factor — DATA
+-- COLLECTION ONLY, nothing reads this for picks yet). Also kept as its own standalone
+-- file (sql/nba-blowout-table.sql) so it can be applied to an existing database without
+-- re-running this file's destructive `drop table` header above.
+create table if not exists nba_blowouts (
+  game_id text primary key,
+  date date not null,
+  away_team text not null,
+  home_team text not null,
+  winner text not null,
+  loser text not null,
+  margin_at_4min integer not null,
+  final_margin integer not null,
+  is_blowout boolean not null,
+  starters jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists idx_nba_blowouts_date on nba_blowouts (date);
+create index if not exists idx_nba_blowouts_winner on nba_blowouts (winner);
+create index if not exists idx_nba_blowouts_loser on nba_blowouts (loser);
+alter table nba_blowouts enable row level security;

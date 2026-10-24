@@ -1195,6 +1195,228 @@ for (const [route, { table, fields, orderBy }] of Object.entries(LEARNING_TABLES
   });
 }
 
+// --- NBA blowout tracker (2026-10-24, Seb's request) ---
+// Nightly engine job (no Claude usage): for every FINAL NBA game on a date, records the
+// score margin at the 4:00 mark of the 4th quarter (a 25+ margin there flags a blowout --
+// the point a trailing team's bench is typically already in) plus the final margin and
+// both teams' starters' minutes, so blowout rate and garbage-time starter-minutes loss can
+// be computed per team once there's enough sample. DATA COLLECTION ONLY -- see rule
+// nba-blowout-factor. Nothing reads this for picks yet; the Monday/Thursday NBA Tracker
+// refresh merges it into nbaTeams as reference data only.
+
+// ESPN's team abbreviations don't always match the Desk's nbaTeams doc ids.
+const ESPN_TO_NBA_ABBR = { GS: "GSW", NO: "NOP", NY: "NYK", SA: "SAS", UTAH: "UTA", WSH: "WAS" };
+function nbaAbbr(a) {
+  return ESPN_TO_NBA_ABBR[a] || a;
+}
+
+function secondsRemaining(clockDisplay) {
+  const m = /^(\d+):(\d+)/.exec(clockDisplay || "");
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+// Score (away, home) as of the play closest to 4:00 remaining in the 4th quarter --
+// prefers the last play still at >=240s remaining, so the snapshot is the score AS the
+// clock reaches 4:00 rather than just after. Play-by-play granularity means this is a
+// close approximation, not an exact frame.
+function marginAtFourMinutes(plays) {
+  const q4 = (plays || []).filter((p) => p.period?.number === 4);
+  let best = null;
+  let bestDiff = Infinity;
+  for (const p of q4) {
+    const sec = secondsRemaining(p.clock?.displayValue);
+    if (sec == null) continue;
+    const diff = sec >= 240 ? sec - 240 : 240 - sec + 0.5; // ties prefer the >=240s side
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = p;
+    }
+  }
+  if (!best || best.awayScore == null || best.homeScore == null) return null;
+  return { away: Number(best.awayScore), home: Number(best.homeScore) };
+}
+
+function extractStarters(boxscorePlayers) {
+  const out = {};
+  for (const teamBlock of boxscorePlayers || []) {
+    const abbr = nbaAbbr(teamBlock.team?.abbreviation);
+    if (!abbr) continue;
+    const stat = teamBlock.statistics?.[0];
+    const athletes = stat?.athletes || [];
+    const minIdx = (stat?.keys || []).indexOf("minutes");
+    out[abbr] = athletes
+      .filter((a) => a.starter)
+      .map((a) => ({
+        name: a.athlete?.displayName,
+        position: a.athlete?.position?.abbreviation,
+        minutes: Number(a.stats?.[minIdx >= 0 ? minIdx : 0]) || 0,
+      }));
+  }
+  return out;
+}
+
+async function upsertBlowoutRow(row) {
+  await supabaseFetch(`/nba_blowouts?on_conflict=game_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ ...row, updated_at: new Date().toISOString() }]),
+  });
+}
+
+async function trackBlowoutsForDate(yyyymmdd) {
+  const result = { date: yyyymmdd, gamesFound: 0, gamesRecorded: 0, skipped: [] };
+  let scoreboard;
+  try {
+    scoreboard = await getJson(`${ESPN_BASE}/basketball/nba/scoreboard?dates=${yyyymmdd}`);
+  } catch (err) {
+    result.error = err.message;
+    return result;
+  }
+  const events = (scoreboard.events || []).filter((ev) => ev.status?.type?.state === "post");
+  result.gamesFound = events.length;
+  for (const ev of events) {
+    try {
+      const comp = ev.competitions?.[0];
+      const away = comp?.competitors?.find((c) => c.homeAway === "away");
+      const home = comp?.competitors?.find((c) => c.homeAway === "home");
+      if (!away || !home) {
+        result.skipped.push({ id: ev.id, reason: "missing competitors" });
+        continue;
+      }
+      const awayAbbr = nbaAbbr(away.team?.abbreviation);
+      const homeAbbr = nbaAbbr(home.team?.abbreviation);
+      const finalAway = Number(away.score);
+      const finalHome = Number(home.score);
+      const winnerAbbr = finalAway > finalHome ? awayAbbr : homeAbbr;
+      const loserAbbr = finalAway > finalHome ? homeAbbr : awayAbbr;
+      const finalMargin = Math.abs(finalAway - finalHome);
+
+      const summary = await getJson(`${ESPN_BASE}/basketball/nba/summary?event=${ev.id}`);
+      const snap = marginAtFourMinutes(summary.plays);
+      if (!snap) {
+        result.skipped.push({ id: ev.id, reason: "no Q4 4:00 play found (OT game or missing play-by-play)" });
+        continue;
+      }
+      const marginAt4 = Math.abs(snap.away - snap.home);
+      const starters = extractStarters(summary.boxscore?.players);
+
+      await upsertBlowoutRow({
+        game_id: ev.id,
+        date: `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`,
+        away_team: awayAbbr,
+        home_team: homeAbbr,
+        winner: winnerAbbr,
+        loser: loserAbbr,
+        margin_at_4min: marginAt4,
+        final_margin: finalMargin,
+        is_blowout: marginAt4 >= 25,
+        starters,
+      });
+      result.gamesRecorded++;
+    } catch (err) {
+      result.skipped.push({ id: ev.id, reason: err.message });
+    }
+  }
+  return result;
+}
+
+// Pulled nightly by a Supabase pg_cron job (see sports-proxy/sql/nba-blowout-cron.sql).
+// ?date=YYYYMMDD does one night (default: yesterday in ET, since games finish after
+// midnight UTC); ?from=&to=YYYYMMDD (both YYYYMMDD) backfills every date in the range
+// inclusive -- used once to backfill the season to date, safe to re-run since every write
+// upserts on game_id.
+app.get("/internal/jobs/nba-blowout-tracker", async (req, res) => {
+  try {
+    const { date, from, to } = req.query;
+    const dates = [];
+    if (from && to) {
+      let d = new Date(Date.UTC(Number(from.slice(0, 4)), Number(from.slice(4, 6)) - 1, Number(from.slice(6, 8))));
+      const end = new Date(Date.UTC(Number(to.slice(0, 4)), Number(to.slice(4, 6)) - 1, Number(to.slice(6, 8))));
+      while (d <= end) {
+        dates.push(d.toISOString().slice(0, 10).replace(/-/g, ""));
+        d.setUTCDate(d.getUTCDate() + 1);
+      }
+    } else if (date) {
+      dates.push(date);
+    } else {
+      const yesterdayET = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      dates.push(yesterdayET.toISOString().slice(0, 10).replace(/-/g, ""));
+    }
+    const results = [];
+    for (const d of dates) {
+      results.push(await trackBlowoutsForDate(d));
+    }
+    res.json({
+      ok: true,
+      nights: results.length,
+      gamesRecorded: results.reduce((s, r) => s + r.gamesRecorded, 0),
+      results,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Desk-facing read: per-team blowout risk, computed on read from nba_blowouts rows.
+// Used by the Monday/Thursday NBA Tracker refresh instead of WebFetch (which has been
+// failing) — plain GET, no Supabase access needed by the caller.
+app.get("/api/nba/blowout-risk", async (req, res) => {
+  try {
+    const r = await supabaseFetch(`/nba_blowouts?select=*&order=date.asc&limit=2000`);
+    const rows = await r.json();
+    const byTeam = {};
+    const ensure = (team) =>
+      (byTeam[team] ||= {
+        team,
+        gamesPlayed: 0,
+        gamesAsWinner: 0,
+        gamesAsLoser: 0,
+        blowoutsAsWinner: 0,
+        blowoutsAsLoser: 0,
+        starterMinutesInBlowouts: [],
+        starterMinutesNormal: [],
+      });
+    for (const row of rows) {
+      const winner = ensure(row.winner);
+      const loser = ensure(row.loser);
+      winner.gamesPlayed++;
+      loser.gamesPlayed++;
+      winner.gamesAsWinner++;
+      loser.gamesAsLoser++;
+      if (row.is_blowout) {
+        winner.blowoutsAsWinner++;
+        loser.blowoutsAsLoser++;
+      }
+      for (const abbr of [row.away_team, row.home_team]) {
+        const starters = row.starters?.[abbr] || [];
+        if (!starters.length || !byTeam[abbr]) continue;
+        const avgMin = starters.reduce((s, p) => s + (p.minutes || 0), 0) / starters.length;
+        (row.is_blowout ? byTeam[abbr].starterMinutesInBlowouts : byTeam[abbr].starterMinutesNormal).push(avgMin);
+      }
+    }
+    const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+    const teams = Object.values(byTeam).map((t) => {
+      const normalAvg = avg(t.starterMinutesNormal);
+      const blowoutAvg = avg(t.starterMinutesInBlowouts);
+      return {
+        team: t.team,
+        sampleSize: t.gamesPlayed,
+        blowoutRateAsWinner: t.gamesAsWinner ? Number((t.blowoutsAsWinner / t.gamesAsWinner).toFixed(3)) : null,
+        blowoutRateAsLoser: t.gamesAsLoser ? Number((t.blowoutsAsLoser / t.gamesAsLoser).toFixed(3)) : null,
+        blowoutRateOverall: t.gamesPlayed
+          ? Number(((t.blowoutsAsWinner + t.blowoutsAsLoser) / t.gamesPlayed).toFixed(3))
+          : null,
+        avgStarterMinutesDropInBlowouts:
+          normalAvg != null && blowoutAvg != null ? Number((normalAvg - blowoutAvg).toFixed(1)) : null,
+      };
+    });
+    res.json({ ok: true, updatedAt: new Date().toISOString(), gamesTracked: rows.length, teams });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`sports-proxy listening on ${PORT}`));
