@@ -796,6 +796,9 @@ function scoreLeg(parsed, game) {
     const over = mine.score > parsed.line;
     return (parsed.direction === "over") === over ? "hit" : "miss";
   }
+  if (parsed.category === "draw") {
+    return comps[0].score === comps[1].score ? "hit" : "miss";
+  }
   return null;
 }
 
@@ -1115,7 +1118,6 @@ app.get("/internal/jobs/grader", async (req, res) => {
       const pendingIdx = legs
         .map((l, i) => ({ l, i }))
         .filter(({ l }) => !l.status || l.status === "pending" || l.status === "needs_review");
-      if (pendingIdx.length === 0) continue;
 
       let changed = false;
       const newLegs = [...legs];
@@ -1126,9 +1128,18 @@ app.get("/internal/jobs/grader", async (req, res) => {
           changed = true;
         }
       }
-      if (!changed) continue;
 
+      // Roll up and write even when no leg changed this run (including when pendingIdx was
+      // empty from the start, i.e. every leg was ALREADY hit/miss/push -- a ticket whose legs
+      // came in pre-graded, e.g. read straight off an uploaded slip, never had a "pending" leg
+      // for this loop to grade, so its own ticket-level `status` field could sit wrong
+      // (stuck "needs_review"/"pending") forever with nothing to ever correct it. Comparing
+      // against the ticket's CURRENT stored status, not just whether a leg changed, is what
+      // catches that. Found 2026-10-28: 2 real MAIN tickets stuck this way, fully graded legs
+      // but a stale ticket-level status.
       const newTicketStatus = rollUpTicketStatus(newLegs);
+      if (!changed && newTicketStatus === data.status) continue;
+
       const newData = { ...data, legs: newLegs, status: newTicketStatus };
       await upsertDoc(desk, "parlays", doc.doc_id, newData);
       results.push({ ticketId: doc.doc_id, newStatus: newTicketStatus, legStatuses: newLegs.map((l) => l.status) });

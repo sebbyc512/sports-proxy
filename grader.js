@@ -164,6 +164,13 @@ const ANYTIME_TD_PATTERNS = [
   new RegExp(`^(?<player>${PLAYER})\\s*-?\\s*Anytime (?:TD|Touchdown)(?: Scorer)?\\s*(?:\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\))?\\s*(?:[+-]\\d+)?$`, "iu"),
 ];
 
+// "Alaves vs Malaga draw (3:00 PM ET)" / "A vs B Tie" — a correlated-draw leg, stored with
+// type "other" since it's neither a straight moneyline nor a spread/total. Kickoff-time and
+// low-confidence-marker parens already stripped by normalize() before this runs.
+const DRAW_PATTERNS = [
+  new RegExp(`^(?<a>${TEAM}) ${SEP} (?<b>${TEAM}) (?:Draw|Tie)$`, "iu"),
+];
+
 function tryPatterns(text, patterns) {
   for (const re of patterns) {
     const m = text.match(re);
@@ -233,6 +240,10 @@ function parseLeg(text, legType) {
     }
   }
   if (legType !== "ftd") {
+    const draw = tryPatterns(t, DRAW_PATTERNS);
+    if (draw) {
+      return { category: "draw", rawA: draw.a.trim(), rawB: draw.b.trim() };
+    }
     const td = tryPatterns(t, ANYTIME_TD_PATTERNS);
     if (td) {
       return {
