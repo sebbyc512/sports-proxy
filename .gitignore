@@ -2,4 +2,4 @@ node_modules/
 .env
 migration/
 sql/run-me.sql
-sql/app-github-dispatch-run-me.sql
+sql/app-wake-sync-run-me.sql

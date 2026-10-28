@@ -513,70 +513,72 @@ app.post("/internal/jobs/telegram-send-raw", async (req, res) => {
   }
 });
 
-// --- GitHub dispatch relay (2026-10-28, instant-wake for Post-Cutover Sync) ---
+// --- Instant-wake relay for Post-Cutover Sync (2026-10-28) ---
 // A Supabase `docs` trigger calls this the moment the APP inserts a new requests/appUploads/
-// appEdits row, so a GitHub-webhook-triggered cloud routine can pick it up within seconds
-// instead of waiting for the hourly cron. Also called a second time by the pick-request
-// builder triggers right after they answer a request, so the round-trip (ticket pushed up +
-// Supabase request marked "answered") doesn't wait for the next hourly tick either.
-// Rate-limited to at most one real GitHub call per 90s (in-memory -- resets on redeploy, which
-// is fine: this is a courtesy coalesce so a burst of app inserts fires one dispatch, not a
-// correctness guarantee. The cloud routine's own idempotent status checks are what actually
-// prevent double-processing, same as every other Phase 0 step already relies on.)
-// A call made DURING the cooldown is never just dropped: it schedules one trailing dispatch
-// for the moment the cooldown ends (at most one pending at a time -- a second call while one
-// is already scheduled just no-ops), so e.g. an app request made 30s after an upload still
-// wakes the sync once the window clears, instead of waiting for the one that already fired.
-const GITHUB_DISPATCH_TOKEN = process.env.GITHUB_DISPATCH_TOKEN;
-const GITHUB_DISPATCH_REPO = process.env.GITHUB_DISPATCH_REPO; // "owner/repo"
-const GITHUB_DISPATCH_COOLDOWN_MS = 90_000;
-let lastGithubDispatchAt = 0;
-let trailingGithubDispatchTimer = null;
+// appEdits row, so the routine can pick it up within seconds instead of waiting for the hourly
+// cron. Also called a second time by the pick-request builder triggers right after they answer
+// a request, so the round-trip (ticket pushed up + Supabase request marked "answered") doesn't
+// wait for the next hourly tick either.
+// Fires Post-Cutover Sync directly via its own "API" trigger (claude.ai/code routine Fire URL +
+// token, generated once in that routine's trigger settings) -- no GitHub/webhook plumbing
+// needed. The appended `text` carries the FAST_PATH_WAKE marker the routine's own prompt
+// branches on, so a woken run only does Phase 0 + 1 + 1c and the scheduled hourly fire (which
+// carries no such text) still does the full Phase 0-4 sync.
+// Rate-limited to at most one real fire per 90s (in-memory -- resets on redeploy, which is
+// fine: this is a courtesy coalesce so a burst of app inserts fires once, not a correctness
+// guarantee. The routine's own idempotent status checks are what actually prevent
+// double-processing, same as every other Phase 0 step already relies on.) A call made DURING
+// the cooldown is never just dropped: it schedules one trailing fire for the moment the
+// cooldown ends (at most one pending at a time -- a second call while one is already scheduled
+// just no-ops), so e.g. an app request made 30s after an upload still wakes the sync once the
+// window clears, instead of waiting for the one that already fired.
+const CLAUDE_FIRE_URL = process.env.CLAUDE_FIRE_URL;
+const CLAUDE_FIRE_TOKEN = process.env.CLAUDE_FIRE_TOKEN;
+const SYNC_WAKE_COOLDOWN_MS = 90_000;
+let lastSyncWakeAt = 0;
+let trailingSyncWakeTimer = null;
 
-async function sendGithubDispatch() {
-  lastGithubDispatchAt = Date.now();
-  const ghRes = await fetch(`https://api.github.com/repos/${GITHUB_DISPATCH_REPO}/dispatches`, {
+async function sendSyncWake() {
+  lastSyncWakeAt = Date.now();
+  const fireRes = await fetch(CLAUDE_FIRE_URL, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${GITHUB_DISPATCH_TOKEN}`,
-      "Accept": "application/vnd.github+json",
+      "Authorization": `Bearer ${CLAUDE_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
       "Content-Type": "application/json",
-      "User-Agent": "sports-proxy/0.1",
     },
-    body: JSON.stringify({
-      event_type: "parlay-desk-sync",
-      client_payload: { at: new Date().toISOString() },
-    }),
+    body: JSON.stringify({ text: "FAST_PATH_WAKE" }),
   });
-  if (!ghRes.ok) {
-    const body = await ghRes.text();
-    throw new Error(`GitHub dispatch -> HTTP ${ghRes.status}: ${body}`);
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`Sync wake fire -> HTTP ${fireRes.status}: ${body}`);
   }
 }
 
-app.post("/internal/jobs/github-dispatch", async (req, res) => {
+app.post("/internal/jobs/wake-sync", async (req, res) => {
   try {
-    if (!GITHUB_DISPATCH_TOKEN || !GITHUB_DISPATCH_REPO) {
-      return res.status(500).json({ error: "GITHUB_DISPATCH_TOKEN/GITHUB_DISPATCH_REPO not configured on the server." });
+    if (!CLAUDE_FIRE_URL || !CLAUDE_FIRE_TOKEN) {
+      return res.status(500).json({ error: "CLAUDE_FIRE_URL/CLAUDE_FIRE_TOKEN not configured on the server." });
     }
-    const sinceLast = Date.now() - lastGithubDispatchAt;
-    if (sinceLast >= GITHUB_DISPATCH_COOLDOWN_MS) {
-      await sendGithubDispatch();
-      return res.json({ ok: true, dispatched: true });
+    const sinceLast = Date.now() - lastSyncWakeAt;
+    if (sinceLast >= SYNC_WAKE_COOLDOWN_MS) {
+      await sendSyncWake();
+      return res.json({ ok: true, fired: true });
     }
-    if (trailingGithubDispatchTimer) {
-      return res.json({ ok: true, dispatched: false, reason: "cooldown", trailingAlreadyScheduled: true });
+    if (trailingSyncWakeTimer) {
+      return res.json({ ok: true, fired: false, reason: "cooldown", trailingAlreadyScheduled: true });
     }
-    const delay = GITHUB_DISPATCH_COOLDOWN_MS - sinceLast;
-    trailingGithubDispatchTimer = setTimeout(async () => {
-      trailingGithubDispatchTimer = null;
+    const delay = SYNC_WAKE_COOLDOWN_MS - sinceLast;
+    trailingSyncWakeTimer = setTimeout(async () => {
+      trailingSyncWakeTimer = null;
       try {
-        await sendGithubDispatch();
+        await sendSyncWake();
       } catch (err) {
-        console.error("Trailing GitHub dispatch failed:", err.message);
+        console.error("Trailing sync wake failed:", err.message);
       }
     }, delay);
-    res.json({ ok: true, dispatched: false, reason: "cooldown", trailingScheduledInMs: delay });
+    res.json({ ok: true, fired: false, reason: "cooldown", trailingScheduledInMs: delay });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -1190,6 +1192,63 @@ app.post("/api/:desk/docs/:collection/:docId", async (req, res) => {
     if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "JSON body required" });
     await upsertDoc(req.params.desk, req.params.collection, req.params.docId, req.body);
     res.json({ ok: true });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Atomic claim (2026-10-28): the plain POST above is a blind upsert, fine for one writer --
+// but now that Post-Cutover Sync can be woken mid-cycle by the fast path AND still run on its
+// own hourly cron, two overlapping runs could both see the same appUpload/appEdit/request at
+// "pending" and both process it (double BET PLACED, worst case). This calls a single Postgres
+// UPDATE ... WHERE data->>'status' = expected (claim_doc_status, see sql/app-wake-sync.sql) --
+// row-level locking means only the first of two concurrent callers actually matches that WHERE
+// clause and updates anything; the other gets `claimed:false` back and must skip the row
+// entirely rather than process it. Call this BEFORE doing any real work on a row, not just
+// before the final write.
+app.post("/api/:desk/docs/:collection/:docId/claim", async (req, res) => {
+  try {
+    if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
+    const { expected, next } = req.body || {};
+    if (!expected || !next) return res.status(400).json({ error: "expected and next are required" });
+    const r = await supabaseFetch(`/rpc/claim_doc_status`, {
+      method: "POST",
+      body: JSON.stringify({
+        p_desk_id: req.params.desk,
+        p_collection: req.params.collection,
+        p_doc_id: req.params.docId,
+        p_expected: expected,
+        p_next: next,
+      }),
+    });
+    const claimed = await r.json();
+    res.json({ ok: true, claimed: claimed === true });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Stuck-claim recovery (2026-10-28): if a run dies right after claiming a row (crash, killed
+// task) before finishing it, that row would sit at "processing" forever -- nothing would ever
+// touch it again. The hourly FULL run (never the fast path -- see Post-Cutover Sync's own
+// prompt) sweeps for rows still "processing" with a `claimedAt` older than staleMinutes
+// (default 20) and takes them over via reclaim_stuck_doc, same atomic
+// UPDATE-with-the-check-in-the-WHERE-clause pattern as /claim above.
+app.post("/api/:desk/docs/:collection/:docId/reclaim-stuck", async (req, res) => {
+  try {
+    if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
+    const staleMinutes = Number(req.body?.staleMinutes) || 20;
+    const r = await supabaseFetch(`/rpc/reclaim_stuck_doc`, {
+      method: "POST",
+      body: JSON.stringify({
+        p_desk_id: req.params.desk,
+        p_collection: req.params.collection,
+        p_doc_id: req.params.docId,
+        p_stale_minutes: staleMinutes,
+      }),
+    });
+    const claimed = await r.json();
+    res.json({ ok: true, claimed: claimed === true });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
