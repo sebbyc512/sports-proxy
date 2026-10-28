@@ -799,6 +799,15 @@ function scoreLeg(parsed, game) {
   if (parsed.category === "draw") {
     return comps[0].score === comps[1].score ? "hit" : "miss";
   }
+  if (parsed.category === "doubleChance") {
+    const isTie = (n) => /^(tie|draw)$/i.test(n.trim());
+    const options = [parsed.first, parsed.second];
+    if (comps[0].score === comps[1].score) {
+      return options.some(isTie) ? "hit" : "miss";
+    }
+    const winner = comps[0].score > comps[1].score ? comps[0] : comps[1];
+    return options.some((n) => !isTie(n) && teamMatches(n, winner)) ? "hit" : "miss";
+  }
   return null;
 }
 

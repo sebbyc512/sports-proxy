@@ -171,6 +171,13 @@ const DRAW_PATTERNS = [
   new RegExp(`^(?<a>${TEAM}) ${SEP} (?<b>${TEAM}) (?:Draw|Tie)$`, "iu"),
 ];
 
+// "Athletic Bilbao or Tie Double Chance (Athletic Bilbao vs Getafe)" / "Tie or Bayern Munchen
+// Double Chance (Freiburg vs Bayern Munchen)" — a team-or-draw (or team-or-team) combined
+// market, stored with type "other". Hit if the real result matches EITHER named outcome.
+const DOUBLE_CHANCE_PATTERNS = [
+  new RegExp(`^(?<first>${TEAM}) or (?<second>${TEAM}) Double Chance\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)$`, "iu"),
+];
+
 function tryPatterns(text, patterns) {
   for (const re of patterns) {
     const m = text.match(re);
@@ -240,6 +247,16 @@ function parseLeg(text, legType) {
     }
   }
   if (legType !== "ftd") {
+    const dc = tryPatterns(t, DOUBLE_CHANCE_PATTERNS);
+    if (dc) {
+      return {
+        category: "doubleChance",
+        first: dc.first.trim(),
+        second: dc.second.trim(),
+        rawA: dc.a.trim(),
+        rawB: dc.b.trim(),
+      };
+    }
     const draw = tryPatterns(t, DRAW_PATTERNS);
     if (draw) {
       return { category: "draw", rawA: draw.a.trim(), rawB: draw.b.trim() };
