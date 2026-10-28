@@ -496,10 +496,11 @@ app.post("/internal/jobs/telegram-alert", async (req, res) => {
   }
 });
 
-// Free-text send for manual corrections only (e.g. retracting a bad telegram-alert send) --
-// no caption template, no dedup, no timing hold. Not called by any automated task; this exists
-// so a mistaken post can be corrected without inventing a fake "kind" to abuse telegram-alert's
-// templates. dryRun defaults to true, same convention as the other Telegram endpoints.
+// Free-text send -- no caption template, no dedup, no timing hold. Used for manual corrections
+// (e.g. retracting a bad telegram-alert send) so a mistaken post can be fixed without inventing
+// a fake "kind" to abuse telegram-alert's templates. Also used by the automated BET PLACED
+// alerts (Post-Cutover Sync + Friends Desk step 0) to post newly-placed entries to the group.
+// dryRun defaults to true, same convention as the other Telegram endpoints.
 app.post("/internal/jobs/telegram-send-raw", async (req, res) => {
   try {
     const { chatId, text, dryRun = true } = req.body || {};
@@ -1146,6 +1147,28 @@ for (const collection of ["parlays", "pnlEntries", "rules", "requests"]) {
     }
   });
 }
+
+// --- App uploads: slip image fetch (Session B, Phase 3A "app can save") ---
+// The 'slips' Storage bucket is private -- only the SERVICE key can read it. The Slip
+// reader trigger (B4) has no Supabase credentials of its own and never should; it calls
+// this proxy-token-protected endpoint instead, same pattern as every other engine call.
+app.get("/api/:desk/slip-image", async (req, res) => {
+  try {
+    if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
+    const path = req.query.path;
+    if (!path || !path.startsWith(`${req.params.desk}/`)) {
+      return res.status(400).json({ error: "path is required and must start with '<desk>/'" });
+    }
+    const r = await fetch(`${SUPABASE_URL}/storage/v1/object/slips/${path}`, {
+      headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}` },
+    });
+    if (!r.ok) return res.status(r.status).json({ error: await r.text() });
+    res.set("Content-Type", r.headers.get("content-type") || "application/octet-stream");
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
 
 // --- Phase 3 prep tables (model_versions, learning_log, pick_sources) ---
 // These have no desk_id column (schema.sql) -- they're global learning-history tables, not
