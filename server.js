@@ -1035,9 +1035,15 @@ app.get("/internal/jobs/grader", async (req, res) => {
     for (const doc of docs) {
       const data = doc.data;
       const legs = data.legs || [];
+      // Re-check "needs_review" too, not just "pending" -- a leg can land on needs_review
+      // while its game is still in progress (stillAwaitingResult correctly defers a hard
+      // "needs_review" call at that point), but was previously never revisited once the
+      // game went final, so it stayed wrong indefinitely instead of resolving to a real
+      // hit/miss/push. Found 2026-10-28: 3 real MAIN/Steve/Lela tickets stuck needs_review
+      // for 6-9h after their games finished.
       const pendingIdx = legs
         .map((l, i) => ({ l, i }))
-        .filter(({ l }) => !l.status || l.status === "pending");
+        .filter(({ l }) => !l.status || l.status === "pending" || l.status === "needs_review");
       if (pendingIdx.length === 0) continue;
 
       let changed = false;
