@@ -10,6 +10,13 @@
 -- appended turn telling the routine's prompt to run its FAST PATH (Phase 0 + 1 + 1c only)
 -- instead of waiting for the hourly cron.
 --
+-- TOKEN: passed as ?token=... in the URL, same as every other pg_net call in this project
+-- (odds-usage-cron.sql, nba-blowout-cron.sql) -- NOT as a custom header. An earlier version
+-- of this file sent it via an x-proxy-token header on net.http_post and got a 401 back
+-- (net._http_response showed "Missing or invalid token" even though the token value was
+-- right) -- query-string is the pattern actually proven to work against this server's
+-- requireToken middleware, so that's what every call here uses now.
+--
 -- AFTER INSERT ONLY, never AFTER UPDATE: the app's RLS policy (docs_app_insert, see
 -- app-rls.sql) only ever lets the app insert new rows, never update existing ones -- so a
 -- row's INSERT *is* "the app created this." The sync engine's own writes to these same rows
@@ -57,11 +64,8 @@ begin
      and coalesce(NEW.data->>'status', '') in ('queued', 'pending')
   then
     perform net.http_post(
-      url := 'https://sports-proxy-nv9n.onrender.com/internal/jobs/wake-sync',
-      headers := jsonb_build_object(
-        'Content-Type', 'application/json',
-        'x-proxy-token', '<PROXY_TOKEN from rule sports-proxy-source>'
-      ),
+      url := 'https://sports-proxy-nv9n.onrender.com/internal/jobs/wake-sync?token=<PROXY_TOKEN from rule sports-proxy-source>',
+      headers := '{"Content-Type": "application/json"}'::jsonb,
       body := '{}'::jsonb
     );
   end if;
