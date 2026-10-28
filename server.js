@@ -1123,10 +1123,14 @@ function rollUpTicketStatus(legs) {
 
 app.get("/internal/jobs/grader", async (req, res) => {
   const desk = req.query.desk;
+  // "collection" lets this same grader run against any single-ticket-shaped collection,
+  // not just "parlays" -- added 2026-10-28 for "ftd" (First TD options queue), which uses
+  // the identical {legs:[{text,type,status}], status} shape, just one leg per doc.
+  const collection = req.query.collection || "parlays";
   if (!DESKS.includes(desk)) return res.status(404).json({ error: "unknown desk" });
   try {
     const listRes = await supabaseFetch(
-      `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.parlays&select=doc_id,data,version`
+      `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.${encodeURIComponent(collection)}&select=doc_id,data,version`
     );
     const docs = await listRes.json();
     const results = [];
@@ -1165,10 +1169,52 @@ app.get("/internal/jobs/grader", async (req, res) => {
       if (!changed && newTicketStatus === data.status) continue;
 
       const newData = { ...data, legs: newLegs, status: newTicketStatus };
-      await upsertDoc(desk, "parlays", doc.doc_id, newData);
+      await upsertDoc(desk, collection, doc.doc_id, newData);
       results.push({ ticketId: doc.doc_id, newStatus: newTicketStatus, legStatuses: newLegs.map((l) => l.status) });
     }
-    res.json({ ok: true, ticketsChecked: docs.length, ticketsUpdated: results.length, results });
+    res.json({ ok: true, collection, ticketsChecked: docs.length, ticketsUpdated: results.length, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- First TD weekly archive (2026-10-28, Seb's request) ---
+// Tuesday-morning engine job (pg_cron, not a Claude run -- see sports-proxy/sql/ftd-archive-cron.sql),
+// scheduled AFTER the NFL TD weekly learning loop has graded the week's "ftd" docs. Moves every
+// doc in collection "ftd" for a desk into collection "ftdHistory" under the SAME doc_id (so the
+// learning loop and any later lookup can still find a given week's option by id), then deletes it
+// from "ftd" so the app's First TD tab starts the new week empty. With no ?desk given, runs for
+// both "main" and "steve" (Seb's desk and Steve's desk get the same First TD options and the same
+// archive treatment; Lela is not on this feature). Safe to re-run: archiving an already-empty "ftd"
+// collection for a desk is just a no-op for that desk.
+async function archiveFtdForDesk(desk) {
+  const listRes = await supabaseFetch(
+    `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.ftd&select=doc_id,data`
+  );
+  const docs = await listRes.json();
+  for (const doc of docs) {
+    await upsertDoc(desk, "ftdHistory", doc.doc_id, doc.data);
+  }
+  if (docs.length > 0) {
+    await supabaseFetch(
+      `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.ftd`,
+      { method: "DELETE" }
+    );
+  }
+  return docs.length;
+}
+
+app.get("/internal/jobs/archive-ftd", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
+  for (const d of desks) {
+    if (!DESKS.includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  }
+  try {
+    const archived = {};
+    for (const d of desks) {
+      archived[d] = await archiveFtdForDesk(d);
+    }
+    res.json({ ok: true, archived });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -1303,7 +1349,7 @@ app.delete("/api/:desk/docs/:collection/:docId", async (req, res) => {
 });
 
 // Convenience read-only shortcuts for the desk's most-used collections.
-for (const collection of ["parlays", "pnlEntries", "rules", "requests"]) {
+for (const collection of ["parlays", "pnlEntries", "rules", "requests", "ftd", "ftdHistory"]) {
   app.get(`/api/:desk/${collection}`, async (req, res) => {
     try {
       if (!DESKS.includes(req.params.desk)) return res.status(404).json({ error: "unknown desk" });
