@@ -513,6 +513,75 @@ app.post("/internal/jobs/telegram-send-raw", async (req, res) => {
   }
 });
 
+// --- GitHub dispatch relay (2026-10-28, instant-wake for Post-Cutover Sync) ---
+// A Supabase `docs` trigger calls this the moment the APP inserts a new requests/appUploads/
+// appEdits row, so a GitHub-webhook-triggered cloud routine can pick it up within seconds
+// instead of waiting for the hourly cron. Also called a second time by the pick-request
+// builder triggers right after they answer a request, so the round-trip (ticket pushed up +
+// Supabase request marked "answered") doesn't wait for the next hourly tick either.
+// Rate-limited to at most one real GitHub call per 90s (in-memory -- resets on redeploy, which
+// is fine: this is a courtesy coalesce so a burst of app inserts fires one dispatch, not a
+// correctness guarantee. The cloud routine's own idempotent status checks are what actually
+// prevent double-processing, same as every other Phase 0 step already relies on.)
+// A call made DURING the cooldown is never just dropped: it schedules one trailing dispatch
+// for the moment the cooldown ends (at most one pending at a time -- a second call while one
+// is already scheduled just no-ops), so e.g. an app request made 30s after an upload still
+// wakes the sync once the window clears, instead of waiting for the one that already fired.
+const GITHUB_DISPATCH_TOKEN = process.env.GITHUB_DISPATCH_TOKEN;
+const GITHUB_DISPATCH_REPO = process.env.GITHUB_DISPATCH_REPO; // "owner/repo"
+const GITHUB_DISPATCH_COOLDOWN_MS = 90_000;
+let lastGithubDispatchAt = 0;
+let trailingGithubDispatchTimer = null;
+
+async function sendGithubDispatch() {
+  lastGithubDispatchAt = Date.now();
+  const ghRes = await fetch(`https://api.github.com/repos/${GITHUB_DISPATCH_REPO}/dispatches`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${GITHUB_DISPATCH_TOKEN}`,
+      "Accept": "application/vnd.github+json",
+      "Content-Type": "application/json",
+      "User-Agent": "sports-proxy/0.1",
+    },
+    body: JSON.stringify({
+      event_type: "parlay-desk-sync",
+      client_payload: { at: new Date().toISOString() },
+    }),
+  });
+  if (!ghRes.ok) {
+    const body = await ghRes.text();
+    throw new Error(`GitHub dispatch -> HTTP ${ghRes.status}: ${body}`);
+  }
+}
+
+app.post("/internal/jobs/github-dispatch", async (req, res) => {
+  try {
+    if (!GITHUB_DISPATCH_TOKEN || !GITHUB_DISPATCH_REPO) {
+      return res.status(500).json({ error: "GITHUB_DISPATCH_TOKEN/GITHUB_DISPATCH_REPO not configured on the server." });
+    }
+    const sinceLast = Date.now() - lastGithubDispatchAt;
+    if (sinceLast >= GITHUB_DISPATCH_COOLDOWN_MS) {
+      await sendGithubDispatch();
+      return res.json({ ok: true, dispatched: true });
+    }
+    if (trailingGithubDispatchTimer) {
+      return res.json({ ok: true, dispatched: false, reason: "cooldown", trailingAlreadyScheduled: true });
+    }
+    const delay = GITHUB_DISPATCH_COOLDOWN_MS - sinceLast;
+    trailingGithubDispatchTimer = setTimeout(async () => {
+      trailingGithubDispatchTimer = null;
+      try {
+        await sendGithubDispatch();
+      } catch (err) {
+        console.error("Trailing GitHub dispatch failed:", err.message);
+      }
+    }, delay);
+    res.json({ ok: true, dispatched: false, reason: "cooldown", trailingScheduledInMs: delay });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Telegram private-chat routing (2026-10-22, Seb's request) ---
 // The group chat (real chat_id, passed by the caller as before) keeps getting ONLY the 5
 // bet-lifecycle captions above -- unchanged. Everything below always goes to Seb's own DM
