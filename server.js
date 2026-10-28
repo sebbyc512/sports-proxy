@@ -694,7 +694,22 @@ app.post("/telegram/webhook", async (req, res) => {
     }
     if (update.message) {
       const msg = update.message;
-      if (!isSebChat(msg.chat?.id)) return res.json({ ok: true, ignored: true });
+      if (!isSebChat(msg.chat?.id)) {
+        // 2026-10-28: capture any non-Seb private chat that messages the bot (e.g. a friend
+        // tapping Start) so Seb can read off their chat id here instead of needing getUpdates
+        // (which Telegram stops delivering once a webhook is registered). Read-only side
+        // effect -- never acts on the message, never replies, same ignored response as before.
+        try {
+          await upsertDoc("main", "telegramIntros", String(msg.chat?.id), {
+            chatId: msg.chat?.id,
+            firstName: msg.chat?.first_name || msg.from?.first_name || null,
+            username: msg.chat?.username || msg.from?.username || null,
+            lastText: (msg.text || "").slice(0, 200),
+            lastSeenAt: new Date().toISOString(),
+          });
+        } catch (e) { console.error("telegramIntros capture failed:", e.message); }
+        return res.json({ ok: true, ignored: true });
+      }
       if ((msg.text || "").trim() === "/usage") {
         const doc = await getDoc("main", "opsReports", "usage-latest");
         const reply = doc?.data?.text || "No usage report yet — the nightly report task hasn't run.";
