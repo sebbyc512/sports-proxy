@@ -25,6 +25,12 @@
 -- The data.source/data.status check inside the function is a second, belt-and-suspenders
 -- guard for the same reason, in case anything ever inserts on the sync's behalf.
 --
+-- FAIL-SAFE: the net.http_post call is wrapped in its own begin/exception block. A failed
+-- wake (bad URL, sports-proxy down, network hiccup, anything) must NEVER block the app's
+-- insert -- the hourly run is always the backup -- so any error in there is caught, logged
+-- as a warning (visible later via Postgres logs), and swallowed; the function always falls
+-- through to `return NEW` regardless.
+--
 -- PART 2 -- ATOMIC CLAIM: the generic `docs` table only ever supported a blind upsert
 -- (POST .../docs/:collection/:docId), no compare-and-swap -- fine for one writer, but with
 -- the fast-path run and the hourly run now both able to touch the same pending appUpload/
@@ -63,11 +69,15 @@ begin
   if coalesce(NEW.data->>'source', '') = 'app'
      and coalesce(NEW.data->>'status', '') in ('queued', 'pending')
   then
-    perform net.http_post(
-      url := 'https://sports-proxy-nv9n.onrender.com/internal/jobs/wake-sync?token=<PROXY_TOKEN from rule sports-proxy-source>',
-      headers := '{"Content-Type": "application/json"}'::jsonb,
-      body := '{}'::jsonb
-    );
+    begin
+      perform net.http_post(
+        url := 'https://sports-proxy-nv9n.onrender.com/internal/jobs/wake-sync?token=<PROXY_TOKEN from rule sports-proxy-source>',
+        headers := '{"Content-Type": "application/json"}'::jsonb,
+        body := '{}'::jsonb
+      );
+    exception when others then
+      raise warning 'notify_app_insert_dispatch: wake-sync call failed: %', SQLERRM;
+    end;
   end if;
   return NEW;
 end;
