@@ -194,7 +194,34 @@ async function supabaseFetch(pathAndQuery, options = {}) {
   return res;
 }
 
+// GUARD (added 2026-10-29, after an incident where a Post-Cutover Sync run's own
+// ad-hoc push script wrapped ~38 rows as {data: {...real fields...}} instead of
+// posting the real fields flat): if a caller hands us exactly that double-wrapped
+// shape -- a single top-level key literally named "data" whose value is itself a
+// plain object -- unwrap it one level before storing, and log a warning so this is
+// visible without silently normalizing bad callers forever. This is a last-resort
+// safety net, not a substitute for callers sending the right shape.
+function unwrapIfDoubleWrapped(deskId, collection, docId, data) {
+  if (
+    data &&
+    typeof data === "object" &&
+    !Array.isArray(data) &&
+    Object.keys(data).length === 1 &&
+    Object.prototype.hasOwnProperty.call(data, "data") &&
+    data.data &&
+    typeof data.data === "object" &&
+    !Array.isArray(data.data)
+  ) {
+    console.warn(
+      `[upsertDoc] double-wrapped write caught and auto-unwrapped for ${deskId}/${collection}/${docId} -- caller sent {data:{...}} instead of the flat fields`
+    );
+    return data.data;
+  }
+  return data;
+}
+
 async function upsertDoc(deskId, collection, docId, data) {
+  data = unwrapIfDoubleWrapped(deskId, collection, docId, data);
   await supabaseFetch(`/docs?on_conflict=desk_id,collection,doc_id`, {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
