@@ -660,6 +660,76 @@ app.post("/internal/jobs/wake-sync", async (req, res) => {
   }
 });
 
+// --- Builder fire relay (2026-10-29, Seb's request) ---
+// Replaces direct fire_trigger calls to the two pick-request builders (Sebas Desk pick
+// requests, Friends Desk picks/slips/grading) -- those are plain http_api routines now
+// (recreated after the cowork-task ArtifactData incident), which fire_trigger can't start.
+// Same cooldown + trailing-fire shape as /internal/jobs/wake-sync above, kept PER DESK
+// (main and steve fire independently -- one desk's cooldown never blocks the other's).
+const BUILDER_FIRE = {
+  main: { url: process.env.MAIN_BUILDER_FIRE_URL, token: process.env.MAIN_BUILDER_FIRE_TOKEN },
+  steve: { url: process.env.FRIENDS_BUILDER_FIRE_URL, token: process.env.FRIENDS_BUILDER_FIRE_TOKEN },
+};
+const BUILDER_FIRE_COOLDOWN_MS = 90_000;
+const builderFireState = {
+  main: { lastFireAt: 0, trailingTimer: null },
+  steve: { lastFireAt: 0, trailingTimer: null },
+};
+
+async function sendBuilderFire(desk, text) {
+  const cfg = BUILDER_FIRE[desk];
+  builderFireState[desk].lastFireAt = Date.now();
+  const fireRes = await fetch(cfg.url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(text ? { text } : {}),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`${desk} builder fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+}
+
+app.post("/internal/jobs/fire-builder", async (req, res) => {
+  try {
+    const desk = req.query.desk;
+    if (!BUILDER_FIRE[desk]) return res.status(400).json({ error: "desk must be main or steve" });
+    const cfg = BUILDER_FIRE[desk];
+    if (!cfg.url || !cfg.token) {
+      return res
+        .status(500)
+        .json({ error: `${desk === "main" ? "MAIN" : "FRIENDS"}_BUILDER_FIRE_URL/TOKEN not configured on the server.` });
+    }
+    const state = builderFireState[desk];
+    const text = req.query.text || req.body?.text;
+    const sinceLast = Date.now() - state.lastFireAt;
+    if (sinceLast >= BUILDER_FIRE_COOLDOWN_MS) {
+      await sendBuilderFire(desk, text);
+      return res.json({ ok: true, fired: true, desk });
+    }
+    if (state.trailingTimer) {
+      return res.json({ ok: true, fired: false, desk, reason: "cooldown", trailingAlreadyScheduled: true });
+    }
+    const delay = BUILDER_FIRE_COOLDOWN_MS - sinceLast;
+    state.trailingTimer = setTimeout(async () => {
+      state.trailingTimer = null;
+      try {
+        await sendBuilderFire(desk, text);
+      } catch (err) {
+        console.error(`Trailing ${desk} builder fire failed:`, err.message);
+      }
+    }, delay);
+    res.json({ ok: true, fired: false, desk, reason: "cooldown", trailingScheduledInMs: delay });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Telegram private-chat routing (2026-10-22, Seb's request) ---
 // The group chat (real chat_id, passed by the caller as before) keeps getting ONLY the 5
 // bet-lifecycle captions above -- unchanged. Everything below always goes to Seb's own DM
