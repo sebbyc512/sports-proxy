@@ -3,3 +3,4 @@ node_modules/
 migration/
 sql/run-me.sql
 sql/app-wake-sync-run-me.sql
+sql/nhl-tracker-cron-run-me.sql

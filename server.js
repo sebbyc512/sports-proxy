@@ -1731,6 +1731,16 @@ async function upsertNhlSkaterRow(row) {
   });
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// "M:SS" or "MM:SS" -> whole seconds. Returns null for anything unparseable (DNP, missing).
+function toiToSeconds(toi) {
+  if (!toi || typeof toi !== "string" || !toi.includes(":")) return null;
+  const [m, s] = toi.split(":").map(Number);
+  if (!Number.isFinite(m) || !Number.isFinite(s)) return null;
+  return m * 60 + s;
+}
+
 async function trackNhlForDate(yyyymmdd) {
   const result = { date: yyyymmdd, gamesFound: 0, gamesRecorded: 0, skaterRowsRecorded: 0, skipped: [] };
   let scoreboard;
@@ -1756,8 +1766,31 @@ async function trackNhlForDate(yyyymmdd) {
       const awayAbbr = away.team?.abbreviation;
       const homeAbbr = home.team?.abbreviation;
 
+      // Paced (see sleep() below, after each event) so a multi-night backfill doesn't
+      // hammer ESPN's public API in a tight loop.
       const summary = await getJson(`${ESPN_BASE}/hockey/nhl/summary?event=${ev.id}`);
       const teamBlocks = summary.boxscore?.players || [];
+
+      // Team-level stats (PP goals/opportunities) live in boxscore.teams, a SEPARATE array
+      // from boxscore.players used below for per-athlete stats -- added 2026-10-29, this
+      // array was never read before.
+      let awayPpGoals = null, awayPpOpp = null, homePpGoals = null, homePpOpp = null;
+      for (const tb of summary.boxscore?.teams || []) {
+        const abbr = tb.team?.abbreviation;
+        const side = abbr === awayAbbr ? "away" : abbr === homeAbbr ? "home" : null;
+        if (!side) continue;
+        const stats = tb.statistics || [];
+        const find = (name) => stats.find((s) => s.name === name);
+        const ppg = Number(find("powerPlayGoals")?.displayValue);
+        const ppo = Number(find("powerPlayOpportunities")?.displayValue);
+        if (side === "away") {
+          awayPpGoals = Number.isFinite(ppg) ? ppg : null;
+          awayPpOpp = Number.isFinite(ppo) ? ppo : null;
+        } else {
+          homePpGoals = Number.isFinite(ppg) ? ppg : null;
+          homePpOpp = Number.isFinite(ppo) ? ppo : null;
+        }
+      }
 
       let awayGoalie = null;
       let homeGoalie = null;
@@ -1772,6 +1805,10 @@ async function trackNhlForDate(yyyymmdd) {
           const iG = (cat.labels || []).indexOf("G");
           const iA = (cat.labels || []).indexOf("A");
           const iS = (cat.labels || []).indexOf("S");
+          const iTOI = (cat.labels || []).indexOf("TOI");
+          const iPPTOI = (cat.labels || []).indexOf("PPTOI");
+          const iSHTOI = (cat.labels || []).indexOf("SHTOI");
+          const iESTOI = (cat.labels || []).indexOf("ESTOI");
           // SA (shots against) / SV (saves) label names are the best guess for the goalie
           // category -- unlike NHL_LABEL above (confirmed against a real game already),
           // these haven't been verified against a live goalie box score yet. If they come
@@ -1808,6 +1845,10 @@ async function trackNhlForDate(yyyymmdd) {
                 assists,
                 points: goals + assists,
                 shots_on_goal: sog,
+                toi_seconds: iTOI >= 0 ? toiToSeconds(ath.stats?.[iTOI]) : null,
+                pp_toi_seconds: iPPTOI >= 0 ? toiToSeconds(ath.stats?.[iPPTOI]) : null,
+                sh_toi_seconds: iSHTOI >= 0 ? toiToSeconds(ath.stats?.[iSHTOI]) : null,
+                es_toi_seconds: iESTOI >= 0 ? toiToSeconds(ath.stats?.[iESTOI]) : null,
               });
             }
           }
@@ -1834,6 +1875,10 @@ async function trackNhlForDate(yyyymmdd) {
         home_shots: homeShots,
         away_saves: awayGoalie?.saves ?? null,
         home_saves: homeGoalie?.saves ?? null,
+        away_pp_goals: awayPpGoals,
+        away_pp_opportunities: awayPpOpp,
+        home_pp_goals: homePpGoals,
+        home_pp_opportunities: homePpOpp,
         raw: { awayGoalie, homeGoalie },
       });
       result.gamesRecorded++;
@@ -1845,6 +1890,7 @@ async function trackNhlForDate(yyyymmdd) {
     } catch (err) {
       result.skipped.push({ id: ev.id, reason: err.message });
     }
+    await sleep(200); // pace ESPN calls, esp. during a multi-night backfill
   }
   return result;
 }
@@ -1871,6 +1917,7 @@ app.get("/internal/jobs/nhl-nightly-tracker", async (req, res) => {
     const results = [];
     for (const d of dates) {
       results.push(await trackNhlForDate(d));
+      await sleep(300); // pace between nights on a multi-night backfill
     }
     res.json({
       ok: true,
@@ -1878,6 +1925,73 @@ app.get("/internal/jobs/nhl-nightly-tracker", async (req, res) => {
       gamesRecorded: results.reduce((s, r) => s + r.gamesRecorded, 0),
       skaterRowsRecorded: results.reduce((s, r) => s + (r.skaterRowsRecorded || 0), 0),
       results,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Read-only aggregation over nhl_game_logs -- no new ESPN pulls, pure math over rows the
+// tracker above already wrote. Used by pick builders at request time (never scheduled).
+// GET /api/nhl/team-form?team=BOS&n=10&asOf=2026-10-28 (n defaults to 10; asOf defaults to
+// today, both ends inclusive of games on or before asOf).
+app.get("/api/nhl/team-form", async (req, res) => {
+  try {
+    const team = (req.query.team || "").toUpperCase();
+    if (!team) return res.status(400).json({ error: "team is required (e.g. ?team=BOS)" });
+    const n = Math.max(1, Math.min(50, Number(req.query.n) || 10));
+    const asOf = req.query.asOf || new Date().toISOString().slice(0, 10);
+
+    const r = await supabaseFetch(
+      `/nhl_game_logs?or=(away_team.eq.${team},home_team.eq.${team})&date=lte.${asOf}&order=date.desc&limit=50&select=game_id,date,away_team,home_team,away_score,home_score`
+    );
+    const rows = await r.json();
+
+    const withResult = rows.map((row) => {
+      const isHome = row.home_team === team;
+      const gf = isHome ? row.home_score : row.away_score;
+      const ga = isHome ? row.away_score : row.home_score;
+      return { ...row, isHome, gf, ga, win: gf != null && ga != null ? gf > ga : null };
+    });
+
+    function summarize(list) {
+      const played = list.filter((g) => g.win !== null);
+      const wins = played.filter((g) => g.win).length;
+      const gf = played.reduce((s, g) => s + (g.gf || 0), 0);
+      const ga = played.reduce((s, g) => s + (g.ga || 0), 0);
+      return {
+        gamesPlayed: played.length,
+        record: `${wins}-${played.length - wins}`,
+        goalsFor: gf,
+        goalsAgainst: ga,
+        avgGoalsFor: played.length ? Number((gf / played.length).toFixed(2)) : null,
+        avgGoalsAgainst: played.length ? Number((ga / played.length).toFixed(2)) : null,
+      };
+    }
+
+    const last5 = summarize(withResult.slice(0, 5));
+    const lastN = summarize(withResult.slice(0, n));
+    const homeGames = summarize(withResult.filter((g) => g.isHome));
+    const awayGames = summarize(withResult.filter((g) => !g.isHome));
+
+    let backToBack = false;
+    if (withResult.length) {
+      const mostRecent = new Date(withResult[0].date);
+      const asOfDate = new Date(asOf);
+      const diffDays = Math.round((asOfDate - mostRecent) / 86400000);
+      backToBack = diffDays === 1;
+    }
+
+    res.json({
+      team,
+      asOf,
+      last5,
+      [`last${n}`]: lastN,
+      homeSplit: homeGames,
+      awaySplit: awayGames,
+      backToBack,
+      mostRecentGame: withResult[0] || null,
+      gamesConsidered: withResult.length,
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
