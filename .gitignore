@@ -5,3 +5,6 @@ sql/run-me.sql
 sql/app-wake-sync-run-me.sql
 sql/nhl-tracker-cron-run-me.sql
 sql/engine-grader-cron-run-me.sql
+sql/ftd-archive-cron-run-me.sql
+sql/nba-tracker-cron-run-me.sql
+sql/soccer-tracker-cron-run-me.sql

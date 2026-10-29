@@ -214,6 +214,21 @@ async function getDoc(deskId, collection, docId) {
   return rows[0] || null;
 }
 
+// Read-merge-write: upsertDoc()'s "merge-duplicates" is a Postgres row upsert, which
+// replaces the whole jsonb "data" column -- it does NOT deep-merge JSON keys. Every
+// engine job below that touches a doc some OTHER writer (a Claude routine, another
+// engine job) also writes to (nbaTeams' note/blowout fields, soccerTeams' note/asr,
+// nba/meta's openingGames/injuries, etc.) must go through this instead of upsertDoc
+// directly, so it never clobbers a field it doesn't know about.
+async function mergeUpsertDoc(deskId, collection, docId, patch) {
+  const existing = await getDoc(deskId, collection, docId);
+  const clean = { ...patch };
+  Object.keys(clean).forEach((k) => clean[k] === undefined && delete clean[k]);
+  const merged = { ...(existing?.data || {}), ...clean };
+  await upsertDoc(deskId, collection, docId, merged);
+  return merged;
+}
+
 // --- Odds API credit tracking + alert (2026-10-23, Seb's request) ---
 // Every the-odds-api.com call (via getOddsJson above) reports its own current
 // requests-used/requests-remaining here. Stored once, under desk "main" (this is
@@ -1788,60 +1803,487 @@ app.get("/internal/jobs/nba-blowout-tracker", async (req, res) => {
   }
 });
 
-// Desk-facing read: per-team blowout risk, computed on read from nba_blowouts rows.
-// Used by the Monday/Thursday NBA Tracker refresh instead of WebFetch (which has been
-// failing) — plain GET, no Supabase access needed by the caller.
+// Per-team blowout risk, computed from nba_blowouts rows. Shared by the desk-facing read
+// below and by the nightly NBA tracker (which merges these fields into nbaTeams directly
+// instead of making the builder call this route separately).
+async function computeNbaBlowoutRisk() {
+  const r = await supabaseFetch(`/nba_blowouts?select=*&order=date.asc&limit=2000`);
+  const rows = await r.json();
+  const byTeam = {};
+  const ensure = (team) =>
+    (byTeam[team] ||= {
+      team,
+      gamesPlayed: 0,
+      gamesAsWinner: 0,
+      gamesAsLoser: 0,
+      blowoutsAsWinner: 0,
+      blowoutsAsLoser: 0,
+      starterMinutesInBlowouts: [],
+      starterMinutesNormal: [],
+    });
+  for (const row of rows) {
+    const winner = ensure(row.winner);
+    const loser = ensure(row.loser);
+    winner.gamesPlayed++;
+    loser.gamesPlayed++;
+    winner.gamesAsWinner++;
+    loser.gamesAsLoser++;
+    if (row.is_blowout) {
+      winner.blowoutsAsWinner++;
+      loser.blowoutsAsLoser++;
+    }
+    for (const abbr of [row.away_team, row.home_team]) {
+      const starters = row.starters?.[abbr] || [];
+      if (!starters.length || !byTeam[abbr]) continue;
+      const avgMin = starters.reduce((s, p) => s + (p.minutes || 0), 0) / starters.length;
+      (row.is_blowout ? byTeam[abbr].starterMinutesInBlowouts : byTeam[abbr].starterMinutesNormal).push(avgMin);
+    }
+  }
+  const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+  const byAbbr = {};
+  for (const t of Object.values(byTeam)) {
+    const normalAvg = avg(t.starterMinutesNormal);
+    const blowoutAvg = avg(t.starterMinutesInBlowouts);
+    byAbbr[t.team] = {
+      sampleSize: t.gamesPlayed,
+      blowoutRateAsWinner: t.gamesAsWinner ? Number((t.blowoutsAsWinner / t.gamesAsWinner).toFixed(3)) : null,
+      blowoutRateAsLoser: t.gamesAsLoser ? Number((t.blowoutsAsLoser / t.gamesAsLoser).toFixed(3)) : null,
+      blowoutRateOverall: t.gamesPlayed
+        ? Number(((t.blowoutsAsWinner + t.blowoutsAsLoser) / t.gamesPlayed).toFixed(3))
+        : null,
+      avgStarterMinutesDropInBlowouts:
+        normalAvg != null && blowoutAvg != null ? Number((normalAvg - blowoutAvg).toFixed(1)) : null,
+    };
+  }
+  return { byAbbr, gamesTracked: rows.length };
+}
+
+// Desk-facing read: per-team blowout risk. Used by the Monday/Thursday NBA Tracker
+// refresh instead of WebFetch (which has been failing) — plain GET, no Supabase access
+// needed by the caller.
 app.get("/api/nba/blowout-risk", async (req, res) => {
   try {
-    const r = await supabaseFetch(`/nba_blowouts?select=*&order=date.asc&limit=2000`);
-    const rows = await r.json();
-    const byTeam = {};
-    const ensure = (team) =>
-      (byTeam[team] ||= {
-        team,
-        gamesPlayed: 0,
-        gamesAsWinner: 0,
-        gamesAsLoser: 0,
-        blowoutsAsWinner: 0,
-        blowoutsAsLoser: 0,
-        starterMinutesInBlowouts: [],
-        starterMinutesNormal: [],
-      });
-    for (const row of rows) {
-      const winner = ensure(row.winner);
-      const loser = ensure(row.loser);
-      winner.gamesPlayed++;
-      loser.gamesPlayed++;
-      winner.gamesAsWinner++;
-      loser.gamesAsLoser++;
-      if (row.is_blowout) {
-        winner.blowoutsAsWinner++;
-        loser.blowoutsAsLoser++;
+    const { byAbbr, gamesTracked } = await computeNbaBlowoutRisk();
+    const teams = Object.entries(byAbbr).map(([team, v]) => ({ team, ...v }));
+    res.json({ ok: true, updatedAt: new Date().toISOString(), gamesTracked, teams });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- NBA nightly tracker + engine-gated learning loop (2026-10-29, Seb's request) ---
+// Replaces the Claude "NBA Tracker refresh" (8:30 AM) and "NBA Team Tracker — daily
+// learning" (9:00 AM) triggers' NUMERIC/structural work. Writes record/ptsFor/ptsAgainst
+// straight from ESPN standings, plus an APPROXIMATE pace/offRtg/defRtg -- ESPN's public
+// site API doesn't expose true NBA advanced ratings, so this uses the standard
+// Dean-Oliver-style estimate from each team's own box-score averages (Poss ≈ FGA - OREB +
+// TOV + 0.44*FTA; ORtg = avgPoints/Poss*100; DRtg = avgPointsAgainst/Poss*100, using the
+// SAME team's own pace as a stand-in for the defensive end's pace). This is a disclosed
+// simplification, not a hidden fudge -- flagged to Seb as "approxRatings: true" on every
+// team doc so it's visible to anything reading it, not just buried in a code comment.
+// offRank/defRank (1-30) and identity are derived from these numbers; blowout-risk fields
+// are merged in from computeNbaBlowoutRisk() above. Everything else on the doc (note,
+// anything a Claude routine wrote) survives via mergeUpsertDoc's read-merge-write.
+
+const ESPN_V2_BASE = "https://site.api.espn.com/apis/v2/sports";
+
+async function fetchNbaTeamAdvanced(espnId) {
+  const data = await getJson(`${ESPN_BASE}/basketball/nba/teams/${espnId}/statistics`);
+  const cats = data.results?.stats?.categories || [];
+  const stat = (catName, statName) => {
+    const cat = cats.find((c) => c.name === catName);
+    return cat?.stats?.find((s) => s.name === statName)?.value ?? null;
+  };
+  return {
+    avgFGA: stat("offensive", "avgFieldGoalsAttempted"),
+    avg3PA: stat("offensive", "avgThreePointFieldGoalsAttempted"),
+    avgOREB: stat("offensive", "avgOffensiveRebounds"),
+    avgTOV: stat("offensive", "avgTurnovers"),
+    avgFTA: stat("offensive", "avgFreeThrowsAttempted"),
+  };
+}
+
+async function refreshNbaTeams() {
+  const standings = await getJson(`${ESPN_V2_BASE}/basketball/nba/standings`);
+  const entries = [];
+  for (const child of standings.children || []) entries.push(...(child.standings?.entries || []));
+  if (!entries.length) entries.push(...(standings.standings?.entries || []));
+
+  const byTeam = {};
+  for (const e of entries) {
+    const abbr = nbaAbbr(e.team?.abbreviation);
+    if (!abbr) continue;
+    const get = (name) => e.stats?.find((s) => s.name === name)?.value ?? null;
+    byTeam[abbr] = {
+      espnId: e.team?.id,
+      wins: get("wins"),
+      losses: get("losses"),
+      // ESPN's standings stats include BOTH a season-total "pointsFor"/"pointsAgainst"
+      // AND a per-game "avgPointsFor"/"avgPointsAgainst" -- the Desk's docs always store
+      // the PER-GAME number (e.g. 118.5, not 474), so avg* must win when both are present.
+      ptsFor: get("avgPointsFor") ?? get("pointsFor"),
+      ptsAgainst: get("avgPointsAgainst") ?? get("pointsAgainst"),
+    };
+  }
+
+  let total3PARate = 0;
+  let count3PARate = 0;
+  for (const abbr of Object.keys(byTeam)) {
+    try {
+      const adv = await fetchNbaTeamAdvanced(byTeam[abbr].espnId);
+      const poss = (adv.avgFGA ?? 0) - (adv.avgOREB ?? 0) + (adv.avgTOV ?? 0) + 0.44 * (adv.avgFTA ?? 0);
+      byTeam[abbr].pace = poss > 0 ? Number(poss.toFixed(1)) : null;
+      byTeam[abbr].offRtg =
+        poss > 0 && byTeam[abbr].ptsFor != null ? Number(((byTeam[abbr].ptsFor / poss) * 100).toFixed(1)) : null;
+      byTeam[abbr].defRtg =
+        poss > 0 && byTeam[abbr].ptsAgainst != null
+          ? Number(((byTeam[abbr].ptsAgainst / poss) * 100).toFixed(1))
+          : null;
+      byTeam[abbr].threePARate = adv.avgFGA ? (adv.avg3PA ?? 0) / adv.avgFGA : null;
+      if (byTeam[abbr].threePARate != null) {
+        total3PARate += byTeam[abbr].threePARate;
+        count3PARate++;
       }
-      for (const abbr of [row.away_team, row.home_team]) {
-        const starters = row.starters?.[abbr] || [];
-        if (!starters.length || !byTeam[abbr]) continue;
-        const avgMin = starters.reduce((s, p) => s + (p.minutes || 0), 0) / starters.length;
-        (row.is_blowout ? byTeam[abbr].starterMinutesInBlowouts : byTeam[abbr].starterMinutesNormal).push(avgMin);
+    } catch (err) {
+      byTeam[abbr].advError = err.message;
+    }
+    await sleep(150);
+  }
+  const league3PARate = count3PARate ? total3PARate / count3PARate : null;
+
+  const abbrs = Object.keys(byTeam);
+  const byOffRtg = abbrs.filter((a) => byTeam[a].offRtg != null).sort((a, b) => byTeam[b].offRtg - byTeam[a].offRtg);
+  const byDefRtg = abbrs.filter((a) => byTeam[a].defRtg != null).sort((a, b) => byTeam[a].defRtg - byTeam[b].defRtg);
+  byOffRtg.forEach((a, i) => (byTeam[a].offRank = i + 1));
+  byDefRtg.forEach((a, i) => (byTeam[a].defRank = i + 1));
+
+  const { byAbbr: blowoutRisk } = await computeNbaBlowoutRisk();
+
+  const result = { teamsUpdated: 0, errors: [] };
+  for (const abbr of abbrs) {
+    const t = byTeam[abbr];
+    let identity;
+    if (t.threePARate != null && league3PARate != null && t.offRank && t.defRank) {
+      if (t.threePARate >= league3PARate + 0.04) identity = "3PT-heavy";
+      else if (t.threePARate <= league3PARate - 0.04) identity = "Paint-heavy";
+      else if (t.offRank <= 5 && t.defRank <= 5) identity = "Elite";
+      else if (t.offRank >= 26 && t.defRank >= 26) identity = "Struggling";
+      else identity = "Balanced";
+    }
+    const patch = {
+      record: t.wins != null && t.losses != null ? `${t.wins}-${t.losses}` : undefined,
+      ptsFor: t.ptsFor ?? undefined,
+      ptsAgainst: t.ptsAgainst ?? undefined,
+      pace: t.pace ?? undefined,
+      offRtg: t.offRtg ?? undefined,
+      defRtg: t.defRtg ?? undefined,
+      offRank: t.offRank ?? undefined,
+      defRank: t.defRank ?? undefined,
+      identity: identity ?? undefined,
+      approxRatings: true,
+    };
+    const risk = blowoutRisk[abbr];
+    if (risk) {
+      patch.blowoutRateAsWinner = risk.blowoutRateAsWinner;
+      patch.blowoutRateAsLoser = risk.blowoutRateAsLoser;
+      patch.blowoutRateOverall = risk.blowoutRateOverall;
+      patch.avgStarterMinutesDropInBlowouts = risk.avgStarterMinutesDropInBlowouts;
+      patch.blowoutSampleSize = risk.sampleSize;
+    }
+    try {
+      await mergeUpsertDoc("main", "nbaTeams", abbr, patch);
+      result.teamsUpdated++;
+    } catch (err) {
+      result.errors.push({ abbr, error: err.message });
+    }
+  }
+
+  await mergeUpsertDoc("main", "nba", "meta", { lastUpdated: new Date().toISOString().slice(0, 10) });
+  return result;
+}
+
+// Pulled nightly by a Supabase pg_cron job (see sql/nba-tracker-cron.sql).
+app.get("/internal/jobs/nba-nightly-tracker", async (req, res) => {
+  try {
+    const result = await refreshNbaTeams();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+const NBA_LOOP_FIRE_URL = process.env.NBA_LOOP_FIRE_URL;
+const NBA_LOOP_FIRE_TOKEN = process.env.NBA_LOOP_FIRE_TOKEN;
+const NBA_LOOP_THRESHOLD = 10;
+
+async function fireNbaLearningLoop() {
+  if (!NBA_LOOP_FIRE_URL || !NBA_LOOP_FIRE_TOKEN) {
+    throw new Error("NBA_LOOP_FIRE_URL/NBA_LOOP_FIRE_TOKEN not configured on the server.");
+  }
+  const fireRes = await fetch(NBA_LOOP_FIRE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${NBA_LOOP_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`NBA loop fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+}
+
+// Same tail/tag logic as nhlTailTag above, generalized -- a "tail" is a copy of the
+// other person's real-world bet, excluded from independent-sample hit-rate math.
+function deskTailTag(desk, source) {
+  const s = (source || "").toLowerCase();
+  if (desk === "steve" && (s === "seb" || s === "seb's bets")) return true;
+  if (desk === "main" && (s === "steve" || s === "steve's plays")) return true;
+  return false;
+}
+
+async function countNewGradedLegsByLeague(league, sinceIso) {
+  const counts = { main: { claude: 0, seb: 0, tail: 0 }, steve: { claude: 0, steve: 0, tail: 0 } };
+  let total = 0;
+  for (const desk of ["main", "steve"]) {
+    for (const collection of ["parlays", "pnlEntries"]) {
+      const r = await supabaseFetch(
+        `/docs?desk_id=eq.${desk}&collection=eq.${collection}&updated_at=gt.${encodeURIComponent(
+          sinceIso
+        )}&select=doc_id,data,updated_at`
+      );
+      const rows = await r.json();
+      for (const row of rows) {
+        const data = row.data || {};
+        const source = data.source;
+        if (collection === "parlays" && (source || "").toLowerCase() !== "claude") continue;
+        const legs = Array.isArray(data.legs) ? data.legs : [];
+        for (const leg of legs) {
+          const legLeague = leg.league || data.league;
+          if (legLeague !== league) continue;
+          if (!["won", "lost", "push"].includes(leg.status)) continue;
+          let tag;
+          if (collection === "parlays") tag = "claude";
+          else if (deskTailTag(desk, source)) tag = "tail";
+          else tag = desk === "main" ? "seb" : "steve";
+          counts[desk][tag] = (counts[desk][tag] || 0) + 1;
+          total++;
+        }
       }
     }
-    const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
-    const teams = Object.values(byTeam).map((t) => {
-      const normalAvg = avg(t.starterMinutesNormal);
-      const blowoutAvg = avg(t.starterMinutesInBlowouts);
-      return {
-        team: t.team,
-        sampleSize: t.gamesPlayed,
-        blowoutRateAsWinner: t.gamesAsWinner ? Number((t.blowoutsAsWinner / t.gamesAsWinner).toFixed(3)) : null,
-        blowoutRateAsLoser: t.gamesAsLoser ? Number((t.blowoutsAsLoser / t.gamesAsLoser).toFixed(3)) : null,
-        blowoutRateOverall: t.gamesPlayed
-          ? Number(((t.blowoutsAsWinner + t.blowoutsAsLoser) / t.gamesPlayed).toFixed(3))
-          : null,
-        avgStarterMinutesDropInBlowouts:
-          normalAvg != null && blowoutAvg != null ? Number((normalAvg - blowoutAvg).toFixed(1)) : null,
-      };
+  }
+  return { total, counts };
+}
+
+// Pulled hourly by a Supabase pg_cron job (see sql/nba-tracker-cron.sql).
+app.get("/internal/jobs/nba-learning-gate", async (req, res) => {
+  try {
+    const state = await getDoc("main", "taskConfig", "nbaLearningGate");
+    const lastFiredAt = state?.data?.lastFiredAt || "1970-01-01T00:00:00Z";
+    const { total, counts } = await countNewGradedLegsByLeague("NBA", lastFiredAt);
+    if (total < NBA_LOOP_THRESHOLD) {
+      return res.json({ ok: true, fired: false, total, threshold: NBA_LOOP_THRESHOLD, counts, lastFiredAt });
+    }
+    await fireNbaLearningLoop();
+    const firedAt = new Date().toISOString();
+    await upsertDoc("main", "taskConfig", "nbaLearningGate", { lastFiredAt: firedAt, lastFireTotal: total, lastFireCounts: counts });
+    res.json({ ok: true, fired: true, total, threshold: NBA_LOOP_THRESHOLD, counts, firedAt });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Soccer nightly tracker + engine-gated learning loop (2026-10-29, Seb's request) ---
+// Writes the numeric/structural fields only (comp/rank/rec/gf/ga/gd/pts domestic block,
+// euroComp/euroRank/... European block, identity). Note/ASR/xG/lineup-injury notes and the
+// Libertadores/Sudamericana knockout bracket are NOT engine-automatable -- confirmed live
+// (plain fetches to sofascore.com return HTTP 403 from this server, and fotmob disallows
+// scraping per its own footer), so those stay on the light weekly Claude trigger. Doc ids
+// here are freshly assigned by this job (soccerTeams didn't exist in Supabase before this)
+// -- NOT required to match whatever ids the old Claude-maintained ArtifactData docs used,
+// since builders now read this Supabase mirror as their primary source.
+
+const SOCCER_COMPETITIONS = [
+  { slug: "eng.1", label: "Premier League", block: "domestic" },
+  { slug: "esp.1", label: "La Liga", block: "domestic" },
+  { slug: "ita.1", label: "Serie A", block: "domestic" },
+  { slug: "ger.1", label: "Bundesliga", block: "domestic" },
+  { slug: "fra.1", label: "Ligue 1", block: "domestic" },
+  { slug: "usa.1", label: "MLS", block: "domestic", hasConf: true },
+  { slug: "arg.1", label: "Liga Argentina", block: "domestic", hasGroup: true },
+  { slug: "col.1", label: "FPC", block: "domestic" },
+  { slug: "uefa.champions", label: "Champions League", block: "euro" },
+  { slug: "uefa.europa", label: "Europa League", block: "euro" },
+];
+
+function soccerTeamDocId(team) {
+  const base = team.abbreviation || team.displayName || String(team.id);
+  return base.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10) || `T${team.id}`;
+}
+
+async function fetchSoccerStandings(slug) {
+  const data = await getJson(`${ESPN_V2_BASE}/soccer/${slug}/standings`);
+  const entries = [];
+  for (const e of data.standings?.entries || []) entries.push({ ...e, group: null });
+  for (const child of data.children || []) {
+    for (const e of child.standings?.entries || []) entries.push({ ...e, group: child.name });
+  }
+  return entries;
+}
+
+async function refreshSoccerTeams() {
+  const result = { teamsUpdated: 0, competitions: [], errors: [] };
+  const uniqueDocIds = new Set();
+
+  for (const comp of SOCCER_COMPETITIONS) {
+    try {
+      const entries = await fetchSoccerStandings(comp.slug);
+      result.competitions.push({ slug: comp.slug, teams: entries.length });
+      for (const e of entries) {
+        const docId = soccerTeamDocId(e.team);
+        uniqueDocIds.add(docId);
+        const get = (name) => e.stats?.find((s) => s.name === name)?.value ?? null;
+        const wins = get("wins");
+        const ties = get("ties");
+        const losses = get("losses");
+        const rec = [wins, ties, losses].every((v) => v != null) ? `${wins}-${ties}-${losses}` : undefined;
+        const patch = {
+          teamName: e.team?.displayName,
+        };
+        if (comp.block === "domestic") {
+          patch.comp = comp.label;
+          patch.rank = get("rank") ?? undefined;
+          patch.rec = rec;
+          patch.gf = get("pointsFor") ?? undefined;
+          patch.ga = get("pointsAgainst") ?? undefined;
+          patch.gd = get("pointDifferential") ?? undefined;
+          patch.pts = get("points") ?? undefined;
+          if (comp.hasConf) patch.conf = e.group ?? undefined;
+          if (comp.hasGroup) patch.group = e.group ?? undefined;
+        } else {
+          patch.euroComp = comp.label;
+          patch.euroRank = get("rank") ?? undefined;
+          patch.euroRec = rec;
+          patch.euroGf = get("pointsFor") ?? undefined;
+          patch.euroGa = get("pointsAgainst") ?? undefined;
+          patch.euroGd = get("pointDifferential") ?? undefined;
+          patch.euroPts = get("points") ?? undefined;
+        }
+        await mergeUpsertDoc("main", "soccerTeams", docId, patch);
+        result.teamsUpdated++;
+        await sleep(60);
+      }
+    } catch (err) {
+      result.errors.push({ competition: comp.slug, error: err.message });
+    }
+  }
+
+  // Identity pass: goals-for/against-per-game vs league average, from whichever block
+  // (domestic or European) has the larger sample for that team -- same disclosed
+  // approximation style as the NBA tracker's offRtg/defRtg above.
+  try {
+    const docsRes = await supabaseFetch(`/docs?desk_id=eq.main&collection=eq.soccerTeams&select=doc_id,data`);
+    const rows = await docsRes.json();
+    const parsePlayed = (rec) => (rec || "").split("-").reduce((s, n) => s + (Number(n) || 0), 0);
+    const rates = rows
+      .map((row) => {
+        const d = row.data || {};
+        const domesticPlayed = parsePlayed(d.rec);
+        const euroPlayed = parsePlayed(d.euroRec);
+        const useDomestic = domesticPlayed >= euroPlayed;
+        const played = useDomestic ? domesticPlayed : euroPlayed;
+        const gf = useDomestic ? d.gf : d.euroGf;
+        const ga = useDomestic ? d.ga : d.euroGa;
+        return {
+          docId: row.doc_id,
+          played,
+          gfRate: played && gf != null ? gf / played : null,
+          gaRate: played && ga != null ? ga / played : null,
+        };
+      })
+      .filter((r) => r.gfRate != null && r.gaRate != null);
+    const avgGf = rates.length ? rates.reduce((s, r) => s + r.gfRate, 0) / rates.length : null;
+    const avgGa = rates.length ? rates.reduce((s, r) => s + r.gaRate, 0) / rates.length : null;
+    for (const r of rates) {
+      let identity;
+      if (r.played < 3) {
+        const diff = r.gfRate - r.gaRate;
+        identity = diff >= 0.3 ? "Hot start" : diff <= -0.3 ? "Rough start" : "Even";
+      } else if (avgGf != null && avgGa != null) {
+        if (r.gfRate >= avgGf + 0.3 && r.gaRate <= avgGa - 0.3) identity = "Elite";
+        else if (r.gfRate >= avgGf + 0.3) identity = "High-scoring";
+        else if (r.gaRate <= avgGa - 0.3) identity = "Stingy D";
+        else if (r.gaRate >= avgGa + 0.3) identity = "Leaky D";
+        else if (r.gfRate <= avgGf - 0.3 && r.gaRate >= avgGa) identity = "Struggling";
+        else identity = "Balanced";
+      }
+      if (identity) await mergeUpsertDoc("main", "soccerTeams", r.docId, { identity });
+    }
+  } catch (err) {
+    result.errors.push({ step: "identity", error: err.message });
+  }
+
+  await mergeUpsertDoc("main", "soccer", "meta", {
+    lastUpdated: new Date().toISOString().slice(0, 10),
+    teamCount: uniqueDocIds.size,
+  });
+  return result;
+}
+
+// Pulled nightly by a Supabase pg_cron job (see sql/soccer-tracker-cron.sql).
+app.get("/internal/jobs/soccer-nightly-tracker", async (req, res) => {
+  try {
+    const result = await refreshSoccerTeams();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+const SOCCER_LOOP_FIRE_URL = process.env.SOCCER_LOOP_FIRE_URL;
+const SOCCER_LOOP_FIRE_TOKEN = process.env.SOCCER_LOOP_FIRE_TOKEN;
+const SOCCER_LOOP_THRESHOLD = 10;
+
+async function fireSoccerLearningLoop() {
+  if (!SOCCER_LOOP_FIRE_URL || !SOCCER_LOOP_FIRE_TOKEN) {
+    throw new Error("SOCCER_LOOP_FIRE_URL/SOCCER_LOOP_FIRE_TOKEN not configured on the server.");
+  }
+  const fireRes = await fetch(SOCCER_LOOP_FIRE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${SOCCER_LOOP_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`Soccer loop fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+}
+
+// Pulled hourly by a Supabase pg_cron job (see sql/soccer-tracker-cron.sql).
+app.get("/internal/jobs/soccer-learning-gate", async (req, res) => {
+  try {
+    const state = await getDoc("main", "taskConfig", "soccerLearningGate");
+    const lastFiredAt = state?.data?.lastFiredAt || "1970-01-01T00:00:00Z";
+    const { total, counts } = await countNewGradedLegsByLeague("Soccer", lastFiredAt);
+    if (total < SOCCER_LOOP_THRESHOLD) {
+      return res.json({ ok: true, fired: false, total, threshold: SOCCER_LOOP_THRESHOLD, counts, lastFiredAt });
+    }
+    await fireSoccerLearningLoop();
+    const firedAt = new Date().toISOString();
+    await upsertDoc("main", "taskConfig", "soccerLearningGate", {
+      lastFiredAt: firedAt,
+      lastFireTotal: total,
+      lastFireCounts: counts,
     });
-    res.json({ ok: true, updatedAt: new Date().toISOString(), gamesTracked: rows.length, teams });
+    res.json({ ok: true, fired: true, total, threshold: SOCCER_LOOP_THRESHOLD, counts, firedAt });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -2046,6 +2488,96 @@ async function trackNhlForDate(yyyymmdd) {
 
 // Pulled nightly by a Supabase pg_cron job (see sql/nhl-tracker-cron.sql). Same
 // date/from/to convention as /internal/jobs/nba-blowout-tracker above.
+// Standings (record/points/goals for/against/diff) from ESPN, plus PP%/PK%/shots
+// for-against aggregated from nhl_game_logs (already-collected per-game data, more
+// accurate than ESPN's team-stats endpoint since that one exposes PP GOALS but not PP
+// OPPORTUNITIES, so a true PP% can't be computed from it alone). Added 2026-10-29 so
+// builders reading nhlTeams from Supabase (per the sports-proxy switch) get fresh data --
+// this was previously maintained by a Claude routine that no longer exists as an active
+// trigger. Merges in, never overwrites identity/note (untouched, same read-merge-write
+// pattern as the NBA/soccer trackers above).
+async function refreshNhlTeams() {
+  const standings = await getJson(`${ESPN_V2_BASE}/hockey/nhl/standings`);
+  const entries = [];
+  for (const child of standings.children || []) entries.push(...(child.standings?.entries || []));
+  if (!entries.length) entries.push(...(standings.standings?.entries || []));
+
+  const byTeam = {};
+  for (const e of entries) {
+    const abbr = e.team?.abbreviation;
+    if (!abbr) continue;
+    const get = (name) => e.stats?.find((s) => s.name === name)?.value ?? null;
+    byTeam[abbr] = {
+      wins: get("wins"),
+      losses: get("losses"),
+      otLosses: get("otLosses") ?? get("overtimeLosses"),
+      points: get("points"),
+      goalsFor: get("pointsFor"),
+      goalsAgainst: get("pointsAgainst"),
+      goalDiff: get("pointDifferential"),
+    };
+  }
+
+  const gamesRes = await supabaseFetch(
+    `/nhl_game_logs?select=away_team,home_team,away_shots,home_shots,away_pp_goals,away_pp_opportunities,home_pp_goals,home_pp_opportunities&limit=2000`
+  );
+  const games = await gamesRes.json();
+  const agg = {};
+  const ensure = (abbr) =>
+    (agg[abbr] ||= { shotsFor: 0, shotsAgainst: 0, ppGoals: 0, ppOpp: 0, pkGoalsAllowed: 0, pkOpp: 0, games: 0 });
+  for (const g of games) {
+    if (g.away_team) {
+      const a = ensure(g.away_team);
+      a.games++;
+      if (g.away_shots != null) a.shotsFor += g.away_shots;
+      if (g.home_shots != null) a.shotsAgainst += g.home_shots;
+      if (g.away_pp_goals != null) a.ppGoals += g.away_pp_goals;
+      if (g.away_pp_opportunities != null) a.ppOpp += g.away_pp_opportunities;
+      if (g.home_pp_goals != null) a.pkGoalsAllowed += g.home_pp_goals;
+      if (g.home_pp_opportunities != null) a.pkOpp += g.home_pp_opportunities;
+    }
+    if (g.home_team) {
+      const h = ensure(g.home_team);
+      h.games++;
+      if (g.home_shots != null) h.shotsFor += g.home_shots;
+      if (g.away_shots != null) h.shotsAgainst += g.away_shots;
+      if (g.home_pp_goals != null) h.ppGoals += g.home_pp_goals;
+      if (g.home_pp_opportunities != null) h.ppOpp += g.home_pp_opportunities;
+      if (g.away_pp_goals != null) h.pkGoalsAllowed += g.away_pp_goals;
+      if (g.away_pp_opportunities != null) h.pkOpp += g.away_pp_opportunities;
+    }
+  }
+
+  const result = { teamsUpdated: 0, errors: [] };
+  for (const abbr of Object.keys(byTeam)) {
+    const t = byTeam[abbr];
+    const a = agg[abbr];
+    const patch = {
+      record: t.wins != null && t.losses != null ? `${t.wins}-${t.losses}-${t.otLosses ?? 0}` : undefined,
+      points: t.points ?? undefined,
+      goalsFor: t.goalsFor ?? undefined,
+      goalsAgainst: t.goalsAgainst ?? undefined,
+      goalDiff: t.goalDiff ?? undefined,
+    };
+    if (a) {
+      patch.shotsForPerGame = a.games ? Number((a.shotsFor / a.games).toFixed(1)) : undefined;
+      patch.shotsAgainstPerGame = a.games ? Number((a.shotsAgainst / a.games).toFixed(1)) : undefined;
+      patch.ppPct = a.ppOpp ? Number(((a.ppGoals / a.ppOpp) * 100).toFixed(1)) : undefined;
+      patch.pkPct = a.pkOpp ? Number((100 - (a.pkGoalsAllowed / a.pkOpp) * 100).toFixed(1)) : undefined;
+      patch.specialTeamsSampleGames = a.games;
+    }
+    try {
+      await mergeUpsertDoc("main", "nhlTeams", abbr, patch);
+      result.teamsUpdated++;
+    } catch (err) {
+      result.errors.push({ abbr, error: err.message });
+    }
+  }
+
+  await mergeUpsertDoc("main", "nhl", "meta", { lastUpdated: new Date().toISOString().slice(0, 10) });
+  return result;
+}
+
 app.get("/internal/jobs/nhl-nightly-tracker", async (req, res) => {
   try {
     const { date, from, to } = req.query;
@@ -2068,12 +2600,14 @@ app.get("/internal/jobs/nhl-nightly-tracker", async (req, res) => {
       results.push(await trackNhlForDate(d));
       await sleep(300); // pace between nights on a multi-night backfill
     }
+    const teamsResult = await refreshNhlTeams();
     res.json({
       ok: true,
       nights: results.length,
       gamesRecorded: results.reduce((s, r) => s + r.gamesRecorded, 0),
       skaterRowsRecorded: results.reduce((s, r) => s + (r.skaterRowsRecorded || 0), 0),
       results,
+      nhlTeams: teamsResult,
     });
   } catch (err) {
     res.status(502).json({ error: err.message });
