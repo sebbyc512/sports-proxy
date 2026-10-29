@@ -1261,6 +1261,11 @@ async function gradeOneLeg(leg, ticketDate) {
 }
 
 function rollUpTicketStatus(legs) {
+  // An empty/missing legs array is a malformed-doc signal (e.g. a double-wrapped
+  // Supabase row where the real legs sit one level deeper) -- NOT "every leg resolved."
+  // Falling through to "won" here was a vacuous-truth bug: it silently marked
+  // corrupted docs as won. Caller should treat this as "don't touch the status."
+  if (legs.length === 0) return "needs_review";
   if (legs.some((l) => l.status === "needs_review")) return "needs_review";
   if (legs.some((l) => l.status === "pending")) return "pending";
   if (legs.some((l) => l.status === "miss")) return "lost";
@@ -1355,7 +1360,7 @@ function etDateDaysAgo(daysAgo) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d); // YYYY-MM-DD
 }
 
-async function gradeCollectionForDesk(desk, collection) {
+async function gradeCollectionForDesk(desk, collection, mode) {
   const dateFloor = etDateDaysAgo(3);
   const base = `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.${encodeURIComponent(collection)}&select=doc_id,data,version`;
   let docs;
@@ -1395,7 +1400,22 @@ async function gradeCollectionForDesk(desk, collection) {
     const prevStatus = data.status;
     if (!changed && newTicketStatus === prevStatus) continue;
     const newData = { ...data, legs: newLegs, status: newTicketStatus };
-    await upsertDoc(desk, collection, doc.doc_id, newData);
+    if (mode === "live") {
+      await upsertDoc(desk, collection, doc.doc_id, newData);
+    } else {
+      // SHADOW MODE: never touch the real collection -- only log what would have
+      // been written, so Phase 1 (desk -> Supabase push) is never starved by a
+      // shadow-bumped updated_at, and nothing here can corrupt pnlEntries/parlays/ftd.
+      await upsertDoc(desk, "graderShadowLog", `${doc.doc_id}-${collection}-${Date.now()}`, {
+        desk,
+        collection,
+        docId: doc.doc_id,
+        prevStatus,
+        wouldBeStatus: newTicketStatus,
+        wouldBeLegs: newLegs,
+        loggedAt: new Date().toISOString(),
+      });
+    }
     results.push({ docId: doc.doc_id, prevStatus, newStatus: newTicketStatus, data: newData });
   }
   return results;
@@ -1410,7 +1430,7 @@ app.get("/internal/jobs/grade-and-alert", async (req, res) => {
     for (const desk of desks) {
       const deskSummary = { parlays: 0, pnlEntries: 0, ftd: 0, alertsSent: 0, alertsLogged: 0 };
       for (const collection of ["parlays", "pnlEntries", "ftd"]) {
-        const changed = await gradeCollectionForDesk(desk, collection);
+        const changed = await gradeCollectionForDesk(desk, collection, mode);
         deskSummary[collection] = changed.length;
         if (collection !== "pnlEntries") continue;
 
@@ -1422,15 +1442,8 @@ app.get("/internal/jobs/grade-and-alert", async (req, res) => {
           const entryId = c.docId;
 
           if (mode === "shadow") {
-            await upsertDoc(desk, "graderShadowLog", `${entryId}-${kind}-${Date.now()}`, {
-              desk,
-              entryId,
-              kind,
-              person,
-              odds: c.data.odds,
-              ticket: c.data.desc,
-              loggedAt: new Date().toISOString(),
-            });
+            // gradeCollectionForDesk already wrote the per-doc shadow-log entry above;
+            // this just tallies the "would have alerted" count for the summary.
             deskSummary.alertsLogged++;
           } else {
             const timing = telegramShouldSendNow({ kind, gradedBy: c.data.gradedBy, lastGameStart: c.data.lastStart });
