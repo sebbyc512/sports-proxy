@@ -513,6 +513,49 @@ app.post("/internal/jobs/telegram-send-raw", async (req, res) => {
   }
 });
 
+// Releases a claim taken by claimTelegramAlert -- used only when the claimed send itself
+// failed, so a transient Telegram error can't permanently block that alert (the claim doc
+// would otherwise sit there forever looking "already sent" to every future caller).
+async function releaseTelegramAlertClaim(deskId, alertId) {
+  await supabaseFetch(
+    `/docs?desk_id=eq.${encodeURIComponent(deskId)}&collection=eq.tgAlerts&doc_id=eq.${encodeURIComponent(alertId)}`,
+    { method: "DELETE" }
+  );
+}
+
+// Atomic claim-then-send for Phase 1c's placed/tail alerts (2026-10-29): unlike
+// telegram-send-raw, this claims desk/tgAlerts/<entryId>:placed in Supabase BEFORE
+// sending -- insert-only, so only one caller across any number of overlapping runs
+// can ever win it, regardless of how stale each run's own snapshot of groupAlerted
+// was. Fixes the 2026-10-29 double-post (two overlapping Post-Cutover Sync fast-path
+// runs both decided to send from stale reads). If the claimed send itself fails (a
+// real Telegram/network error, not a dedup), the claim is released so the alert isn't
+// stuck forever -- the next run (or a retry) gets a fresh chance at it.
+app.post("/internal/jobs/telegram-placed-alert", async (req, res) => {
+  try {
+    const { desk, entryId, text, chatId, dryRun = true } = req.body || {};
+    if (!DESKS.includes(desk)) return res.status(404).json({ error: "unknown desk" });
+    if (!entryId || !text) return res.status(400).json({ error: "desk, entryId and text are required." });
+    if (!dryRun && !chatId) return res.status(400).json({ error: "chatId is required unless dryRun." });
+
+    const alertId = `${entryId}:placed`;
+    const claimed = await claimTelegramAlert(desk, alertId);
+    if (!claimed) return res.json({ sent: false, dryRun, reason: "already_sent" });
+
+    if (!dryRun) {
+      try {
+        await sendTelegram(chatId, text);
+      } catch (err) {
+        await releaseTelegramAlertClaim(desk, alertId).catch(() => {});
+        return res.status(502).json({ sent: false, dryRun, reason: "send_failed", released: true, error: err.message });
+      }
+    }
+    res.json({ sent: !dryRun, dryRun, text });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Instant-wake relay for Post-Cutover Sync (2026-10-28) ---
 // A Supabase `docs` trigger calls this the moment the APP inserts a new requests/appUploads/
 // appEdits row, so the routine can pick it up within seconds instead of waiting for the hourly
