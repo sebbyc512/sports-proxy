@@ -375,13 +375,31 @@ app.get("/api/:desk/live-scores", async (req, res) => {
 // target chat id (see handbooks/phase2-log.md). This is just the reusable send primitive,
 // ready to use once both are known.
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// Real group chat id (see handbooks/friends-desk-tasks.md). Defined here, above
+// sendTelegram, so the quiet-hours check below and grade-and-alert further down can both
+// reference it.
+const TELEGRAM_GROUP_CHAT_ID = "-5191991471";
+
+// Group quiet hours (2026-10-29, Seb's request): 1:00-7:59 AM America/New_York, the GROUP
+// chat only -- every DM (Steve's 1:1, Seb's own private chat) is unaffected, since this
+// only checks the chat id. Timezone computed in code (Intl, DST-proof) rather than a fixed
+// UTC hour range, which would silently drift wrong across the EST/EDT change.
+function isGroupQuietHours() {
+  const hour = Number(
+    new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hour12: false }).format(new Date())
+  );
+  // hour12:false can format midnight as "24" instead of "0" -- normalize.
+  const h = hour === 24 ? 0 : hour;
+  return h >= 1 && h < 8; // 1:00 AM through 7:59 AM ET
+}
 
 async function sendTelegram(chatId, text) {
   if (!TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN not configured on the server.");
+  const silent = chatId === TELEGRAM_GROUP_CHAT_ID && isGroupQuietHours();
   const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_notification: silent }),
   });
   const data = await res.json();
   if (!data.ok) throw new Error(`Telegram sendMessage failed: ${JSON.stringify(data)}`);
@@ -421,9 +439,6 @@ const TELEGRAM_CAPTIONS = {
   livePrefix: "🔴 IN LIVE 🔴\n",
 };
 const TELEGRAM_PERSON_EMOJI = { main: "🏈", steve: "🏀", lela: "⚽️" };
-// Real group chat id (see handbooks/friends-desk-tasks.md), used only by
-// /internal/jobs/grade-and-alert's mode=live path -- never by shadow mode.
-const TELEGRAM_GROUP_CHAT_ID = "-5191991471";
 
 function buildTelegramCaption({ kind, person, odds, live, lowConfidenceLegs }) {
   const template = TELEGRAM_CAPTIONS[kind];
@@ -1243,11 +1258,38 @@ app.get("/internal/jobs/grader", async (req, res) => {
 // it can never pre-claim the dedup key and block a later real send. mode=live: actually
 // claims (via the SAME claimTelegramAlert helper, same `${entryId}:${kind}` key Phase
 // 1c/4 use) and sends -- only ever pass mode=live after Seb has reviewed shadow output.
+//
+// SCOPE (2026-10-29, Seb's ask, after the first unscoped run took 2m37s/desk re-checking
+// hundreds of permanently-stuck needs_review legs every tick): "parlays" and "ftd" only
+// grade tickets whose game date is within the last 3 days (server-side filter, cheap).
+// "pnlEntries" grades that same 3-day window PLUS, regardless of date, every doc that's
+// still pending/needs_review with a real stake > 0 -- real money is never skipped just
+// because it's an old open bet.
+function etDateDaysAgo(daysAgo) {
+  const d = new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000);
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d); // YYYY-MM-DD
+}
+
 async function gradeCollectionForDesk(desk, collection) {
-  const listRes = await supabaseFetch(
-    `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.${encodeURIComponent(collection)}&select=doc_id,data,version`
-  );
-  const docs = await listRes.json();
+  const dateFloor = etDateDaysAgo(3);
+  const base = `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.${encodeURIComponent(collection)}&select=doc_id,data,version`;
+  let docs;
+  if (collection === "pnlEntries") {
+    // Needs the stake>0-regardless-of-date OR, which isn't safe to express as a numeric
+    // Supabase/PostgREST filter on a jsonb field -- fetch this (modest-sized) collection
+    // in full and filter in JS instead.
+    const listRes = await supabaseFetch(base);
+    const all = await listRes.json();
+    docs = all.filter((doc) => {
+      const d = doc.data || {};
+      if (d.date && d.date >= dateFloor) return true;
+      const stillOpen = !d.status || d.status === "pending" || d.status === "needs_review";
+      return stillOpen && Number(d.stake) > 0;
+    });
+  } else {
+    const listRes = await supabaseFetch(`${base}&data->>date=gte.${encodeURIComponent(dateFloor)}`);
+    docs = await listRes.json();
+  }
   const results = [];
   for (const doc of docs) {
     const data = doc.data;
