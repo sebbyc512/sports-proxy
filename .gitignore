@@ -4,3 +4,4 @@ migration/
 sql/run-me.sql
 sql/app-wake-sync-run-me.sql
 sql/nhl-tracker-cron-run-me.sql
+sql/engine-grader-cron-run-me.sql
