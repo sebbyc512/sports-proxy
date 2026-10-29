@@ -1698,6 +1698,285 @@ app.get("/api/nba/blowout-risk", async (req, res) => {
   }
 });
 
+// --- NHL tracker + engine-gated learning loop (2026-10-29, Seb's request) ---
+// Two pieces, both pure engine (no Claude usage until the gate actually fires):
+// 1. /internal/jobs/nhl-nightly-tracker -- pulled nightly by pg_cron (see
+//    sql/nhl-tracker-cron.sql), writes final games' scores, starting goalies, team
+//    shots/saves and skater points/SOG into nhl_game_logs/nhl_skater_logs (see
+//    sql/nhl-game-logs-table.sql). Same shape/pattern as nba-blowout-tracker above.
+// 2. /internal/jobs/nhl-learning-gate -- pulled hourly by the same cron file. Counts
+//    newly graded NHL legs (since the last time this gate actually fired) across BOTH
+//    main and steve's Supabase-mirrored parlays/pnlEntries, tagged claude/seb/steve/tail
+//    the same way the NHL learning loop routine itself tags them (see rule
+//    nhl-model-spec and the routine's own prompt, trig_013nPeQ8Sk74619muX8a2f8k). Only
+//    once that count reaches 10 does it fire the routine via its own Fire URL/token
+//    (NHL_LOOP_FIRE_URL/NHL_LOOP_FIRE_TOKEN, generated once in the routine's own trigger
+//    settings on claude.ai) -- same mechanism CLAUDE_FIRE_URL/CLAUDE_FIRE_TOKEN already
+//    use for Post-Cutover Sync's fast-path wake, above. No scheduled Claude run ever
+//    fires just to check and find nothing -- this endpoint is the only thing that checks.
+
+async function upsertNhlGameRow(row) {
+  await supabaseFetch(`/nhl_game_logs?on_conflict=game_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ ...row, updated_at: new Date().toISOString() }]),
+  });
+}
+
+async function upsertNhlSkaterRow(row) {
+  await supabaseFetch(`/nhl_skater_logs?on_conflict=game_id,player`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ ...row, updated_at: new Date().toISOString() }]),
+  });
+}
+
+async function trackNhlForDate(yyyymmdd) {
+  const result = { date: yyyymmdd, gamesFound: 0, gamesRecorded: 0, skaterRowsRecorded: 0, skipped: [] };
+  let scoreboard;
+  try {
+    scoreboard = await getJson(`${ESPN_BASE}/hockey/nhl/scoreboard?dates=${yyyymmdd}`);
+  } catch (err) {
+    result.error = err.message;
+    return result;
+  }
+  const events = (scoreboard.events || []).filter((ev) => ev.status?.type?.state === "post");
+  result.gamesFound = events.length;
+  const isoDate = `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
+
+  for (const ev of events) {
+    try {
+      const comp = ev.competitions?.[0];
+      const away = comp?.competitors?.find((c) => c.homeAway === "away");
+      const home = comp?.competitors?.find((c) => c.homeAway === "home");
+      if (!away || !home) {
+        result.skipped.push({ id: ev.id, reason: "missing competitors" });
+        continue;
+      }
+      const awayAbbr = away.team?.abbreviation;
+      const homeAbbr = home.team?.abbreviation;
+
+      const summary = await getJson(`${ESPN_BASE}/hockey/nhl/summary?event=${ev.id}`);
+      const teamBlocks = summary.boxscore?.players || [];
+
+      let awayGoalie = null;
+      let homeGoalie = null;
+      const skaterRows = [];
+
+      for (const block of teamBlocks) {
+        const abbr = block.team?.abbreviation;
+        const side = abbr === awayAbbr ? "away" : abbr === homeAbbr ? "home" : null;
+        if (!side) continue;
+        for (const cat of block.statistics || []) {
+          const isGoalieCat = cat.name === "goalies";
+          const iG = (cat.labels || []).indexOf("G");
+          const iA = (cat.labels || []).indexOf("A");
+          const iS = (cat.labels || []).indexOf("S");
+          // SA (shots against) / SV (saves) label names are the best guess for the goalie
+          // category -- unlike NHL_LABEL above (confirmed against a real game already),
+          // these haven't been verified against a live goalie box score yet. If they come
+          // back null on the first real run, check the actual label strings in a raw
+          // summary response for a finished NHL game and fix these two lines.
+          const iSA = (cat.labels || []).indexOf("SA");
+          const iSV = (cat.labels || []).indexOf("SV");
+          for (const ath of cat.athletes || []) {
+            if (isGoalieCat) {
+              const info = {
+                name: ath.athlete?.displayName,
+                starter: !!ath.starter,
+                shotsAgainst: iSA >= 0 ? Number(ath.stats?.[iSA]) || null : null,
+                saves: iSV >= 0 ? Number(ath.stats?.[iSV]) || null : null,
+              };
+              // A team can dress a backup who never enters; prefer whichever goalie
+              // actually logged shots-against/saves (the one who played) over one with no
+              // stats yet.
+              const better = (cur) => !cur || (info.saves != null && cur.saves == null);
+              if (side === "away" && better(awayGoalie)) awayGoalie = info;
+              if (side === "home" && better(homeGoalie)) homeGoalie = info;
+            } else {
+              const name = ath.athlete?.displayName;
+              if (!name) continue;
+              const goals = iG >= 0 ? Number(ath.stats?.[iG]) || 0 : 0;
+              const assists = iA >= 0 ? Number(ath.stats?.[iA]) || 0 : 0;
+              const sog = iS >= 0 ? Number(ath.stats?.[iS]) || 0 : 0;
+              skaterRows.push({
+                game_id: ev.id,
+                date: isoDate,
+                team: abbr,
+                player: name,
+                goals,
+                assists,
+                points: goals + assists,
+                shots_on_goal: sog,
+              });
+            }
+          }
+        }
+      }
+
+      // Team shots-for == the OPPOSING goalie's shots-against (same identity NHL_LABEL's
+      // comment above already confirmed against a real game for skaters' "S").
+      const awayShots = homeGoalie?.shotsAgainst ?? null;
+      const homeShots = awayGoalie?.shotsAgainst ?? null;
+
+      await upsertNhlGameRow({
+        game_id: ev.id,
+        date: isoDate,
+        away_team: awayAbbr,
+        home_team: homeAbbr,
+        away_score: Number(away.score),
+        home_score: Number(home.score),
+        away_goalie: awayGoalie?.name ?? null,
+        home_goalie: homeGoalie?.name ?? null,
+        away_goalie_confirmed_starter: !!awayGoalie?.starter,
+        home_goalie_confirmed_starter: !!homeGoalie?.starter,
+        away_shots: awayShots,
+        home_shots: homeShots,
+        away_saves: awayGoalie?.saves ?? null,
+        home_saves: homeGoalie?.saves ?? null,
+        raw: { awayGoalie, homeGoalie },
+      });
+      result.gamesRecorded++;
+
+      for (const row of skaterRows) {
+        await upsertNhlSkaterRow(row);
+        result.skaterRowsRecorded++;
+      }
+    } catch (err) {
+      result.skipped.push({ id: ev.id, reason: err.message });
+    }
+  }
+  return result;
+}
+
+// Pulled nightly by a Supabase pg_cron job (see sql/nhl-tracker-cron.sql). Same
+// date/from/to convention as /internal/jobs/nba-blowout-tracker above.
+app.get("/internal/jobs/nhl-nightly-tracker", async (req, res) => {
+  try {
+    const { date, from, to } = req.query;
+    const dates = [];
+    if (from && to) {
+      let d = new Date(Date.UTC(Number(from.slice(0, 4)), Number(from.slice(4, 6)) - 1, Number(from.slice(6, 8))));
+      const end = new Date(Date.UTC(Number(to.slice(0, 4)), Number(to.slice(4, 6)) - 1, Number(to.slice(6, 8))));
+      while (d <= end) {
+        dates.push(d.toISOString().slice(0, 10).replace(/-/g, ""));
+        d.setUTCDate(d.getUTCDate() + 1);
+      }
+    } else if (date) {
+      dates.push(date);
+    } else {
+      const yesterdayET = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      dates.push(yesterdayET.toISOString().slice(0, 10).replace(/-/g, ""));
+    }
+    const results = [];
+    for (const d of dates) {
+      results.push(await trackNhlForDate(d));
+    }
+    res.json({
+      ok: true,
+      nights: results.length,
+      gamesRecorded: results.reduce((s, r) => s + r.gamesRecorded, 0),
+      skaterRowsRecorded: results.reduce((s, r) => s + (r.skaterRowsRecorded || 0), 0),
+      results,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- NHL learning-loop gate ---
+const NHL_LOOP_FIRE_URL = process.env.NHL_LOOP_FIRE_URL;
+const NHL_LOOP_FIRE_TOKEN = process.env.NHL_LOOP_FIRE_TOKEN;
+const NHL_LOOP_THRESHOLD = 10;
+
+async function fireNhlLearningLoop() {
+  if (!NHL_LOOP_FIRE_URL || !NHL_LOOP_FIRE_TOKEN) {
+    throw new Error("NHL_LOOP_FIRE_URL/NHL_LOOP_FIRE_TOKEN not configured on the server.");
+  }
+  const fireRes = await fetch(NHL_LOOP_FIRE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${NHL_LOOP_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`NHL loop fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+}
+
+// A "tail" is the SAME real-world leg already counted once under its original tag (a
+// copy of the other person's bet) -- identified here only to be labeled and excluded
+// from the learning loop's hit-rate math, never to be double-counted as new data.
+function nhlTailTag(desk, source) {
+  const s = (source || "").toLowerCase();
+  if (desk === "steve" && (s === "seb" || s === "seb's bets")) return true;
+  if (desk === "main" && (s === "steve" || s === "steve's plays")) return true;
+  return false;
+}
+
+async function countNewGradedNhlLegs(sinceIso) {
+  const counts = { main: { claude: 0, seb: 0, tail: 0 }, steve: { claude: 0, steve: 0, tail: 0 } };
+  let total = 0;
+  for (const desk of ["main", "steve"]) {
+    for (const collection of ["parlays", "pnlEntries"]) {
+      const r = await supabaseFetch(
+        `/docs?desk_id=eq.${desk}&collection=eq.${collection}&updated_at=gt.${encodeURIComponent(sinceIso)}&select=doc_id,data,updated_at`
+      );
+      const rows = await r.json();
+      for (const row of rows) {
+        const data = row.data || {};
+        const source = data.source;
+        // A Claude-built "parlays" doc is counted here; an uploaded-slip "parlays" mirror
+        // (source "upload") is skipped since the SAME bet is also a pnlEntries doc, which
+        // gets tagged seb/steve/tail below -- counting both would double the same leg.
+        if (collection === "parlays" && (source || "").toLowerCase() !== "claude") continue;
+        const legs = Array.isArray(data.legs) ? data.legs : [];
+        for (const leg of legs) {
+          const league = leg.league || data.league;
+          if (league !== "NHL") continue;
+          if (!["won", "lost", "push"].includes(leg.status)) continue;
+          let tag;
+          if (collection === "parlays") tag = "claude";
+          else if (nhlTailTag(desk, source)) tag = "tail";
+          else tag = desk === "main" ? "seb" : "steve";
+          counts[desk][tag] = (counts[desk][tag] || 0) + 1;
+          total++;
+        }
+      }
+    }
+  }
+  return { total, counts };
+}
+
+// Pulled hourly by a Supabase pg_cron job (see sql/nhl-tracker-cron.sql). Pure read +
+// count against the existing docs mirror -- no ESPN calls, cheap enough to run hourly so
+// a threshold crossing gets caught same-day instead of waiting for the next nightly tick.
+app.get("/internal/jobs/nhl-learning-gate", async (req, res) => {
+  try {
+    const state = await getDoc("main", "taskConfig", "nhlLearningGate");
+    const lastFiredAt = state?.data?.lastFiredAt || "1970-01-01T00:00:00Z";
+    const { total, counts } = await countNewGradedNhlLegs(lastFiredAt);
+    if (total < NHL_LOOP_THRESHOLD) {
+      return res.json({ ok: true, fired: false, total, threshold: NHL_LOOP_THRESHOLD, counts, lastFiredAt });
+    }
+    await fireNhlLearningLoop();
+    const firedAt = new Date().toISOString();
+    await upsertDoc("main", "taskConfig", "nhlLearningGate", {
+      lastFiredAt: firedAt,
+      lastFireTotal: total,
+      lastFireCounts: counts,
+    });
+    res.json({ ok: true, fired: true, total, threshold: NHL_LOOP_THRESHOLD, counts, firedAt });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`sports-proxy listening on ${PORT}`));
