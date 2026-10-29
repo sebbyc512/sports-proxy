@@ -421,6 +421,9 @@ const TELEGRAM_CAPTIONS = {
   livePrefix: "🔴 IN LIVE 🔴\n",
 };
 const TELEGRAM_PERSON_EMOJI = { main: "🏈", steve: "🏀", lela: "⚽️" };
+// Real group chat id (see handbooks/friends-desk-tasks.md), used only by
+// /internal/jobs/grade-and-alert's mode=live path -- never by shadow mode.
+const TELEGRAM_GROUP_CHAT_ID = "-5191991471";
 
 function buildTelegramCaption({ kind, person, odds, live, lowConfidenceLegs }) {
   const template = TELEGRAM_CAPTIONS[kind];
@@ -1216,6 +1219,110 @@ app.get("/internal/jobs/grader", async (req, res) => {
       results.push({ ticketId: doc.doc_id, newStatus: newTicketStatus, legStatuses: newLegs.map((l) => l.status) });
     }
     res.json({ ok: true, collection, ticketsChecked: docs.length, ticketsUpdated: results.length, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Engine-only grade + alert, no Claude run (2026-10-29, Seb's request) ---
+// Reuses the same grading logic as /internal/jobs/grader above, writing only the engine's
+// Supabase mirror. SAFE BY CONSTRUCTION against Post-Cutover Sync's Phase 1 push-up:
+// upsertDoc always stamps `updated_at` to now, and Phase 1 only pushes the real desk's
+// copy UP (overwriting the mirror) when the real desk's own updatedAt/createdAt is newer
+// than the mirror's updated_at -- a grade written here always makes the mirror the newer
+// one, so Phase 1 skips it on its own, no prompt change needed.
+//
+// Telegram alerting here ONLY ever acts on "pnlEntries" transitions to won/lost/push --
+// those are real stake>0 placed bets by construction. "parlays" and "ftd" are graded (same
+// Supabase-mirror-only write) but never alerted from this job: a "parlays" alert needs
+// Phase 4's own played:true gate checked against the REAL desk (which this job never
+// touches), and "ftd" is explicitly never alerted per Post-Cutover Sync's Phase 3b.
+//
+// mode=shadow (default): grades for real (so tomorrow's comparison has real data), logs
+// what WOULD be sent to collection "graderShadowLog" -- NEVER calls claimTelegramAlert, so
+// it can never pre-claim the dedup key and block a later real send. mode=live: actually
+// claims (via the SAME claimTelegramAlert helper, same `${entryId}:${kind}` key Phase
+// 1c/4 use) and sends -- only ever pass mode=live after Seb has reviewed shadow output.
+async function gradeCollectionForDesk(desk, collection) {
+  const listRes = await supabaseFetch(
+    `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.${encodeURIComponent(collection)}&select=doc_id,data,version`
+  );
+  const docs = await listRes.json();
+  const results = [];
+  for (const doc of docs) {
+    const data = doc.data;
+    const legs = data.legs || [];
+    const pendingIdx = legs
+      .map((l, i) => ({ l, i }))
+      .filter(({ l }) => !l.status || l.status === "pending" || l.status === "needs_review");
+    let changed = false;
+    const newLegs = [...legs];
+    for (const { l, i } of pendingIdx) {
+      const graded = await gradeOneLeg(l, data.date);
+      if (graded.status !== (l.status || "pending")) {
+        newLegs[i] = { ...l, status: graded.status };
+        changed = true;
+      }
+    }
+    const newTicketStatus = rollUpTicketStatus(newLegs);
+    const prevStatus = data.status;
+    if (!changed && newTicketStatus === prevStatus) continue;
+    const newData = { ...data, legs: newLegs, status: newTicketStatus };
+    await upsertDoc(desk, collection, doc.doc_id, newData);
+    results.push({ docId: doc.doc_id, prevStatus, newStatus: newTicketStatus, data: newData });
+  }
+  return results;
+}
+
+app.get("/internal/jobs/grade-and-alert", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
+  const mode = req.query.mode === "live" ? "live" : "shadow";
+  for (const d of desks) if (!DESKS.includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  try {
+    const summary = { mode, results: {} };
+    for (const desk of desks) {
+      const deskSummary = { parlays: 0, pnlEntries: 0, ftd: 0, alertsSent: 0, alertsLogged: 0 };
+      for (const collection of ["parlays", "pnlEntries", "ftd"]) {
+        const changed = await gradeCollectionForDesk(desk, collection);
+        deskSummary[collection] = changed.length;
+        if (collection !== "pnlEntries") continue;
+
+        for (const c of changed) {
+          if (!["won", "lost", "push"].includes(c.newStatus)) continue;
+          if (c.prevStatus === c.newStatus) continue;
+          const kind = c.newStatus;
+          const person = c.data.who || c.data.source || "claude";
+          const entryId = c.docId;
+
+          if (mode === "shadow") {
+            await upsertDoc(desk, "graderShadowLog", `${entryId}-${kind}-${Date.now()}`, {
+              desk,
+              entryId,
+              kind,
+              person,
+              odds: c.data.odds,
+              ticket: c.data.desc,
+              loggedAt: new Date().toISOString(),
+            });
+            deskSummary.alertsLogged++;
+          } else {
+            const timing = telegramShouldSendNow({ kind, gradedBy: c.data.gradedBy, lastGameStart: c.data.lastStart });
+            if (!timing.ok) continue;
+            const claimed = await claimTelegramAlert(desk, `${entryId}:${kind}`);
+            if (!claimed) continue;
+            const text = buildTelegramCaption({ kind, person, odds: c.data.odds });
+            try {
+              await sendTelegram(TELEGRAM_GROUP_CHAT_ID, text);
+              deskSummary.alertsSent++;
+            } catch (err) {
+              await releaseTelegramAlertClaim(desk, `${entryId}:${kind}`).catch(() => {});
+            }
+          }
+        }
+      }
+      summary.results[desk] = deskSummary;
+    }
+    res.json({ ok: true, ...summary });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
