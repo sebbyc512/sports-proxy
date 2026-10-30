@@ -1307,10 +1307,14 @@ function toWinAmount(stake, odds, boost) {
 // where DraftKings' own boost/promo math can't be replicated by toWinAmount) over computing
 // it, and only falls back to toWinAmount when no potential is on file. Never returns null/
 // undefined for a terminal status -- that's the whole point of this function existing.
+// "cashout" is deliberately NOT handled here: it's never a computed status (rollUpTicketStatus
+// only ever returns needs_review/pending/lost/won) and its ret is a real, manually-entered
+// dollar amount (what Seb actually got paid for cashing out early) -- never derivable from
+// stake/odds/potential, so it must never be auto-corrected or backfilled by formula.
 function settlePnlRet(status, data) {
   if (status === "lost") return 0;
   if (status === "push") return Number(data.stake) || 0;
-  if (status === "won" || status === "cashout") {
+  if (status === "won") {
     const potential = Number(data.potential);
     if (Number.isFinite(potential) && potential > 0) return potential;
     return toWinAmount(data.stake, data.odds, data.boost);
@@ -1475,7 +1479,7 @@ async function gradeCollectionForDesk(desk, collection, mode) {
     // didn't just change this run, so a bet that's ALREADY won/lost/push with a missing or
     // wrong ret gets backfilled the next time the grader touches it, not just on transition.
     let retPatch = {};
-    if (collection === "pnlEntries" && ["won", "lost", "push", "cashout"].includes(newTicketStatus)) {
+    if (collection === "pnlEntries" && ["won", "lost", "push"].includes(newTicketStatus)) {
       const correctRet = settlePnlRet(newTicketStatus, data);
       if (correctRet !== undefined && correctRet !== data.ret) {
         retPatch = { ret: correctRet, settledAt: data.settledAt || new Date().toISOString() };
