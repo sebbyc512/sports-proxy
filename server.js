@@ -1293,9 +1293,15 @@ function rollUpTicketStatus(legs) {
   // Falling through to "won" here was a vacuous-truth bug: it silently marked
   // corrupted docs as won. Caller should treat this as "don't touch the status."
   if (legs.length === 0) return "needs_review";
+  // A confirmed miss dooms the parlay outright -- check it BEFORE needs_review/pending,
+  // since one leg still being ambiguous or not-yet-final never changes the fact that
+  // another leg has already lost it. Checking needs_review/pending first (the old order)
+  // left real losers stuck "needs_review" forever instead of resolving to "lost" the
+  // moment any leg missed -- found 2026-10-30 comparing shadow-grader output to real
+  // production results.
+  if (legs.some((l) => l.status === "miss")) return "lost";
   if (legs.some((l) => l.status === "needs_review")) return "needs_review";
   if (legs.some((l) => l.status === "pending")) return "pending";
-  if (legs.some((l) => l.status === "miss")) return "lost";
   return "won"; // every leg is hit or push
 }
 
@@ -1410,6 +1416,12 @@ async function gradeCollectionForDesk(desk, collection, mode) {
   const results = [];
   for (const doc of docs) {
     const data = doc.data;
+    // A protected (Early Exit / manually-locked) bet is permanent per Post-Cutover Sync's
+    // own LOCK rule -- the engine must never re-grade it, in shadow OR live mode. Found
+    // 2026-10-30: the shadow grader would have flipped a real protected win back to a
+    // computed "lost" (and, in live mode, would have sent a wrong Telegram alert for it)
+    // because this check didn't exist.
+    if (data.protected === true) continue;
     const legs = data.legs || [];
     const pendingIdx = legs
       .map((l, i) => ({ l, i }))

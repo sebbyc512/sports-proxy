@@ -169,6 +169,11 @@ const ANYTIME_TD_PATTERNS = [
 // low-confidence-marker parens already stripped by normalize() before this runs.
 const DRAW_PATTERNS = [
   new RegExp(`^(?<a>${TEAM}) ${SEP} (?<b>${TEAM}) (?:Draw|Tie)$`, "iu"),
+  // "Draw Moneyline (Man City vs Brighton)" -- the phrasing slip-upload legs actually use
+  // (team names inside the parens, "Draw"/"Tie" up front instead of trailing). Found
+  // 2026-10-30: an entire 6-leg draw parlay sat needs_review on every leg because only the
+  // trailing-"Draw" phrasing above was recognized.
+  new RegExp(`^(?:Draw|Tie)(?: Moneyline)?\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)$`, "iu"),
 ];
 
 // "Athletic Bilbao or Tie Double Chance (Athletic Bilbao vs Getafe)" / "Tie or Bayern Munchen
