@@ -1287,6 +1287,37 @@ async function gradeOneLeg(leg, ticketDate) {
   return { status: verdict };
 }
 
+// American-odds payout, stake included -- same math the Desk's own slip math uses for a
+// plain (non-boosted-by-DK) bet. "boost" is a parlay-boost percentage applied to the profit
+// portion only (never the stake itself), matching how the Desk's own boost field is used
+// everywhere else (r09, ticket notes). Added 2026-10-30 after a settled bet was found with
+// ret left null even though it had cleared -- every settle must write a real number now.
+function toWinAmount(stake, odds, boost) {
+  const s = Number(stake) || 0;
+  const o = parseFloat(String(odds ?? "").replace(/[^0-9.+-]/g, ""));
+  if (!s || !Number.isFinite(o) || o === 0) return 0;
+  let profit = o > 0 ? s * (o / 100) : s * (100 / Math.abs(o));
+  const b = Number(boost) || 0;
+  if (b) profit *= 1 + b / 100;
+  return Math.round((s + profit) * 100) / 100;
+}
+
+// The real settle payout for a pnlEntries doc, given its ticket-level status just computed.
+// Prefers `potential` (the slip's own read-off payout -- ground truth for an uploaded slip,
+// where DraftKings' own boost/promo math can't be replicated by toWinAmount) over computing
+// it, and only falls back to toWinAmount when no potential is on file. Never returns null/
+// undefined for a terminal status -- that's the whole point of this function existing.
+function settlePnlRet(status, data) {
+  if (status === "lost") return 0;
+  if (status === "push") return Number(data.stake) || 0;
+  if (status === "won" || status === "cashout") {
+    const potential = Number(data.potential);
+    if (Number.isFinite(potential) && potential > 0) return potential;
+    return toWinAmount(data.stake, data.odds, data.boost);
+  }
+  return undefined; // not a terminal status -- caller must not write ret from this
+}
+
 function rollUpTicketStatus(legs) {
   // An empty/missing legs array is a malformed-doc signal (e.g. a double-wrapped
   // Supabase row where the real legs sit one level deeper) -- NOT "every leg resolved."
@@ -1437,8 +1468,23 @@ async function gradeCollectionForDesk(desk, collection, mode) {
     }
     const newTicketStatus = rollUpTicketStatus(newLegs);
     const prevStatus = data.status;
+
+    // RET/PAYOUT (2026-10-30, Seb's request): on a pnlEntries doc settling to a terminal
+    // status, always write a real ret -- never leave it null/missing, which is what was
+    // silently breaking the app's displayed balance. Checked even when the status itself
+    // didn't just change this run, so a bet that's ALREADY won/lost/push with a missing or
+    // wrong ret gets backfilled the next time the grader touches it, not just on transition.
+    let retPatch = {};
+    if (collection === "pnlEntries" && ["won", "lost", "push", "cashout"].includes(newTicketStatus)) {
+      const correctRet = settlePnlRet(newTicketStatus, data);
+      if (correctRet !== undefined && correctRet !== data.ret) {
+        retPatch = { ret: correctRet, settledAt: data.settledAt || new Date().toISOString() };
+        changed = true;
+      }
+    }
+
     if (!changed && newTicketStatus === prevStatus) continue;
-    const newData = { ...data, legs: newLegs, status: newTicketStatus };
+    const newData = { ...data, legs: newLegs, status: newTicketStatus, ...retPatch };
     if (mode === "live") {
       await upsertDoc(desk, collection, doc.doc_id, newData);
     } else {
