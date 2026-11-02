@@ -3371,6 +3371,29 @@ function extractCbbTeamStats(teamBlock) {
   };
 }
 
+// Free closing-line proxy (2026-11-02, Seb's request, instead of the-odds-api's paid
+// historical endpoint): ESPN's own game summary carries a "pickcenter" array of
+// sportsbook lines. For a FINAL game this is frozen at whatever the book last quoted --
+// effectively the closing line, at no cost. Prefers DraftKings (same book the live
+// /odds proxy uses) and falls back to whichever provider ESPN ranks #1 (lowest
+// `priority`) if DK isn't listed for that game. `spread`/`moneyLine` here are already
+// HOME-team-signed (ESPN's own convention) -- homeTeamOdds.favorite is true when the
+// home team is favored, so a negative `spread` means the home team is favored by that
+// many points.
+function extractCbbClosingLine(summary) {
+  const books = summary?.pickcenter || [];
+  if (!books.length) return { provider: null, homeSpread: null, total: null, homeMoneyline: null, awayMoneyline: null };
+  const dk = books.find((b) => /draftkings/i.test(b.provider?.name || ""));
+  const best = dk || books.slice().sort((a, b) => (a.provider?.priority ?? 99) - (b.provider?.priority ?? 99))[0];
+  return {
+    provider: best.provider?.name || null,
+    homeSpread: Number.isFinite(best.spread) ? best.spread : null,
+    total: Number.isFinite(best.overUnder) ? best.overUnder : null,
+    homeMoneyline: Number.isFinite(best.homeTeamOdds?.moneyLine) ? best.homeTeamOdds.moneyLine : null,
+    awayMoneyline: Number.isFinite(best.awayTeamOdds?.moneyLine) ? best.awayTeamOdds.moneyLine : null,
+  };
+}
+
 function cbbHalfScores(competitor) {
   const ls = competitor?.linescores || [];
   const h1 = ls.find((l) => l.period === 1);
@@ -3426,6 +3449,7 @@ async function trackCbbForDate(yyyymmdd) {
       }
       const awayStats = extractCbbTeamStats(awayBlock);
       const homeStats = extractCbbTeamStats(homeBlock);
+      const closingLine = extractCbbClosingLine(summary);
 
       await upsertCbbGameRow({
         game_id: ev.id,
@@ -3439,6 +3463,11 @@ async function trackCbbForDate(yyyymmdd) {
         away_2h: awayHalves.h2,
         home_1h: homeHalves.h1,
         home_2h: homeHalves.h2,
+        line_provider: closingLine.provider,
+        home_spread: closingLine.homeSpread,
+        total_line: closingLine.total,
+        home_moneyline: closingLine.homeMoneyline,
+        away_moneyline: closingLine.awayMoneyline,
         away_fg_made: awayStats.fgMade, away_fg_att: awayStats.fgAtt, away_fg_pct: awayStats.fgPct,
         away_three_made: awayStats.threeMade, away_three_att: awayStats.threeAtt, away_three_pct: awayStats.threePct,
         away_ft_made: awayStats.ftMade, away_ft_att: awayStats.ftAtt, away_ft_pct: awayStats.ftPct,
