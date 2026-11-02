@@ -872,6 +872,60 @@ app.post("/internal/jobs/telegram-private", async (req, res) => {
   }
 });
 
+// --- ONE-OFF: Steve's weekly report Telegram send (2026-11-02, Seb's request) ---
+// Single-purpose, hardcoded target (not a generic "send any file anywhere" endpoint on
+// purpose -- this is meant to fire exactly once, from a one-time pg_cron job, then be
+// deleted). Pulls the PDF from the private 'slips' Storage bucket (reusing the same
+// service-key read pattern as /api/:desk/slip-image) and posts it to Steve's PRIVATE
+// Telegram chat only via Telegram's sendDocument (multipart). Refuses outright if the
+// hardcoded chat id were ever changed to the group chat id -- belt-and-suspenders with
+// the no-dollar-amounts-in-group rule, even though this is a fixed constant here.
+// DELETE THIS ENDPOINT (and the one-time cron job that calls it) once Seb confirms the
+// message_id came back -- it has no reason to exist after that single send.
+const STEVE_REPORT_BUCKET = "slips";
+const STEVE_REPORT_PATH = "reports/steve-weekly-2026-10-25-to-11-02.pdf";
+const STEVE_REPORT_CHAT_ID = "1294297670";
+const STEVE_REPORT_CAPTION = "Your weekly Parlay Desk report \u{1F4CA}";
+
+app.get("/internal/jobs/send-steve-weekly-report-20261102", async (req, res) => {
+  try {
+    if (String(STEVE_REPORT_CHAT_ID) === String(TELEGRAM_GROUP_CHAT_ID)) {
+      return res.status(400).json({ error: "refusing: target chat id matches the group chat id" });
+    }
+    if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+      return res.status(500).json({ error: "SUPABASE_URL / SUPABASE_SECRET_KEY not configured on the server." });
+    }
+    if (!TELEGRAM_BOT_TOKEN) {
+      return res.status(500).json({ error: "TELEGRAM_BOT_TOKEN not configured on the server." });
+    }
+
+    const fileRes = await fetch(`${SUPABASE_URL}/storage/v1/object/${STEVE_REPORT_BUCKET}/${STEVE_REPORT_PATH}`, {
+      headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}` },
+    });
+    if (!fileRes.ok) {
+      return res.status(502).json({ error: `storage fetch failed: HTTP ${fileRes.status} ${await fileRes.text()}` });
+    }
+    const buf = Buffer.from(await fileRes.arrayBuffer());
+
+    const form = new FormData();
+    form.append("chat_id", STEVE_REPORT_CHAT_ID);
+    form.append("caption", STEVE_REPORT_CAPTION);
+    form.append("document", new Blob([buf], { type: "application/pdf" }), "Report-Steve-2026-10-25-to-11-02.pdf");
+
+    const tgRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await tgRes.json();
+    if (!data.ok) {
+      return res.status(502).json({ error: `Telegram sendDocument failed: ${JSON.stringify(data)}` });
+    }
+    res.json({ sent: true, message_id: data.result.message_id, chat_id: STEVE_REPORT_CHAT_ID });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- Self-heal watchdog (2026-11-01, Seb's request) ---
 // sports-proxy only ever holds Supabase + ESPN credentials -- it has no access to the real
 // desk (that's the claude.ai Artifact's own ArtifactData store, only reachable by a Claude
