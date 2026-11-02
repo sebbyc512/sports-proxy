@@ -24,7 +24,13 @@ const NOISE_RES = [
   [/;[^()]*\)/g, ")"], // trailing in-game commentary inside the matchup parens -> just ")"
   /\s*\*\(I am 55% or less sure on this leg, add at your own risk\)\s*$/gi, // low-confidence 3-unit leg marker
   /,\s*alt\b/gi, // "Over 45.5 total points, alt (Low)" -> "Over 45.5 total points (Low)"
-  /\([^()]*\d{1,2}:\d{2}\s*[AP]M\s*ET\)/gi, // trailing kickoff/tip time, e.g. "(7:00 PM ET)" or "(90 min, 12:30 PM ET)"
+  // Trailing kickoff/tip time, e.g. "(7:00 PM ET)" or "(90 min, 12:30 PM ET)" -- "ET" is
+  // OPTIONAL: a real class of slip-upload legs renders this as bare "(8:10 PM)" with no
+  // timezone suffix at all, and the old ET-required version left that paren unstripped,
+  // which broke every ML/spread/total pattern's trailing $ anchor. Found 2026-11-02: this
+  // alone was why entire lotto parlays (11+ legs, "(uploaded slip)") sat needs_review
+  // forever even after their games went final -- not a matching failure, a normalize() gap.
+  /\([^()]*\d{1,2}:\d{2}\s*[AP]M\s*(?:ET)?\)/gi,
   [/\(\s*\d+\s*Pick SGP,\s*([^)]*)\)/gi, "($1)"], // "(2 Pick SGP, A vs B)" -> "(A vs B)"
   /\bSGP\s*\([+-]\d+\):\s*/gi, // "SGP (-115): " prefix
   /\s-\s*(?=SGP|$)/gi,
@@ -216,7 +222,13 @@ function parseLeg(text, legType) {
 
   if (legType === "spread") {
     const g = tryPatterns(t, SPREAD_PATTERNS);
-    if (g) return { category: "spread", team: g.team.trim(), line: parseFloat(g.num), opponent: (g.opp || g.a === g.team ? g.b : g.a)?.trim() || null };
+    // Was `(g.opp || g.a === g.team ? g.b : g.a)` -- when g.opp WAS set (the common case,
+    // e.g. "Portland Trail Blazers -7.5 vs UTA"), that ternary's condition was truthy and it
+    // returned g.b (always undefined for the opp-group patterns, which have no a/b groups
+    // at all) instead of g.opp itself, silently dropping the opponent. Harmless when the
+    // team only plays once that day (findGame never needed the opponent to disambiguate),
+    // but wrong whenever it did. Found 2026-11-02 while fixing the stuck-bet batch.
+    if (g) return { category: "spread", team: g.team.trim(), line: parseFloat(g.num), opponent: (g.opp || (g.a && g.b ? (sameTeam(g.a, g.team) ? g.b : g.a) : null))?.trim() || null };
   }
 
   if (legType === "over" || legType === "under" || legType === "total") {
@@ -309,7 +321,16 @@ function parseLeg(text, legType) {
 }
 
 function sameTeam(a, b) {
-  return a.trim().toLowerCase() === b.trim().toLowerCase();
+  const x = a.trim().toLowerCase();
+  const y = b.trim().toLowerCase();
+  if (x === y) return true;
+  // One side is a bare abbreviation/city and the other the full team name, e.g. "HOU" vs
+  // "HOU Rockets" in "HOU Rockets Moneyline (HOU vs DAL)" -- exact-string equality always
+  // failed this, so the disambiguation picked the WRONG side as the opponent (here it'd
+  // have called "HOU" itself the opponent of "HOU Rockets" instead of "DAL"). Harmless when
+  // there's only one game matching the team that day (findGame never narrows), but a live
+  // bug the moment a team plays twice in a window and the opponent is needed to disambiguate.
+  return y.startsWith(x + " ") || x.startsWith(y + " ");
 }
 
 export { parseLeg, normalize };
