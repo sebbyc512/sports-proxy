@@ -9,3 +9,4 @@ sql/ftd-archive-cron-run-me.sql
 sql/nba-tracker-cron-run-me.sql
 sql/soccer-tracker-cron-run-me.sql
 sql/self-heal-cron-run-me.sql
+sql/stuck-bet-resolver-cron-run-me.sql
