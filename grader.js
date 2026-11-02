@@ -212,23 +212,50 @@ function parseLeg(text, legType) {
   if (/early exit/i.test(raw)) return { category: "unsupported", reason: "Early Exit prop — needs DraftKings' promo rule, not just final stats" };
   const t = normalize(raw);
 
+  // Half-period markets (NCAAB only, 2026-11-02, Seb's request): "1st Half Duke -3.5",
+  // "2H Over 71.5", or DK's own trailing "(1st Half)"/"(2nd Half)" annotation. Only ever
+  // read by ml/spread/total -- props and every other category below keep using `t`
+  // unchanged, so this cannot affect NFL/NBA/NHL/MLB/soccer grading, which never carries
+  // this prefix in real data. `period` is attached below only on the categories that use
+  // `tHalf`; scoreLeg (server.js) is the piece that actually refuses to apply it outside
+  // basketball/mens-college-basketball.
+  const HALF1_RE = /^(?:1st half|first half|1h)\s+/i;
+  const HALF2_RE = /^(?:2nd half|second half|2h)\s+/i;
+  const HALF1_TRAILING_RE = /\s*\((?:1st half|first half|1h)\)\s*$/i;
+  const HALF2_TRAILING_RE = /\s*\((?:2nd half|second half|2h)\)\s*$/i;
+  let period = "full";
+  let tHalf = t;
+  if (HALF1_RE.test(tHalf)) {
+    period = "1H";
+    tHalf = tHalf.replace(HALF1_RE, "");
+  } else if (HALF2_RE.test(tHalf)) {
+    period = "2H";
+    tHalf = tHalf.replace(HALF2_RE, "");
+  } else if (HALF1_TRAILING_RE.test(tHalf)) {
+    period = "1H";
+    tHalf = tHalf.replace(HALF1_TRAILING_RE, "");
+  } else if (HALF2_TRAILING_RE.test(tHalf)) {
+    period = "2H";
+    tHalf = tHalf.replace(HALF2_TRAILING_RE, "");
+  }
+
   if (legType === "ml") {
-    const g = tryPatterns(t, ML_PATTERNS);
+    const g = tryPatterns(tHalf, ML_PATTERNS);
     if (g) {
       const opponent = g.opp ? g.opp.trim() : g.a && g.b ? (sameTeam(g.a, g.team) ? g.b : g.a).trim() : null;
-      return { category: "ml", team: g.team.trim(), opponent, rawA: g.a?.trim(), rawB: g.b?.trim() };
+      return { category: "ml", team: g.team.trim(), opponent, rawA: g.a?.trim(), rawB: g.b?.trim(), period };
     }
   }
 
   if (legType === "spread") {
-    const g = tryPatterns(t, SPREAD_PATTERNS);
+    const g = tryPatterns(tHalf, SPREAD_PATTERNS);
     // Was `(g.opp || g.a === g.team ? g.b : g.a)` -- when g.opp WAS set (the common case,
     // e.g. "Portland Trail Blazers -7.5 vs UTA"), that ternary's condition was truthy and it
     // returned g.b (always undefined for the opp-group patterns, which have no a/b groups
     // at all) instead of g.opp itself, silently dropping the opponent. Harmless when the
     // team only plays once that day (findGame never needed the opponent to disambiguate),
     // but wrong whenever it did. Found 2026-11-02 while fixing the stuck-bet batch.
-    if (g) return { category: "spread", team: g.team.trim(), line: parseFloat(g.num), opponent: (g.opp || (g.a && g.b ? (sameTeam(g.a, g.team) ? g.b : g.a) : null))?.trim() || null };
+    if (g) return { category: "spread", team: g.team.trim(), line: parseFloat(g.num), opponent: (g.opp || (g.a && g.b ? (sameTeam(g.a, g.team) ? g.b : g.a) : null))?.trim() || null, period };
   }
 
   if (legType === "over" || legType === "under" || legType === "total") {
@@ -240,8 +267,8 @@ function parseLeg(text, legType) {
       // (common for e.g. Real Madrid across UCL + La Liga) look falsely ambiguous.
       if (g) return { category: "teamTotal", team: g.team.trim(), opponent: (g.a && sameTeam(g.a, g.team) ? g.b : g.a)?.trim() || null, direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
     } else {
-      const g = tryPatterns(t, TOTAL_PATTERNS);
-      if (g) return { category: "total", direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
+      const g = tryPatterns(tHalf, TOTAL_PATTERNS);
+      if (g) return { category: "total", direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null, period };
     }
   }
 
@@ -259,8 +286,8 @@ function parseLeg(text, legType) {
       const g = tryPatterns(t, TEAM_TOTAL_PATTERNS);
       if (g) return { category: "teamTotal", team: g.team.trim(), opponent: (g.a && sameTeam(g.a, g.team) ? g.b : g.a)?.trim() || null, direction: g.dir.toLowerCase(), line: parseFloat(g.num), rawA: g.a?.trim() || null, rawB: g.b?.trim() || null };
     } else {
-      const tot = tryPatterns(t, TOTAL_PATTERNS);
-      if (tot) return { category: "total", direction: tot.dir.toLowerCase(), line: parseFloat(tot.num), rawA: tot.a?.trim() || null, rawB: tot.b?.trim() || null };
+      const tot = tryPatterns(tHalf, TOTAL_PATTERNS);
+      if (tot) return { category: "total", direction: tot.dir.toLowerCase(), line: parseFloat(tot.num), rawA: tot.a?.trim() || null, rawB: tot.b?.trim() || null, period };
     }
   }
   if (legType !== "ftd") {

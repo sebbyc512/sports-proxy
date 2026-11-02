@@ -339,6 +339,7 @@ const LIVE_SCORE_SPORTS = [
   { key: "NFL", sport: "football", league: "nfl" },
   { key: "CFB", sport: "football", league: "college-football" },
   { key: "NBA", sport: "basketball", league: "nba" },
+  { key: "CBB", sport: "basketball", league: "mens-college-basketball" },
   { key: "NHL", sport: "hockey", league: "nhl" },
   { key: "other", sport: "baseball", league: "mlb" },
 ];
@@ -370,7 +371,7 @@ async function fetchScoreboardEvents(sport, league) {
 // Pulled on a schedule by an external cron (not Claude usage) — see handbooks/phase2-log.md.
 app.get("/internal/jobs/live-scores", async (req, res) => {
   try {
-    const sports = { NFL: [], CFB: [], NBA: [], NHL: [], other: [], Soccer: [] };
+    const sports = { NFL: [], CFB: [], NBA: [], CBB: [], NHL: [], other: [], Soccer: [] };
     for (const s of LIVE_SCORE_SPORTS) {
       try {
         sports[s.key] = await fetchScoreboardEvents(s.sport, s.league);
@@ -1225,6 +1226,7 @@ app.get("/internal/telegram/set-webhook", async (req, res) => {
 // Part D) so nothing live can be affected by this endpoint.
 const GRADER_LEAGUES = [
   ["football", "nfl"], ["football", "college-football"], ["basketball", "nba"],
+  ["basketball", "mens-college-basketball"],
   ["hockey", "nhl"], ["baseball", "mlb"],
   ["soccer", "eng.1"], ["soccer", "esp.1"], ["soccer", "ita.1"], ["soccer", "ger.1"],
   ["soccer", "fra.1"], ["soccer", "usa.1"], ["soccer", "uefa.champions"], ["soccer", "uefa.europa"],
@@ -1246,6 +1248,13 @@ async function fetchGamesForDate(date) {
           abbreviation: c.team?.abbreviation,
           location: c.team?.location,
           name: c.team?.name,
+          // Half scores (NCAAB 1H/2H grading only, 2026-11-02) -- ESPN's scoreboard
+          // competitor already carries these as {value, displayValue, period}, period 1 =
+          // first half, period 2 = second half (an OT period, if any, is period 3+ and
+          // never part of a half bet's settlement). Carried for every sport/league here
+          // since it's free on this same response, but only CBB's scoreLeg below ever
+          // reads it.
+          linescores: c.linescores || null,
         }));
         if (competitors.length === 2) {
           games.push({ sport, league, id: ev.id, competitors, state: ev.status?.type?.state });
@@ -1258,6 +1267,19 @@ async function fetchGamesForDate(date) {
   return games;
 }
 
+// NCAAB 1H/2H grading only (2026-11-02). Returns the competitor's score for that half, or
+// null if the leg asked for a half on anything other than basketball/mens-college-basketball
+// (half-line bets aren't supported for any other sport yet -- refusing to grade is the safe
+// default, never silently reinterpreting a quarter/period as a "half") or if ESPN didn't
+// carry a linescore for that period (OT-only edge cases, data gaps).
+function halfAwareScore(comp, period, game) {
+  if (!period || period === "full") return comp.score;
+  if (game.sport !== "basketball" || game.league !== "mens-college-basketball") return null;
+  const periodNum = period === "1H" ? 1 : 2;
+  const row = (comp.linescores || []).find((l) => l.period === periodNum);
+  return row ? Number(row.value) : null;
+}
+
 function scoreLeg(parsed, game) {
   const comps = game.competitors;
   const isSoccer = game.sport === "soccer";
@@ -1265,19 +1287,28 @@ function scoreLeg(parsed, game) {
     const mine = comps.find((c) => teamMatches(parsed.team, c));
     const other = comps.find((c) => c !== mine);
     if (!mine || !other) return null;
-    if (mine.score === other.score) return isSoccer ? "miss" : "push";
-    return mine.score > other.score ? "hit" : "miss";
+    const mineScore = halfAwareScore(mine, parsed.period, game);
+    const otherScore = halfAwareScore(other, parsed.period, game);
+    if (mineScore == null || otherScore == null) return null;
+    if (mineScore === otherScore) return isSoccer ? "miss" : "push";
+    return mineScore > otherScore ? "hit" : "miss";
   }
   if (parsed.category === "spread") {
     const mine = comps.find((c) => teamMatches(parsed.team, c));
     const other = comps.find((c) => c !== mine);
     if (!mine || !other) return null;
-    const margin = mine.score - other.score + parsed.line;
+    const mineScore = halfAwareScore(mine, parsed.period, game);
+    const otherScore = halfAwareScore(other, parsed.period, game);
+    if (mineScore == null || otherScore == null) return null;
+    const margin = mineScore - otherScore + parsed.line;
     if (margin === 0) return "push";
     return margin > 0 ? "hit" : "miss";
   }
   if (parsed.category === "total") {
-    const combined = comps[0].score + comps[1].score;
+    const score0 = halfAwareScore(comps[0], parsed.period, game);
+    const score1 = halfAwareScore(comps[1], parsed.period, game);
+    if (score0 == null || score1 == null) return null;
+    const combined = score0 + score1;
     if (combined === parsed.line) return "push";
     const over = combined > parsed.line;
     return (parsed.direction === "over") === over ? "hit" : "miss";
@@ -3261,6 +3292,380 @@ app.get("/internal/jobs/nhl-learning-gate", async (req, res) => {
       lastFireCounts: counts,
     });
     res.json({ ok: true, fired: true, total, threshold: NHL_LOOP_THRESHOLD, counts, firedAt });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- NCAAB nightly tracker + engine-gated learning loop (2026-11-02, Seb's request) ---
+// Same additive pattern as the NBA/NHL/soccer trackers above -- new tables, new endpoints,
+// nothing existing touched. No player props (Seb's call: ML/spread/total only, full game
+// AND halves) so there's no cbb_player_logs table -- player box scores are read live by
+// pick builders for injury/minutes context, never stored here.
+//
+// Half scores: ESPN's scoreboard competitor objects already carry `linescores` with a
+// `period` number (1 = first half, 2 = second half, 3+ = OT) -- see fetchGamesForDate
+// above and halfAwareScore(), which is what actually grades "1st Half"/"2H" legs. This
+// tracker stores the same two numbers (away_1h/away_2h, home_1h/home_2h) on every game log
+// row so half tendencies (fast/slow starters, 2H comebacks) can be read back later.
+//
+// Team box-score stats (FG/3P/FT made-attempted, rebounds, ast/stl/blk/tov, fouls) come
+// from ESPN's per-game summary (boxscore.teams) -- confirmed shape against a real final
+// 2026-27 game (ND @ Villanova, event 401920982) on 2026-11-02: statistics are plain
+// {name, displayValue} pairs, made-attempted stats render as a single "23-65" string that
+// needs splitting, not two separate fields.
+//
+// NOT included, both checked live before writing any code:
+//   - Bart Torvik (barttorvik.com): its robots.txt disallows "ClaudeBot" and "anthropic-ai"
+//     by name (plus most other AI crawlers) site-wide. Respecting that -- no automated
+//     reads of it, no exception. (KenPom was never in scope per Seb.)
+//   - ESPN BPI: no working public site-API endpoint found for college BPI after trying the
+//     standard site.api.espn.com and site.web.api.espn.com BPI paths (all 404). Left out
+//     rather than faked. If Seb finds the real endpoint later, this is where it'd go.
+// SOS is instead a disclosed in-house proxy (average win% of opponents actually played,
+// from cbb_game_logs) -- same "approximate and say so" style as NBA's offRtg/defRtg.
+
+function cbbDocId(team) {
+  const base = team?.abbreviation || team?.displayName || String(team?.id || "");
+  return base.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10) || `T${team?.id}`;
+}
+
+// "23-65" -> { made: 23, att: 65, pct: 35.4 }. Returns nulls for anything unparseable.
+function splitMadeAttempt(str) {
+  const m = /^(\d+)-(\d+)$/.exec(str || "");
+  if (!m) return { made: null, att: null, pct: null };
+  const made = Number(m[1]);
+  const att = Number(m[2]);
+  return { made, att, pct: att > 0 ? Number(((made / att) * 100).toFixed(1)) : null };
+}
+
+function extractCbbTeamStats(teamBlock) {
+  const stats = teamBlock?.statistics || [];
+  const find = (name) => stats.find((s) => s.name === name)?.displayValue;
+  const fg = splitMadeAttempt(find("fieldGoalsMade-fieldGoalsAttempted"));
+  const three = splitMadeAttempt(find("threePointFieldGoalsMade-threePointFieldGoalsAttempted"));
+  const ft = splitMadeAttempt(find("freeThrowsMade-freeThrowsAttempted"));
+  const num = (name) => {
+    const v = Number(find(name));
+    return Number.isFinite(v) ? v : null;
+  };
+  return {
+    fgMade: fg.made, fgAtt: fg.att, fgPct: fg.pct,
+    threeMade: three.made, threeAtt: three.att, threePct: three.pct,
+    ftMade: ft.made, ftAtt: ft.att, ftPct: ft.pct,
+    oreb: num("offensiveRebounds"), dreb: num("defensiveRebounds"), reb: num("totalRebounds"),
+    ast: num("assists"), stl: num("steals"), blk: num("blocks"), tov: num("turnovers"), fouls: num("fouls"),
+  };
+}
+
+function cbbHalfScores(competitor) {
+  const ls = competitor?.linescores || [];
+  const h1 = ls.find((l) => l.period === 1);
+  const h2 = ls.find((l) => l.period === 2);
+  return {
+    h1: h1 ? Number(h1.value ?? h1.displayValue) : null,
+    h2: h2 ? Number(h2.value ?? h2.displayValue) : null,
+  };
+}
+
+async function upsertCbbGameRow(row) {
+  await supabaseFetch(`/cbb_game_logs?on_conflict=game_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ ...row, updated_at: new Date().toISOString() }]),
+  });
+}
+
+async function trackCbbForDate(yyyymmdd) {
+  const result = { date: yyyymmdd, gamesFound: 0, gamesRecorded: 0, skipped: [] };
+  let scoreboard;
+  try {
+    scoreboard = await getJson(`${ESPN_BASE}/basketball/mens-college-basketball/scoreboard?dates=${yyyymmdd}`);
+  } catch (err) {
+    result.error = err.message;
+    return result;
+  }
+  const events = (scoreboard.events || []).filter((ev) => ev.status?.type?.state === "post");
+  result.gamesFound = events.length;
+  const isoDate = `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
+
+  for (const ev of events) {
+    try {
+      const comp = ev.competitions?.[0];
+      const away = comp?.competitors?.find((c) => c.homeAway === "away");
+      const home = comp?.competitors?.find((c) => c.homeAway === "home");
+      if (!away || !home) {
+        result.skipped.push({ id: ev.id, reason: "missing competitors" });
+        continue;
+      }
+      const awayAbbr = cbbDocId(away.team);
+      const homeAbbr = cbbDocId(home.team);
+      const awayHalves = cbbHalfScores(away);
+      const homeHalves = cbbHalfScores(home);
+
+      const summary = await getJson(`${ESPN_BASE}/basketball/mens-college-basketball/summary?event=${ev.id}`);
+      const teamBlocks = summary.boxscore?.teams || [];
+      const awayBlock = teamBlocks.find((tb) => cbbDocId(tb.team) === awayAbbr);
+      const homeBlock = teamBlocks.find((tb) => cbbDocId(tb.team) === homeAbbr);
+      if (!awayBlock || !homeBlock) {
+        result.skipped.push({ id: ev.id, reason: "no boxscore.teams match for one side" });
+        continue;
+      }
+      const awayStats = extractCbbTeamStats(awayBlock);
+      const homeStats = extractCbbTeamStats(homeBlock);
+
+      await upsertCbbGameRow({
+        game_id: ev.id,
+        date: isoDate,
+        away_team: awayAbbr,
+        home_team: homeAbbr,
+        away_score: Number(away.score),
+        home_score: Number(home.score),
+        away_1h: awayHalves.h1,
+        away_2h: awayHalves.h2,
+        home_1h: homeHalves.h1,
+        home_2h: homeHalves.h2,
+        away_fg_made: awayStats.fgMade, away_fg_att: awayStats.fgAtt, away_fg_pct: awayStats.fgPct,
+        away_three_made: awayStats.threeMade, away_three_att: awayStats.threeAtt, away_three_pct: awayStats.threePct,
+        away_ft_made: awayStats.ftMade, away_ft_att: awayStats.ftAtt, away_ft_pct: awayStats.ftPct,
+        away_oreb: awayStats.oreb, away_dreb: awayStats.dreb, away_reb: awayStats.reb,
+        away_ast: awayStats.ast, away_stl: awayStats.stl, away_blk: awayStats.blk, away_tov: awayStats.tov, away_fouls: awayStats.fouls,
+        home_fg_made: homeStats.fgMade, home_fg_att: homeStats.fgAtt, home_fg_pct: homeStats.fgPct,
+        home_three_made: homeStats.threeMade, home_three_att: homeStats.threeAtt, home_three_pct: homeStats.threePct,
+        home_ft_made: homeStats.ftMade, home_ft_att: homeStats.ftAtt, home_ft_pct: homeStats.ftPct,
+        home_oreb: homeStats.oreb, home_dreb: homeStats.dreb, home_reb: homeStats.reb,
+        home_ast: homeStats.ast, home_stl: homeStats.stl, home_blk: homeStats.blk, home_tov: homeStats.tov, home_fouls: homeStats.fouls,
+      });
+      result.gamesRecorded++;
+    } catch (err) {
+      result.skipped.push({ id: ev.id, reason: err.message });
+    }
+    await sleep(200); // pace ESPN calls, esp. during a multi-night backfill
+  }
+  return result;
+}
+
+// Aggregates cbb_game_logs into per-team season numbers (own + allowed, home/away splits,
+// last-5, half splits), merges in ESPN standings (record, conference) and the AP poll
+// (best-effort -- no poll exists yet in the preseason/week-1 window, that's expected, not a
+// bug), and computes a disclosed SOS proxy: the average current win% of every opponent this
+// team has actually played so far (NOT a real strength-of-schedule formula like KenPom's --
+// a plain, honestly-labeled approximation, same spirit as NBA's offRtg/defRtg estimate).
+async function refreshCbbTeams() {
+  const standings = await getJson(`${ESPN_V2_BASE}/basketball/mens-college-basketball/standings?group=50`);
+  const byTeam = {};
+  const conferenceOf = {};
+  for (const child of standings.children || []) {
+    for (const e of child.standings?.entries || []) {
+      const abbr = cbbDocId(e.team);
+      if (!abbr) continue;
+      conferenceOf[abbr] = child.name || null;
+      const get = (name) => e.stats?.find((s) => s.name === name)?.value ?? null;
+      const overall = e.stats?.find((s) => s.name === "overall")?.displayValue || null;
+      byTeam[abbr] = {
+        teamName: e.team?.displayName,
+        record: overall,
+        wins: get("wins"),
+        losses: get("losses"),
+      };
+    }
+  }
+
+  let apRanks = {};
+  try {
+    const rankings = await getJson(`${ESPN_BASE}/basketball/mens-college-basketball/rankings`);
+    const poll = (rankings.rankings || []).find((r) => /ap/i.test(r.name || r.shortName || ""));
+    for (const r of poll?.ranks || []) {
+      const abbr = cbbDocId(r.team);
+      if (abbr) apRanks[abbr] = r.current;
+    }
+  } catch (err) {
+    // No AP poll out yet (preseason/week 1) or shape differs from other sports' rankings
+    // endpoint -- leave apRanks empty rather than guess.
+  }
+
+  const gamesRes = await supabaseFetch(
+    `/cbb_game_logs?select=away_team,home_team,away_score,home_score,away_1h,away_2h,home_1h,home_2h,away_fg_pct,home_fg_pct,away_three_pct,home_three_pct,away_reb,home_reb,away_tov,home_tov,date&order=date.asc&limit=5000`
+  );
+  const games = await gamesRes.json();
+
+  const agg = {};
+  const ensure = (abbr) =>
+    (agg[abbr] ||= {
+      played: 0, wins: 0, homeWins: 0, homePlayed: 0, awayWins: 0, awayPlayed: 0,
+      ptsFor: 0, ptsAgainst: 0, ptsFor1h: 0, ptsAgainst1h: 0, ptsFor2h: 0, ptsAgainst2h: 0,
+      fgPct: [], fgPctAllowed: [], threePct: [], threePctAllowed: [], reb: [], rebAllowed: [], tov: [], tovForced: [],
+      opponents: [], last5: [],
+    });
+
+  for (const g of games) {
+    for (const side of ["away", "home"]) {
+      const other = side === "away" ? "home" : "away";
+      const abbr = g[`${side}_team`];
+      const oppAbbr = g[`${other}_team`];
+      if (!abbr) continue;
+      const t = ensure(abbr);
+      const my = g[`${side}_score`];
+      const opp = g[`${other}_score`];
+      if (my == null || opp == null) continue;
+      t.played++;
+      const won = my > opp;
+      if (won) t.wins++;
+      if (side === "home") { t.homePlayed++; if (won) t.homeWins++; } else { t.awayPlayed++; if (won) t.awayWins++; }
+      t.ptsFor += my; t.ptsAgainst += opp;
+      if (g[`${side}_1h`] != null) t.ptsFor1h += g[`${side}_1h`];
+      if (g[`${other}_1h`] != null) t.ptsAgainst1h += g[`${other}_1h`];
+      if (g[`${side}_2h`] != null) t.ptsFor2h += g[`${side}_2h`];
+      if (g[`${other}_2h`] != null) t.ptsAgainst2h += g[`${other}_2h`];
+      if (g[`${side}_fg_pct`] != null) t.fgPct.push(g[`${side}_fg_pct`]);
+      if (g[`${other}_fg_pct`] != null) t.fgPctAllowed.push(g[`${other}_fg_pct`]);
+      if (g[`${side}_three_pct`] != null) t.threePct.push(g[`${side}_three_pct`]);
+      if (g[`${other}_three_pct`] != null) t.threePctAllowed.push(g[`${other}_three_pct`]);
+      if (g[`${side}_reb`] != null) t.reb.push(g[`${side}_reb`]);
+      if (g[`${other}_reb`] != null) t.rebAllowed.push(g[`${other}_reb`]);
+      if (g[`${side}_tov`] != null) t.tov.push(g[`${side}_tov`]);
+      if (g[`${other}_tov`] != null) t.tovForced.push(g[`${other}_tov`]);
+      if (oppAbbr) t.opponents.push(oppAbbr);
+      t.last5.push({ date: g.date, win: won });
+    }
+  }
+
+  const avg = (arr) => (arr.length ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1)) : null);
+  const winPct = (abbr) => {
+    const bt = byTeam[abbr];
+    if (bt?.wins != null && bt?.losses != null && bt.wins + bt.losses > 0) return bt.wins / (bt.wins + bt.losses);
+    const a = agg[abbr];
+    return a?.played ? a.wins / a.played : null;
+  };
+
+  const result = { teamsUpdated: 0, errors: [] };
+  const abbrs = new Set([...Object.keys(byTeam), ...Object.keys(agg)]);
+  for (const abbr of abbrs) {
+    const bt = byTeam[abbr] || {};
+    const a = agg[abbr];
+    const patch = {
+      teamName: bt.teamName ?? undefined,
+      conference: conferenceOf[abbr] ?? undefined,
+      record: bt.record ?? undefined,
+      apRank: apRanks[abbr] ?? undefined,
+      approxRatings: true,
+    };
+    if (a) {
+      patch.ptsFor = a.played ? Number((a.ptsFor / a.played).toFixed(1)) : undefined;
+      patch.ptsAgainst = a.played ? Number((a.ptsAgainst / a.played).toFixed(1)) : undefined;
+      patch.ptsFor1h = a.played ? Number((a.ptsFor1h / a.played).toFixed(1)) : undefined;
+      patch.ptsAgainst1h = a.played ? Number((a.ptsAgainst1h / a.played).toFixed(1)) : undefined;
+      patch.ptsFor2h = a.played ? Number((a.ptsFor2h / a.played).toFixed(1)) : undefined;
+      patch.ptsAgainst2h = a.played ? Number((a.ptsAgainst2h / a.played).toFixed(1)) : undefined;
+      patch.fgPct = avg(a.fgPct) ?? undefined;
+      patch.fgPctAllowed = avg(a.fgPctAllowed) ?? undefined;
+      patch.threePct = avg(a.threePct) ?? undefined;
+      patch.threePctAllowed = avg(a.threePctAllowed) ?? undefined;
+      patch.rebPerGame = avg(a.reb) ?? undefined;
+      patch.rebAllowedPerGame = avg(a.rebAllowed) ?? undefined;
+      patch.tovPerGame = avg(a.tov) ?? undefined;
+      patch.tovForcedPerGame = avg(a.tovForced) ?? undefined;
+      patch.homeRecord = `${a.homeWins}-${a.homePlayed - a.homeWins}`;
+      patch.awayRecord = `${a.awayWins}-${a.awayPlayed - a.awayWins}`;
+      const last5 = a.last5.slice(-5);
+      patch.last5 = last5.length ? `${last5.filter((g) => g.win).length}-${last5.filter((g) => !g.win).length}` : undefined;
+      const oppWinPcts = a.opponents.map(winPct).filter((v) => v != null);
+      patch.sosProxy = oppWinPcts.length ? Number((oppWinPcts.reduce((s, v) => s + v, 0) / oppWinPcts.length).toFixed(3)) : undefined;
+      patch.sampleGames = a.played;
+    }
+    try {
+      await mergeUpsertDoc("main", "cbbTeams", abbr, patch);
+      result.teamsUpdated++;
+    } catch (err) {
+      result.errors.push({ abbr, error: err.message });
+    }
+  }
+
+  await mergeUpsertDoc("main", "cbb", "meta", {
+    lastUpdated: new Date().toISOString().slice(0, 10),
+    apTop25Available: Object.keys(apRanks).length > 0,
+  });
+  return result;
+}
+
+// Pulled nightly by a Supabase pg_cron job (see sql/cbb-tracker-cron-run-me.sql). Same
+// date/from/to backfill convention as the NHL tracker above -- the season started
+// 2026-11-02, so the very first run only has that one night to cover; from/to exists for
+// catching up after any outage, not an initial multi-week backfill.
+app.get("/internal/jobs/cbb-nightly-tracker", async (req, res) => {
+  try {
+    const { date, from, to } = req.query;
+    const dates = [];
+    if (from && to) {
+      let d = new Date(Date.UTC(Number(from.slice(0, 4)), Number(from.slice(4, 6)) - 1, Number(from.slice(6, 8))));
+      const end = new Date(Date.UTC(Number(to.slice(0, 4)), Number(to.slice(4, 6)) - 1, Number(to.slice(6, 8))));
+      while (d <= end) {
+        dates.push(d.toISOString().slice(0, 10).replace(/-/g, ""));
+        d.setUTCDate(d.getUTCDate() + 1);
+      }
+    } else if (date) {
+      dates.push(date);
+    } else {
+      const yesterdayET = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      dates.push(yesterdayET.toISOString().slice(0, 10).replace(/-/g, ""));
+    }
+    const results = [];
+    for (const d of dates) {
+      results.push(await trackCbbForDate(d));
+      await sleep(300);
+    }
+    const teamsResult = await refreshCbbTeams();
+    res.json({
+      ok: true,
+      nights: results.length,
+      gamesRecorded: results.reduce((s, r) => s + r.gamesRecorded, 0),
+      results,
+      cbbTeams: teamsResult,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+const CBB_LOOP_FIRE_URL = process.env.CBB_LOOP_FIRE_URL;
+const CBB_LOOP_FIRE_TOKEN = process.env.CBB_LOOP_FIRE_TOKEN;
+const CBB_LOOP_THRESHOLD = 10;
+
+async function fireCbbLearningLoop() {
+  if (!CBB_LOOP_FIRE_URL || !CBB_LOOP_FIRE_TOKEN) {
+    throw new Error("CBB_LOOP_FIRE_URL/CBB_LOOP_FIRE_TOKEN not configured on the server.");
+  }
+  const fireRes = await fetch(CBB_LOOP_FIRE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${CBB_LOOP_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`CBB loop fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+}
+
+// Pulled hourly by a Supabase pg_cron job (see sql/cbb-tracker-cron-run-me.sql). Reuses
+// countNewGradedLegsByLeague() (defined above, in the NBA section) -- it's already
+// league-parameterized, so "CBB" just needs that tag used consistently on graded legs.
+app.get("/internal/jobs/cbb-learning-gate", async (req, res) => {
+  try {
+    const state = await getDoc("main", "taskConfig", "cbbLearningGate");
+    const lastFiredAt = state?.data?.lastFiredAt || "1970-01-01T00:00:00Z";
+    const { total, counts } = await countNewGradedLegsByLeague("CBB", lastFiredAt);
+    if (total < CBB_LOOP_THRESHOLD) {
+      return res.json({ ok: true, fired: false, total, threshold: CBB_LOOP_THRESHOLD, counts, lastFiredAt });
+    }
+    await fireCbbLearningLoop();
+    const firedAt = new Date().toISOString();
+    await upsertDoc("main", "taskConfig", "cbbLearningGate", { lastFiredAt: firedAt, lastFireTotal: total, lastFireCounts: counts });
+    res.json({ ok: true, fired: true, total, threshold: CBB_LOOP_THRESHOLD, counts, firedAt });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
