@@ -1003,6 +1003,101 @@ app.get("/internal/jobs/self-heal", async (req, res) => {
   }
 });
 
+// --- Stuck-bet resolver gate (2026-11-02, Seb's request) ---
+// The resolver itself is a separate claude.ai routine (trig_01XucFaBvmZ4GpdqnTEELUVt,
+// "Parlay Desk Stuck Bet Resolver (engine-gated)", model Sonnet, already built and enabled,
+// cron_expression empty -- it only ever runs when fired via its API, never on a schedule).
+// This endpoint is that trigger: it's the "engine" half -- it finds bets whose games are long
+// over but are still sitting pending/needs_review (the self-heal shadow-grader diff can't fix
+// these on its own because they need real research: play-by-play order for First-TD legs, or
+// slip-upload text the regex grader never learned to parse -- see the self-heal watchdog's own
+// comment for why), and fires the Sonnet routine with exactly the list to work on. The routine
+// does the actual re-grading (ArtifactData + WebFetch against ESPN) and writes both the real
+// desk and the Supabase mirror itself -- this endpoint never touches pnlEntries directly.
+//
+// GATING RULE (Seb's ask): a bet qualifies once it's at least 1 hour past (lastStart + 4h) --
+// i.e. 5 hours after its last leg's kickoff, giving every sport's own box score/play-by-play
+// time to go final. Falls back to firstStart, then to end-of-day on `date`, when lastStart is
+// missing (plenty of real docs don't have it) -- documented here so a future "why did this one
+// take longer to fire" question has an answer.
+const STUCK_BET_GATE_HOURS = 5;
+const STUCK_BET_WAKE_COOLDOWN_MS = 60 * 60 * 1000; // at most one fire per hour, same shape as self-heal
+const STUCK_RESOLVER_FIRE_URL = process.env.STUCK_RESOLVER_FIRE_URL;
+const STUCK_RESOLVER_FIRE_TOKEN = process.env.STUCK_RESOLVER_FIRE_TOKEN;
+
+function effectiveLastStart(data) {
+  if (data.lastStart) return new Date(data.lastStart);
+  if (data.firstStart) return new Date(data.firstStart);
+  if (data.date) return new Date(`${data.date}T23:59:00Z`);
+  return null;
+}
+
+async function findStuckBets(desk) {
+  const listRes = await supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data`);
+  const docs = await listRes.json();
+  const cutoffMs = STUCK_BET_GATE_HOURS * 60 * 60 * 1000;
+  const now = Date.now();
+  const stuck = [];
+  for (const doc of docs) {
+    const d = doc.data || {};
+    if (d.protected === true) continue;
+    if (!["pending", "needs_review"].includes(d.status)) continue; // "cashout"/"won"/"lost"/"push" are all terminal-or-locked
+    const start = effectiveLastStart(d);
+    if (!start || Number.isNaN(start.getTime())) continue; // no kickoff info at all -- never guess, skip
+    if (now - start.getTime() < cutoffMs) continue; // not yet 5h past kickoff
+    stuck.push({ desk, docId: doc.doc_id, desc: d.desc || d.ticketId || doc.doc_id });
+  }
+  return stuck;
+}
+
+async function fireStuckResolver(items) {
+  if (!STUCK_RESOLVER_FIRE_URL || !STUCK_RESOLVER_FIRE_TOKEN) {
+    throw new Error("STUCK_RESOLVER_FIRE_URL/STUCK_RESOLVER_FIRE_TOKEN not configured on the server.");
+  }
+  const lines = items.map((it) => `- ${it.desk}/${it.docId}: ${it.desc}`).join("\n");
+  const text = `STUCK_BET_GATE_WAKE -- resolve exactly these ${items.length} doc(s), none other:\n${lines}`;
+  const fireRes = await fetch(STUCK_RESOLVER_FIRE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${STUCK_RESOLVER_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ text }),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`Stuck-bet resolver fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+}
+
+app.get("/internal/jobs/stuck-bet-gate", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
+  for (const d of desks) if (!["main", "steve"].includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  const dryRun = req.query.dryRun === "true";
+  try {
+    const found = [];
+    for (const desk of desks) found.push(...(await findStuckBets(desk)));
+
+    if (found.length === 0) return res.json({ ok: true, action: "none", stuck: [] });
+
+    if (dryRun) return res.json({ ok: true, action: "would-fire", stuck: found });
+
+    const state = await getDoc("main", "stuckResolverState", "_global");
+    const sinceLastWake = Date.now() - (state?.data?.lastWakeAt ? new Date(state.data.lastWakeAt).getTime() : 0);
+    if (sinceLastWake < STUCK_BET_WAKE_COOLDOWN_MS) {
+      return res.json({ ok: true, action: "suppressed-cooldown", stuck: found });
+    }
+
+    await fireStuckResolver(found);
+    await upsertDoc("main", "stuckResolverState", "_global", { lastWakeAt: new Date().toISOString(), lastFired: found });
+    res.json({ ok: true, action: "fired", stuck: found });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // Inbound updates from Telegram. Registered once via /internal/telegram/set-webhook below.
 // Hard rule (Seb's own requirement): only ever act on an update whose chat/user id matches
 // TELEGRAM_SEB_CHAT_ID. Anything else is acknowledged (200, so Telegram doesn't retry) and
@@ -1726,6 +1821,215 @@ app.get("/internal/jobs/grade-and-alert", async (req, res) => {
       summary.results[desk] = deskSummary;
     }
     res.json({ ok: true, ...summary });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Stuck-bet resolver (2026-11-02, Seb's request, previously approved) ---
+// gradeOneLeg's rule-based grader (grader.js) is deliberately conservative: anything it
+// can't confidently parse/match stays needs_review forever, by design -- First TD Scorer
+// legs most of all (type "ftd" is never even attempted; it needs real scoring-play ORDER,
+// which grader.js structurally doesn't have). Those pile up. This job is the backstop:
+// engine-gated (only real, aged-out, still-stuck bets ever reach it -- never a blind
+// schedule), it hands the FEW legs the deterministic grader truly can't do to Sonnet with
+// real ESPN data (final box score stats, and for FTD legs the full ordered scoring-play
+// list) and asks for a grade or an explicit "unresolvable" -- never a guess on real money.
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const STUCK_RESOLVER_MODEL = process.env.STUCK_RESOLVER_MODEL || "claude-sonnet-5-5";
+const STUCK_RESOLVER_GATE_HOURS = 5; // lastStart + 4h (typical game length) + 1h buffer
+const STUCK_RESOLVER_MAX_ATTEMPTS = 3; // give up and flag, don't retry Sonnet forever
+
+async function fetchEventSummary(sport, league, eventId) {
+  return getJson(`${ESPN_BASE}/${sport}/${league}/summary?event=${eventId}`);
+}
+
+// Ordered (ESPN already returns these chronologically -- verified against real NFL data)
+// list of this game's touchdowns only, as plain text the model can read directly -- no
+// pre-parsing of the scorer's name out of "Josh Allen 1 Yd Rush (...)" or "DJ Moore 11 Yd
+// pass from Josh Allen (...)" ourselves; that's exactly the kind of natural-language call
+// Sonnet is being used for here instead of a brittle new regex.
+async function fetchTouchdownOrder(game) {
+  try {
+    const summary = await fetchEventSummary(game.sport, game.league, game.id);
+    return (summary.scoringPlays || [])
+      .filter((p) => p.scoringType?.name === "touchdown")
+      .map((p) => ({ text: p.text, team: p.team?.abbreviation, period: p.period?.number, clock: p.clock?.displayValue }));
+  } catch {
+    return [];
+  }
+}
+
+async function callSonnetResolver(ticket, unresolvedLegs, context) {
+  if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not configured on the server.");
+  const prompt = [
+    "You are grading sports bet legs from REAL final game data. Never guess -- if the data",
+    "given doesn't let you say for certain, mark that leg \"unresolvable\" with why.",
+    "",
+    `Ticket: ${ticket.desc || ticket.ticketId} (date ${ticket.date}, stake $${ticket.stake})`,
+    "",
+    "Legs to grade (index : leg text : real game data):",
+    ...unresolvedLegs.map((l, i) => `${i}. "${l.text}"\n   data: ${JSON.stringify(context[i])}`),
+    "",
+    'Respond with ONLY a JSON array, one entry per leg in the same order: [{"index":0,"status":"hit"|"miss"|"push"|"unresolvable","reason":"..."}, ...]',
+  ].join("\n");
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: STUCK_RESOLVER_MODEL,
+      max_tokens: 2000,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!res.ok) throw new Error(`Anthropic API -> HTTP ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  const text = data.content?.[0]?.text || "[]";
+  const match = text.match(/\[[\s\S]*\]/);
+  return JSON.parse(match ? match[0] : text);
+}
+
+// Gathers the real-data context Sonnet needs for one leg: for an "ftd" leg, the game's full
+// ordered touchdown list; for anything else still unresolved, the matched game's final score
+// plus (when findable) the relevant player's box-score line, so Sonnet is reading real stats,
+// never inferring from the bet text alone.
+async function buildResolverContext(leg, games) {
+  if (leg.type === "ftd") {
+    const parsedMatch = (leg.text.match(/\(([^()]+)\)\s*$/) || [])[1] || "";
+    const [rawA, rawB] = parsedMatch.split(/\s+(?:vs|v|@|at)\s+/i).map((s) => s?.trim());
+    const game = findGame(games, rawA || "", rawB || "");
+    if (!game) return { error: "could not identify the game from leg text" };
+    const tds = await fetchTouchdownOrder(game);
+    return { gameFinalScore: game.competitors.map((c) => `${c.abbreviation} ${c.score}`).join(" - "), touchdownsInOrder: tds };
+  }
+  const parsed = parseLeg(leg.text, leg.type);
+  if (parsed.category === "unsupported") return { parseFailure: parsed.reason };
+  const teamQuery = parsed.team || parsed.rawA || parsed.player;
+  const game = findGame(games, teamQuery || "", parsed.opponent || parsed.rawB || "");
+  if (!game) return { error: "could not identify the game from leg text" };
+  const box = parsed.category === "stat" || parsed.category === "anytimeTd" ? await fetchBoxScorePlayers(game).catch(() => null) : null;
+  return {
+    gameFinalScore: game.competitors.map((c) => `${c.abbreviation} ${c.score}`).join(" - "),
+    boxScorePlayers: box ? box.flatMap((t) => t.statistics).map((c) => ({ names: c.names, labels: c.labels })) : undefined,
+  };
+}
+
+async function resolveStuckTicket(desk, doc) {
+  const data = doc.data;
+  const legs = data.legs || [];
+  const unresolvedIdx = legs.map((l, i) => i).filter((i) => ["pending", "needs_review", undefined, null].includes(legs[i].status));
+  if (unresolvedIdx.length === 0) return { resolved: false, reason: "nothing unresolved" };
+
+  const base = data.date ? new Date(data.date + "T12:00:00Z") : new Date();
+  const dates = [-1, 0, 1].map((delta) => {
+    const dd = new Date(base);
+    dd.setUTCDate(dd.getUTCDate() + delta);
+    return dd.toISOString().slice(0, 10);
+  });
+  const games = (await Promise.all(dates.map(fetchGamesForDate))).flat();
+
+  const unresolvedLegs = unresolvedIdx.map((i) => legs[i]);
+  const context = await Promise.all(unresolvedLegs.map((l) => buildResolverContext(l, games)));
+  const verdicts = await callSonnetResolver(data, unresolvedLegs, context);
+
+  const newLegs = [...legs];
+  let anyChanged = false;
+  const applied = [];
+  for (const v of verdicts) {
+    if (v.status === "unresolvable") continue;
+    const legIdx = unresolvedIdx[v.index];
+    if (legIdx === undefined) continue;
+    newLegs[legIdx] = { ...newLegs[legIdx], status: v.status };
+    anyChanged = true;
+    applied.push({ legIdx, text: legs[legIdx].text, status: v.status, reason: v.reason });
+  }
+
+  const resolverLogId = `rs-${doc.doc_id}-${Date.now()}`;
+  await upsertDoc(desk, "stuckResolverLog", resolverLogId, {
+    desk,
+    docId: doc.doc_id,
+    attemptedAt: new Date().toISOString(),
+    unresolvedLegs: unresolvedLegs.map((l) => l.text),
+    verdicts,
+    applied,
+  });
+
+  if (!anyChanged) {
+    const attempts = (data.resolverAttempts || 0) + 1;
+    await upsertDoc(desk, "pnlEntries", doc.doc_id, { ...data, resolverAttempts: attempts });
+    if (attempts >= STUCK_RESOLVER_MAX_ATTEMPTS) {
+      await telegramApi("sendMessage", {
+        chat_id: TELEGRAM_SEB_CHAT_ID,
+        text: buildPrivateText({
+          kind: "failure",
+          task: "Stuck-bet resolver",
+          reason: `${desk}/${doc.doc_id} ("${data.desc}"): Sonnet couldn't resolve any leg after ${attempts} tries -- needs a manual look.`,
+        }),
+        parse_mode: "HTML",
+      }).catch((err) => console.error("stuck-bet-resolver: flag DM failed:", err.message));
+    }
+    return { resolved: false, reason: "all legs unresolvable", attempts };
+  }
+
+  const newStatus = rollUpTicketStatus(newLegs);
+  const retPatch = {};
+  if (["won", "lost", "push"].includes(newStatus)) {
+    const correctRet = settlePnlRet(newStatus, data);
+    if (correctRet !== undefined) Object.assign(retPatch, { ret: correctRet, settledAt: data.settledAt || new Date().toISOString() });
+  }
+  const newData = { ...data, legs: newLegs, status: newStatus, resolverAttempts: 0, ...retPatch };
+  await upsertDoc(desk, "pnlEntries", doc.doc_id, newData);
+  return { resolved: true, newStatus, applied };
+}
+
+app.get("/internal/jobs/stuck-bet-resolver", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
+  for (const d of desks) if (!DESKS.includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  // dryRun just reports WHICH tickets are gate-eligible right now -- no Sonnet call, no
+  // write -- so eligibility logic can be checked without spending a real API call or even
+  // needing ANTHROPIC_API_KEY set yet.
+  const dryRun = req.query.dryRun === "true";
+  if (!dryRun && !ANTHROPIC_API_KEY) return res.status(500).json({ error: "ANTHROPIC_API_KEY not configured on the server." });
+  try {
+    const now = Date.now();
+    const results = [];
+    for (const desk of desks) {
+      const listRes = await supabaseFetch(
+        `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data`
+      );
+      const docs = await listRes.json();
+      for (const doc of docs) {
+        const data = doc.data;
+        if (data.protected === true) continue;
+        if (!["pending", "needs_review"].includes(data.status)) continue;
+        if (!(Number(data.stake) > 0)) continue;
+        if ((data.resolverAttempts || 0) >= STUCK_RESOLVER_MAX_ATTEMPTS) continue;
+        const lastStartMs = data.lastStart ? new Date(data.lastStart).getTime() : null;
+        const eligible = lastStartMs
+          ? now - lastStartMs >= STUCK_RESOLVER_GATE_HOURS * 60 * 60 * 1000
+          : Boolean(data.date && data.date <= etDateDaysAgo(1));
+        if (!eligible) continue;
+        if (dryRun) {
+          results.push({ desk, docId: doc.doc_id, eligible: true, desc: data.desc });
+          continue;
+        }
+        try {
+          const result = await resolveStuckTicket(desk, doc);
+          results.push({ desk, docId: doc.doc_id, ...result });
+        } catch (err) {
+          results.push({ desk, docId: doc.doc_id, resolved: false, error: err.message });
+        }
+      }
+    }
+    if (!dryRun && results.some((r) => r.resolved)) {
+      await triggerSyncWake().catch((err) => console.error("stuck-bet-resolver: wake-sync failed:", err.message));
+    }
+    res.json({ ok: true, dryRun, checked: results.length, results });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
