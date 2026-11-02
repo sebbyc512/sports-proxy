@@ -659,29 +659,35 @@ async function sendSyncWake() {
   }
 }
 
+// Shared by the HTTP route below and by the self-heal job (which needs to trigger a wake
+// internally without an extra network hop back into its own server).
+async function triggerSyncWake() {
+  if (!CLAUDE_FIRE_URL || !CLAUDE_FIRE_TOKEN) {
+    throw new Error("CLAUDE_FIRE_URL/CLAUDE_FIRE_TOKEN not configured on the server.");
+  }
+  const sinceLast = Date.now() - lastSyncWakeAt;
+  if (sinceLast >= SYNC_WAKE_COOLDOWN_MS) {
+    await sendSyncWake();
+    return { ok: true, fired: true };
+  }
+  if (trailingSyncWakeTimer) {
+    return { ok: true, fired: false, reason: "cooldown", trailingAlreadyScheduled: true };
+  }
+  const delay = SYNC_WAKE_COOLDOWN_MS - sinceLast;
+  trailingSyncWakeTimer = setTimeout(async () => {
+    trailingSyncWakeTimer = null;
+    try {
+      await sendSyncWake();
+    } catch (err) {
+      console.error("Trailing sync wake failed:", err.message);
+    }
+  }, delay);
+  return { ok: true, fired: false, reason: "cooldown", trailingScheduledInMs: delay };
+}
+
 app.post("/internal/jobs/wake-sync", async (req, res) => {
   try {
-    if (!CLAUDE_FIRE_URL || !CLAUDE_FIRE_TOKEN) {
-      return res.status(500).json({ error: "CLAUDE_FIRE_URL/CLAUDE_FIRE_TOKEN not configured on the server." });
-    }
-    const sinceLast = Date.now() - lastSyncWakeAt;
-    if (sinceLast >= SYNC_WAKE_COOLDOWN_MS) {
-      await sendSyncWake();
-      return res.json({ ok: true, fired: true });
-    }
-    if (trailingSyncWakeTimer) {
-      return res.json({ ok: true, fired: false, reason: "cooldown", trailingAlreadyScheduled: true });
-    }
-    const delay = SYNC_WAKE_COOLDOWN_MS - sinceLast;
-    trailingSyncWakeTimer = setTimeout(async () => {
-      trailingSyncWakeTimer = null;
-      try {
-        await sendSyncWake();
-      } catch (err) {
-        console.error("Trailing sync wake failed:", err.message);
-      }
-    }, delay);
-    res.json({ ok: true, fired: false, reason: "cooldown", trailingScheduledInMs: delay });
+    res.json(await triggerSyncWake());
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -722,38 +728,44 @@ async function sendBuilderFire(desk, text) {
   }
 }
 
+// Shared by the HTTP route below and by the self-heal job.
+async function triggerBuilderFire(desk, text) {
+  if (!BUILDER_FIRE[desk]) throw new Error("desk must be main or steve");
+  const cfg = BUILDER_FIRE[desk];
+  if (!cfg.url || !cfg.token) {
+    throw new Error(`${desk === "main" ? "MAIN" : "FRIENDS"}_BUILDER_FIRE_URL/TOKEN not configured on the server.`);
+  }
+  const state = builderFireState[desk];
+  const sinceLast = Date.now() - state.lastFireAt;
+  if (sinceLast >= BUILDER_FIRE_COOLDOWN_MS) {
+    await sendBuilderFire(desk, text);
+    return { ok: true, fired: true, desk };
+  }
+  if (state.trailingTimer) {
+    return { ok: true, fired: false, desk, reason: "cooldown", trailingAlreadyScheduled: true };
+  }
+  const delay = BUILDER_FIRE_COOLDOWN_MS - sinceLast;
+  state.trailingTimer = setTimeout(async () => {
+    state.trailingTimer = null;
+    try {
+      await sendBuilderFire(desk, text);
+    } catch (err) {
+      console.error(`Trailing ${desk} builder fire failed:`, err.message);
+    }
+  }, delay);
+  return { ok: true, fired: false, desk, reason: "cooldown", trailingScheduledInMs: delay };
+}
+
 app.post("/internal/jobs/fire-builder", async (req, res) => {
   try {
     const desk = req.query.desk;
-    if (!BUILDER_FIRE[desk]) return res.status(400).json({ error: "desk must be main or steve" });
-    const cfg = BUILDER_FIRE[desk];
-    if (!cfg.url || !cfg.token) {
-      return res
-        .status(500)
-        .json({ error: `${desk === "main" ? "MAIN" : "FRIENDS"}_BUILDER_FIRE_URL/TOKEN not configured on the server.` });
-    }
-    const state = builderFireState[desk];
     const text = req.query.text || req.body?.text;
-    const sinceLast = Date.now() - state.lastFireAt;
-    if (sinceLast >= BUILDER_FIRE_COOLDOWN_MS) {
-      await sendBuilderFire(desk, text);
-      return res.json({ ok: true, fired: true, desk });
-    }
-    if (state.trailingTimer) {
-      return res.json({ ok: true, fired: false, desk, reason: "cooldown", trailingAlreadyScheduled: true });
-    }
-    const delay = BUILDER_FIRE_COOLDOWN_MS - sinceLast;
-    state.trailingTimer = setTimeout(async () => {
-      state.trailingTimer = null;
-      try {
-        await sendBuilderFire(desk, text);
-      } catch (err) {
-        console.error(`Trailing ${desk} builder fire failed:`, err.message);
-      }
-    }, delay);
-    res.json({ ok: true, fired: false, desk, reason: "cooldown", trailingScheduledInMs: delay });
+    res.json(await triggerBuilderFire(desk, text));
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    let status = 502;
+    if (err.message === "desk must be main or steve") status = 400;
+    else if (err.message.endsWith("not configured on the server.")) status = 500;
+    res.status(status).json({ error: err.message });
   }
 });
 
@@ -824,6 +836,168 @@ app.post("/internal/jobs/telegram-private", async (req, res) => {
     }
     if (!dryRun) await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text: body, parse_mode: "HTML", reply_markup });
     res.json({ sent: !dryRun, dryRun, text: body });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Self-heal watchdog (2026-11-01, Seb's request) ---
+// sports-proxy only ever holds Supabase + ESPN credentials -- it has no access to the real
+// desk (that's the claude.ai Artifact's own ArtifactData store, only reachable by a Claude
+// routine like Post-Cutover Sync). So "compare desk vs Supabase" here is implemented as an
+// internal-consistency check against the Supabase mirror: it reuses gradeCollectionForDesk's
+// shadow mode (the exact same ESPN-backed re-grade /internal/jobs/grade-and-alert already
+// trusts) to find any pnlEntries doc whose status/ret/stake is NOT what it should be given
+// real game results -- that's either a stuck-open bet whose game already went final, or a
+// settle that never got its ret backfilled. That is precisely the signature of Post-Cutover
+// Sync being stuck/broken (the thing this job exists to catch and wake back up), without
+// needing a second read of the real desk.
+const SELF_HEAL_BALANCE_EPSILON = 0.01;
+const SELF_HEAL_WAKE_COOLDOWN_MS = 60 * 60 * 1000; // at most one wake per hour, per Seb's ask
+
+function pnlDelta(d) {
+  if (d.protected === true) {
+    // A locked Early Exit still has a real, final ret -- same math as a normal win, just
+    // never recomputed from odds (see settlePnlRet). It must still count toward balance.
+    if (d.status === "won") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
+    return 0;
+  }
+  if (d.status === "won") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
+  if (d.status === "lost") return -(Number(d.stake) || 0);
+  return 0; // push/open/pending never move the balance
+}
+
+function sumPnlBalance(docs) {
+  return Math.round(docs.reduce((total, d) => total + pnlDelta(d), 0) * 100) / 100;
+}
+
+// One hourly self-heal pass for a single desk: finds what the shadow grader says SHOULD
+// change in pnlEntries (covers both "status/ret/stake drift" and "open bet, game is final
+// but never settled"), and the balance swing that correction would cause.
+async function selfHealCheckDesk(desk) {
+  const listRes = await supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data`);
+  const allDocs = await listRes.json();
+  const currentBalance = sumPnlBalance(allDocs.map((d) => d.data));
+
+  const graded = await gradeCollectionForDesk(desk, "pnlEntries", "shadow");
+
+  const correctedById = new Map(allDocs.map((d) => [d.doc_id, d.data]));
+  for (const g of graded) correctedById.set(g.docId, g.data);
+  const correctedBalance = sumPnlBalance([...correctedById.values()]);
+  const balanceDelta = Math.round((correctedBalance - currentBalance) * 100) / 100;
+
+  const stuckOpens = graded.filter(
+    (g) => ["pending", "needs_review", undefined, null].includes(g.prevStatus) && ["won", "lost", "push"].includes(g.newStatus)
+  );
+
+  const mismatches = graded.map((g) => ({ docId: g.docId, prevStatus: g.prevStatus, newStatus: g.newStatus }));
+  const hasMismatch = mismatches.length > 0 || Math.abs(balanceDelta) > SELF_HEAL_BALANCE_EPSILON;
+
+  return { desk, hasMismatch, mismatches, stuckOpenCount: stuckOpens.length, currentBalance, correctedBalance, balanceDelta };
+}
+
+function selfHealSignature(result) {
+  const ids = result.mismatches.map((m) => m.docId).sort();
+  return JSON.stringify({ ids, balanceDelta: result.balanceDelta });
+}
+
+app.get("/internal/jobs/self-heal", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
+  for (const d of desks) if (!["main", "steve"].includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  const dryRun = req.query.dryRun === "true";
+  try {
+    const summary = { dryRun, desks: {} };
+    let anyMismatch = false;
+    const mismatchedDesks = [];
+
+    for (const desk of desks) {
+      const result = await selfHealCheckDesk(desk);
+      summary.desks[desk] = {
+        hasMismatch: result.hasMismatch,
+        mismatchCount: result.mismatches.length,
+        stuckOpenCount: result.stuckOpenCount,
+        currentBalance: result.currentBalance,
+        correctedBalance: result.correctedBalance,
+        balanceDelta: result.balanceDelta,
+      };
+      if (result.hasMismatch) {
+        anyMismatch = true;
+        mismatchedDesks.push(result);
+      }
+    }
+
+    if (!anyMismatch) {
+      return res.json({ ok: true, action: "none", ...summary });
+    }
+
+    // Repeat-mismatch detection is per-desk (Steve's desk can be stuck while main's is fine,
+    // and vice versa); persisted in Supabase (not memory) so it survives a Render restart.
+    const actions = [];
+    for (const result of mismatchedDesks) {
+      const signature = selfHealSignature(result);
+      const prevState = dryRun ? null : await getDoc(result.desk, "selfHealState", "status");
+      const prev = prevState?.data;
+      const repeating = prev && prev.signature === signature;
+      const consecutiveCount = repeating ? (prev.consecutiveCount || 1) + 1 : 1;
+
+      if (repeating && consecutiveCount >= 2) {
+        // Same mismatch, 2nd (or later) run in a row -- stop poking wake-sync/fire-builder
+        // (that would just loop) and flag it directly to Seb instead.
+        actions.push({ desk: result.desk, action: "flagged-persistent", consecutiveCount });
+        if (!dryRun) {
+          const reason = `${result.desk}: ${result.mismatches.length} pnlEntries mismatch(es), ${result.stuckOpenCount} stuck-open, balance drift $${result.balanceDelta} -- unchanged for ${consecutiveCount} hourly checks in a row. wake-sync/fire-builder already tried and didn't clear it -- needs a manual look.`;
+          await telegramApi("sendMessage", {
+            chat_id: TELEGRAM_SEB_CHAT_ID,
+            text: buildPrivateText({ kind: "failure", task: "Self-heal watchdog", reason }),
+            parse_mode: "HTML",
+          }).catch((err) => console.error("self-heal: persistent-flag DM failed:", err.message));
+          await upsertDoc(result.desk, "selfHealLog", `sh-${result.desk}-${Date.now()}`, {
+            desk: result.desk,
+            foundAt: new Date().toISOString(),
+            mismatches: result.mismatches,
+            stuckOpenCount: result.stuckOpenCount,
+            balanceDelta: result.balanceDelta,
+            action: "flagged-persistent",
+            consecutiveCount,
+          });
+          await upsertDoc(result.desk, "selfHealState", "status", { signature, consecutiveCount, lastCheckedAt: new Date().toISOString() });
+        }
+        continue;
+      }
+
+      // New or changed mismatch (or first time seeing it repeat) -- try to actually fix it:
+      // wake the sync engine, and if it's Steve's desk specifically, also re-light his
+      // pick-request builder (his pipeline couples sync+builder, so a stuck desk there
+      // usually means both need a nudge).
+      let actionTaken = "woke-sync";
+      if (!dryRun) {
+        const globalState = await getDoc("main", "selfHealState", "_global");
+        const sinceLastWake = Date.now() - (globalState?.data?.lastWakeAt ? new Date(globalState.data.lastWakeAt).getTime() : 0);
+        if (sinceLastWake >= SELF_HEAL_WAKE_COOLDOWN_MS) {
+          await triggerSyncWake().catch((err) => console.error("self-heal: wake-sync failed:", err.message));
+          await upsertDoc("main", "selfHealState", "_global", { lastWakeAt: new Date().toISOString() });
+        } else {
+          actionTaken = "suppressed-cooldown";
+        }
+        if (result.desk === "steve") {
+          await triggerBuilderFire("steve", "SELF_HEAL_WAKE").catch((err) => console.error("self-heal: fire-builder failed:", err.message));
+          actionTaken += "+fired-builder";
+        }
+        await upsertDoc(result.desk, "selfHealLog", `sh-${result.desk}-${Date.now()}`, {
+          desk: result.desk,
+          foundAt: new Date().toISOString(),
+          mismatches: result.mismatches,
+          stuckOpenCount: result.stuckOpenCount,
+          balanceDelta: result.balanceDelta,
+          action: actionTaken,
+          consecutiveCount,
+        });
+        await upsertDoc(result.desk, "selfHealState", "status", { signature, consecutiveCount, lastCheckedAt: new Date().toISOString() });
+      }
+      actions.push({ desk: result.desk, action: actionTaken, consecutiveCount });
+    }
+
+    res.json({ ok: true, action: "mismatch-handled", actions, ...summary });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
