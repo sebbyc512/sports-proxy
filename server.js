@@ -3330,6 +3330,19 @@ function cbbDocId(team) {
   return base.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10) || `T${team?.id}`;
 }
 
+// NCAAB season backfill (2026-11-02, Seb's request): "2025-26", "2026-27", etc. The
+// season runs Nov-Apr, so Aug-Dec dates belong to the season STARTING that year and
+// Jan-Jul dates belong to the season ENDING that year. Used to tag every cbb_game_logs
+// row so last season's rows (different rosters -- heavy transfer-portal turnover every
+// year) can be read for PATTERNS (tempo, half tendencies, tournament pace) without ever
+// being averaged into this season's live team ratings.
+function seasonForDate(yyyymmdd) {
+  const year = Number(yyyymmdd.slice(0, 4));
+  const month = Number(yyyymmdd.slice(4, 6));
+  const startYear = month >= 8 ? year : year - 1;
+  return `${startYear}-${String((startYear + 1) % 100).padStart(2, "0")}`;
+}
+
 // "23-65" -> { made: 23, att: 65, pct: 35.4 }. Returns nulls for anything unparseable.
 function splitMadeAttempt(str) {
   const m = /^(\d+)-(\d+)$/.exec(str || "");
@@ -3417,6 +3430,7 @@ async function trackCbbForDate(yyyymmdd) {
       await upsertCbbGameRow({
         game_id: ev.id,
         date: isoDate,
+        season: seasonForDate(yyyymmdd),
         away_team: awayAbbr,
         home_team: homeAbbr,
         away_score: Number(away.score),
@@ -3452,6 +3466,11 @@ async function trackCbbForDate(yyyymmdd) {
 // team has actually played so far (NOT a real strength-of-schedule formula like KenPom's --
 // a plain, honestly-labeled approximation, same spirit as NBA's offRtg/defRtg estimate).
 async function refreshCbbTeams() {
+  // Current season only -- last season's backfilled rows (sql/cbb-tracker-cron.sql's
+  // backfill) must never dilute THIS season's ratings; rosters turn over too much. Last
+  // season's rows stay queryable by anyone who explicitly asks for them (e.g. the learning
+  // loop pulling tournament-pace patterns), just never averaged in here.
+  const currentSeason = seasonForDate(new Date().toISOString().slice(0, 10).replace(/-/g, ""));
   const standings = await getJson(`${ESPN_V2_BASE}/basketball/mens-college-basketball/standings?group=50`);
   const byTeam = {};
   const conferenceOf = {};
@@ -3485,7 +3504,7 @@ async function refreshCbbTeams() {
   }
 
   const gamesRes = await supabaseFetch(
-    `/cbb_game_logs?select=away_team,home_team,away_score,home_score,away_1h,away_2h,home_1h,home_2h,away_fg_pct,home_fg_pct,away_three_pct,home_three_pct,away_reb,home_reb,away_tov,home_tov,date&order=date.asc&limit=5000`
+    `/cbb_game_logs?season=eq.${currentSeason}&select=away_team,home_team,away_score,home_score,away_1h,away_2h,home_1h,home_2h,away_fg_pct,home_fg_pct,away_three_pct,home_three_pct,away_reb,home_reb,away_tov,home_tov,date&order=date.asc&limit=5000`
   );
   const games = await gamesRes.json();
 
@@ -3584,6 +3603,7 @@ async function refreshCbbTeams() {
   await mergeUpsertDoc("main", "cbb", "meta", {
     lastUpdated: new Date().toISOString().slice(0, 10),
     apTop25Available: Object.keys(apRanks).length > 0,
+    currentSeason,
   });
   return result;
 }

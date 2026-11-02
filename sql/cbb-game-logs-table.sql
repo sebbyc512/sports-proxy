@@ -18,6 +18,10 @@
 create table if not exists cbb_game_logs (
   game_id text primary key,
   date date not null,
+  season text, -- "2025-26", "2026-27", etc. (server.js's seasonForDate()) -- lets last
+               -- season's backfilled rows stay queryable for PATTERNS without ever being
+               -- averaged into this season's live cbbTeams ratings (refreshCbbTeams()
+               -- filters to the current season only).
   away_team text not null,
   home_team text not null,
   away_score integer,
@@ -40,7 +44,11 @@ create table if not exists cbb_game_logs (
   updated_at timestamptz not null default now()
 );
 
+-- Defensive: in case this file already ran on disk before the "season" column existed.
+alter table cbb_game_logs add column if not exists season text;
+
 create index if not exists idx_cbb_game_logs_date on cbb_game_logs (date);
+create index if not exists idx_cbb_game_logs_season on cbb_game_logs (season);
 create index if not exists idx_cbb_game_logs_away_team on cbb_game_logs (away_team);
 create index if not exists idx_cbb_game_logs_home_team on cbb_game_logs (home_team);
 
