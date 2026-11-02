@@ -862,7 +862,11 @@ function pnlDelta(d) {
     if (d.status === "won") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
     return 0;
   }
-  if (d.status === "won") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
+  // "cashout" is also a real, final payout (what Seb actually got paid, manually entered --
+  // never derivable from legs/odds) -- same ret-minus-stake math as a win. Missing this
+  // case silently understated the computed balance by every cashout's net on both sides of
+  // self-heal's comparison. Found 2026-11-02 alongside the same gap in the live grader.
+  if (d.status === "won" || d.status === "cashout") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
   if (d.status === "lost") return -(Number(d.stake) || 0);
   return 0; // push/open/pending never move the balance
 }
@@ -1626,6 +1630,11 @@ app.get("/internal/jobs/grader", async (req, res) => {
     const results = [];
     for (const doc of docs) {
       const data = doc.data;
+      // Same guard as gradeCollectionForDesk below (see its comment): a protected/cashout
+      // bet's legs can still be "pending" -- without this, re-grading them for real and
+      // rolling up a fresh status overwrites a real manual lock/cash-out the moment the
+      // game goes final. This route had no such guard at all until 2026-11-02.
+      if (data.protected === true || data.status === "cashout") continue;
       const legs = data.legs || [];
       // Re-check "needs_review" too, not just "pending" -- a leg can land on needs_review
       // while its game is still in progress (stillAwaitingResult correctly defers a hard
@@ -1728,6 +1737,16 @@ async function gradeCollectionForDesk(desk, collection, mode) {
     // computed "lost" (and, in live mode, would have sent a wrong Telegram alert for it)
     // because this check didn't exist.
     if (data.protected === true) continue;
+    // "cashout" is a terminal, manually-entered status with a real ret that is NEVER
+    // derivable from the legs (see settlePnlRet's own comment) -- but its legs are
+    // routinely still "pending"/"needs_review" (you cash out BEFORE the game naturally
+    // finishes), so without this guard the pendingIdx loop below re-grades them for real,
+    // rollUpTicketStatus computes a fresh (often WRONG, since it ignores the cash-out)
+    // status, and that overwrites the real cashout the instant the games go final. Found
+    // 2026-11-02: this engine-grader-cron (?mode=live, every 20 minutes) silently flipped a
+    // real $135.07 cashout to "lost"/ret:0 in Supabase this way. Restored by hand; this
+    // guard is the actual fix.
+    if (data.status === "cashout") continue;
     const legs = data.legs || [];
     const pendingIdx = legs
       .map((l, i) => ({ l, i }))
