@@ -435,17 +435,47 @@ function isGroupQuietHours() {
   return h >= 1 && h < 8; // 1:00 AM through 7:59 AM ET
 }
 
-async function sendTelegram(chatId, text) {
+// GROUP POST GUARD (2026-11-02, Seb's permanent rule): no dollar amounts in ANY group post
+// (Telegram group today, Discord later), from ANY sender -- the engine itself, Post-Cutover
+// Sync, both builders, the stuck-bet resolver, cleanup/summary messages, anything. This is
+// the actual enforcement point, not just a prompt instruction, because sendTelegram is the
+// single choke point every one of those senders already goes through to reach the group
+// chat id (telegram-alert, telegram-send-raw, grade-and-alert's own alerts all call this).
+// A caught message is NEVER sent to the group -- it's redirected to Seb's private DM instead
+// (prefixed so it's obvious it was blocked) and logged, so nothing with a $ amount in it can
+// reach the group even if a routine's prompt forgets the rule.
+const GROUP_DOLLAR_AMOUNT_RE = /\$\s?\d[\d,]*(\.\d+)?/;
+
+async function sendTelegramRaw(chatId, text, disableNotification) {
   if (!TELEGRAM_BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN not configured on the server.");
-  const silent = chatId === TELEGRAM_GROUP_CHAT_ID && isGroupQuietHours();
   const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_notification: silent }),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_notification: disableNotification }),
   });
   const data = await res.json();
   if (!data.ok) throw new Error(`Telegram sendMessage failed: ${JSON.stringify(data)}`);
   return data.result;
+}
+
+async function sendTelegram(chatId, text) {
+  if (chatId === TELEGRAM_GROUP_CHAT_ID && GROUP_DOLLAR_AMOUNT_RE.test(text)) {
+    await upsertDoc("main", "groupPostBlocked", `block-${Date.now()}`, {
+      blockedAt: new Date().toISOString(),
+      reason: "contained a $ amount",
+      text,
+    }).catch((err) => console.error("groupPostBlocked log failed:", err.message));
+    const dmText = `⛔ Blocked from the group (contained a $ amount) -- sent here instead:\n\n${text}`;
+    const result = TELEGRAM_SEB_CHAT_ID
+      ? await sendTelegramRaw(TELEGRAM_SEB_CHAT_ID, dmText, false).catch((err) => {
+          console.error("groupPostBlocked DM redirect failed:", err.message);
+          return null;
+        })
+      : null;
+    return { ...(result || {}), blocked: true, blockedReason: "contained a $ amount" };
+  }
+  const silent = chatId === TELEGRAM_GROUP_CHAT_ID && isGroupQuietHours();
+  return sendTelegramRaw(chatId, text, silent);
 }
 
 // One-time helper: once the bot has been added to a chat and sent at least one message
