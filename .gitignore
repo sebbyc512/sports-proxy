@@ -18,3 +18,4 @@ sql/live-scores-cron-run-me.sql
 sql/sync-needed-cron-run-me.sql
 sql/cfb-tracker-cron-run-me.sql
 sql/cbb-daily-snapshot-cron-run-me.sql
+sql/news-check-cron-run-me.sql
