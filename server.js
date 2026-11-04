@@ -3779,7 +3779,7 @@ async function refreshCbbTeams() {
   }
 
   const gamesRes = await supabaseFetch(
-    `/cbb_game_logs?season=eq.${currentSeason}&select=away_team,home_team,away_score,home_score,away_1h,away_2h,home_1h,home_2h,away_fg_pct,home_fg_pct,away_three_pct,home_three_pct,away_reb,home_reb,away_tov,home_tov,date&order=date.asc&limit=5000`
+    `/cbb_game_logs?season=eq.${currentSeason}&select=away_team,home_team,away_score,home_score,away_1h,away_2h,home_1h,home_2h,away_fg_pct,home_fg_pct,away_fg_att,home_fg_att,away_three_pct,home_three_pct,away_three_att,home_three_att,away_ft_pct,home_ft_pct,away_reb,home_reb,away_tov,home_tov,date&order=date.asc&limit=5000`
   );
   const games = await gamesRes.json();
 
@@ -3789,6 +3789,7 @@ async function refreshCbbTeams() {
       played: 0, wins: 0, homeWins: 0, homePlayed: 0, awayWins: 0, awayPlayed: 0,
       ptsFor: 0, ptsAgainst: 0, ptsFor1h: 0, ptsAgainst1h: 0, ptsFor2h: 0, ptsAgainst2h: 0,
       fgPct: [], fgPctAllowed: [], threePct: [], threePctAllowed: [], reb: [], rebAllowed: [], tov: [], tovForced: [],
+      ftPct: [], threeAtt: [], fgAtt: [],
       opponents: [], last5: [],
     });
 
@@ -3819,6 +3820,9 @@ async function refreshCbbTeams() {
       if (g[`${other}_reb`] != null) t.rebAllowed.push(g[`${other}_reb`]);
       if (g[`${side}_tov`] != null) t.tov.push(g[`${side}_tov`]);
       if (g[`${other}_tov`] != null) t.tovForced.push(g[`${other}_tov`]);
+      if (g[`${side}_ft_pct`] != null) t.ftPct.push(g[`${side}_ft_pct`]);
+      if (g[`${side}_three_att`] != null) t.threeAtt.push(g[`${side}_three_att`]);
+      if (g[`${side}_fg_att`] != null) t.fgAtt.push(g[`${side}_fg_att`]);
       if (oppAbbr) t.opponents.push(oppAbbr);
       t.last5.push({ date: g.date, win: won });
     }
@@ -3866,6 +3870,26 @@ async function refreshCbbTeams() {
       const oppWinPcts = a.opponents.map(winPct).filter((v) => v != null);
       patch.sosProxy = oppWinPcts.length ? Number((oppWinPcts.reduce((s, v) => s + v, 0) / oppWinPcts.length).toFixed(3)) : undefined;
       patch.sampleGames = a.played;
+
+      // marchProfile (2026-11-04, Seb's request): the subset of season numbers most
+      // predictive in tournament play -- free-throw reliability, 3PT shot-attempt share
+      // (how much of the offense comes from deep), turnover rate, and what the defense
+      // allows -- tracked all season, every night, same source data as the fields above.
+      // "Experience" (returning-player seniority) is NOT included here -- no ESPN box
+      // score or standings feed carries that; it would need a Claude routine's own
+      // research, not a nightly engine job.
+      const totalThreeAtt = a.threeAtt.reduce((s, v) => s + v, 0);
+      const totalFgAtt = a.fgAtt.reduce((s, v) => s + v, 0);
+      patch.marchProfile = {
+        ftPct: avg(a.ftPct) ?? undefined,
+        threePtReliance: totalFgAtt > 0 ? Number((totalThreeAtt / totalFgAtt).toFixed(3)) : undefined,
+        toRate: avg(a.tov) ?? undefined,
+        defenseAllowed: {
+          fgPct: avg(a.fgPctAllowed) ?? undefined,
+          threePct: avg(a.threePctAllowed) ?? undefined,
+          tovForced: avg(a.tovForced) ?? undefined,
+        },
+      };
     }
     try {
       await mergeUpsertDoc("main", "cbbTeams", abbr, patch);
@@ -3961,6 +3985,142 @@ app.get("/internal/jobs/cbb-learning-gate", async (req, res) => {
     const firedAt = new Date().toISOString();
     await upsertDoc("main", "taskConfig", "cbbLearningGate", { lastFiredAt: firedAt, lastFireTotal: total, lastFireCounts: counts });
     res.json({ ok: true, fired: true, total, threshold: CBB_LOOP_THRESHOLD, counts, firedAt });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- NCAA tournament (March Madness) historical backfill (2026-11-04, Seb's request,
+// ONE-TIME job -- not nightly, not on a cron, no learning-loop fire. Call its endpoint
+// once; re-running it is still safe (upserts on game_id), just unnecessary). ---
+// A tournament game's own ESPN notes[].headline identifies it ("Men's Basketball
+// Championship - <Region> Region - <Round>", or just "- Final Four"/"- National
+// Championship" with no region) -- that's also where round and region come from. Seed is
+// each competitor's own `seed.current`. Reuses cbbHalfScores/cbbDocId/
+// extractCbbClosingLine as-is (none of them are regular-season-specific).
+function parseCbbTournamentNote(notes) {
+  const headline = notes?.[0]?.headline || "";
+  if (!/Men's Basketball Championship/i.test(headline)) return null;
+  const regionMatch = /-\s*([A-Za-z]+)\s+Region\s*-\s*(.+)$/.exec(headline);
+  if (regionMatch) return { region: regionMatch[1], round: regionMatch[2].trim() };
+  const tail = headline.replace(/^Men's Basketball Championship\s*-\s*/i, "").trim();
+  return { region: null, round: tail || null };
+}
+
+async function upsertCbbTournamentGameRow(row) {
+  await supabaseFetch(`/cbb_tournament_games?on_conflict=game_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ ...row, updated_at: new Date().toISOString() }]),
+  });
+}
+
+async function trackCbbTournamentForDate(yyyymmdd, season) {
+  const result = { date: yyyymmdd, gamesFound: 0, gamesRecorded: 0, skipped: [] };
+  let scoreboard;
+  try {
+    scoreboard = await getJson(`${ESPN_BASE}/basketball/mens-college-basketball/scoreboard?dates=${yyyymmdd}&limit=300`);
+  } catch (err) {
+    result.error = err.message;
+    return result;
+  }
+  const isoDate = `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
+
+  for (const ev of scoreboard.events || []) {
+    try {
+      const comp = ev.competitions?.[0];
+      const parsed = parseCbbTournamentNote(comp?.notes);
+      if (!parsed) continue; // not an NCAA tournament game (regular season/NIT/other on this same date)
+      if (ev.status?.type?.state !== "post") continue;
+
+      const away = comp.competitors?.find((c) => c.homeAway === "away");
+      const home = comp.competitors?.find((c) => c.homeAway === "home");
+      if (!away || !home) {
+        result.skipped.push({ id: ev.id, reason: "missing competitors" });
+        continue;
+      }
+      const awayAbbr = cbbDocId(away.team);
+      const homeAbbr = cbbDocId(home.team);
+      const awayHalves = cbbHalfScores(away);
+      const homeHalves = cbbHalfScores(home);
+
+      const summaryEv = await getJson(`${ESPN_BASE}/basketball/mens-college-basketball/summary?event=${ev.id}`);
+      const closingLine = extractCbbClosingLine(summaryEv);
+
+      await upsertCbbTournamentGameRow({
+        game_id: ev.id,
+        date: isoDate,
+        season: String(season),
+        round: parsed.round,
+        region: parsed.region,
+        site: comp.venue?.fullName || null,
+        site_city: comp.venue?.address?.city || null,
+        site_state: comp.venue?.address?.state || null,
+        away_team: awayAbbr,
+        home_team: homeAbbr,
+        away_seed: away.curatedRank?.current ?? null,
+        home_seed: home.curatedRank?.current ?? null,
+        away_score: Number(away.score),
+        home_score: Number(home.score),
+        away_1h: awayHalves.h1,
+        away_2h: awayHalves.h2,
+        home_1h: homeHalves.h1,
+        home_2h: homeHalves.h2,
+        line_provider: closingLine.provider,
+        home_spread: closingLine.homeSpread,
+        total_line: closingLine.total,
+        home_moneyline: closingLine.homeMoneyline,
+        away_moneyline: closingLine.awayMoneyline,
+      });
+      result.gamesFound++;
+      result.gamesRecorded++;
+    } catch (err) {
+      result.skipped.push({ id: ev.id, reason: err.message });
+    }
+    await sleep(200);
+  }
+  return result;
+}
+
+// Last ~10 COMPLETED tournaments (2026 back through 2015), skipping 2020 (cancelled).
+// Each window is generous (First Four through Championship plus a few days' padding) --
+// trackCbbTournamentForDate() itself filters to real tournament games via the headline
+// check above, so a day with no tournament games just records 0, cheaply.
+const CBB_TOURNAMENT_WINDOWS = [
+  { season: 2026, from: "20260317", to: "20260409" },
+  { season: 2025, from: "20250317", to: "20250409" },
+  { season: 2024, from: "20240317", to: "20240409" },
+  { season: 2023, from: "20230313", to: "20230404" },
+  { season: 2022, from: "20220314", to: "20220405" },
+  { season: 2021, from: "20210314", to: "20210406" },
+  { season: 2019, from: "20190317", to: "20190409" },
+  { season: 2018, from: "20180311", to: "20180403" },
+  { season: 2017, from: "20170312", to: "20170404" },
+  { season: 2016, from: "20160313", to: "20160405" },
+];
+
+// One-time backfill endpoint (see sql/cbb-tournament-games-table.sql). Optional
+// ?season=2024 restricts to one tournament (e.g. a retry after a partial failure);
+// otherwise runs every window above. Not pulled by any cron job.
+app.get("/internal/jobs/cbb-tournament-backfill", async (req, res) => {
+  try {
+    const onlySeason = req.query.season ? Number(req.query.season) : null;
+    const windows = onlySeason ? CBB_TOURNAMENT_WINDOWS.filter((w) => w.season === onlySeason) : CBB_TOURNAMENT_WINDOWS;
+    const results = [];
+    for (const w of windows) {
+      let d = new Date(Date.UTC(Number(w.from.slice(0, 4)), Number(w.from.slice(4, 6)) - 1, Number(w.from.slice(6, 8))));
+      const end = new Date(Date.UTC(Number(w.to.slice(0, 4)), Number(w.to.slice(4, 6)) - 1, Number(w.to.slice(6, 8))));
+      let seasonRecorded = 0;
+      while (d <= end) {
+        const yyyymmdd = d.toISOString().slice(0, 10).replace(/-/g, "");
+        const r = await trackCbbTournamentForDate(yyyymmdd, w.season);
+        seasonRecorded += r.gamesRecorded;
+        d.setUTCDate(d.getUTCDate() + 1);
+        await sleep(150);
+      }
+      results.push({ season: w.season, gamesRecorded: seasonRecorded });
+    }
+    res.json({ ok: true, seasons: results.length, totalGamesRecorded: results.reduce((s, r) => s + r.gamesRecorded, 0), results });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
