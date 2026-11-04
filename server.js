@@ -5283,6 +5283,30 @@ app.get("/internal/test/api-football-diag", async (req, res) => {
       out[name] = { error: err.message };
     }
   }
+  // Season-blocked on the free plan (confirmed above) -- but does date+league scoping
+  // (no season param at all) work for a NAMED league, and do fixture-scoped lineups/
+  // injuries work the same way (not season-blocked since they're tied to one match)?
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const next7 = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const dateLeague = await getApiFootballJson(`/fixtures?date=${today}&league=39`);
+    out.date_plus_league_today = { results: dateLeague.results, errors: dateLeague.errors };
+    let probeFixtureId = dateLeague.response?.[0]?.fixture?.id;
+    if (!probeFixtureId) {
+      const dateLeagueNext = await getApiFootballJson(`/fixtures?from=${today}&to=${next7}&league=39`);
+      out.date_range_plus_league = { results: dateLeagueNext.results, errors: dateLeagueNext.errors };
+      probeFixtureId = dateLeagueNext.response?.[0]?.fixture?.id;
+    }
+    out.probeFixtureId = probeFixtureId || null;
+    if (probeFixtureId) {
+      const lu = await getApiFootballJson(`/fixtures/lineups?fixture=${probeFixtureId}`);
+      out.lineupsByFixture = { results: lu.results, errors: lu.errors, hasLineups: (lu.response || []).length > 0 };
+      const inj = await getApiFootballJson(`/injuries?fixture=${probeFixtureId}`);
+      out.injuriesByFixture = { results: inj.results, errors: inj.errors, sample: (inj.response || []).slice(0, 3).map((i) => i.player?.name) };
+    }
+  } catch (err) {
+    out.probeError = err.message;
+  }
   res.json(out);
 });
 
