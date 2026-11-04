@@ -19,3 +19,5 @@ sql/sync-needed-cron-run-me.sql
 sql/cfb-tracker-cron-run-me.sql
 sql/cbb-daily-snapshot-cron-run-me.sql
 sql/news-check-cron-run-me.sql
+sql/soccer-lineup-check-cron-run-me.sql
+sql/understat-weekly-check-cron-run-me.sql
