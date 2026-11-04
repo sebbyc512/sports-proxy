@@ -12,3 +12,4 @@ sql/self-heal-cron-run-me.sql
 sql/stuck-bet-resolver-cron-run-me.sql
 sql/cbb-tracker-cron-run-me.sql
 sql/steve-report-send-once-run-me.sql
+sql/odds-usage-cron-run-me.sql

@@ -28,7 +28,7 @@ select cron.schedule(
   '0 13 * * *',  -- 1:00 PM UTC = 9:00 AM ET / 8:00 AM CT -- once a day, well ahead of evening slates
   $$
   select net.http_get(
-    url := 'https://sports-proxy-nv9n.onrender.com/internal/jobs/odds-usage-check?token=defbfd82060d8e73195d0bdcc91083e5cf1dbe2e0ce3f2eb92e6c4ce2089ab88'
+    url := 'https://sports-proxy-nv9n.onrender.com/internal/jobs/odds-usage-check?token=<PROXY_TOKEN from rule sports-proxy-source>'
   );
   $$
 );
