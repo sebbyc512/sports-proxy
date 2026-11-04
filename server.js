@@ -1106,17 +1106,52 @@ app.get("/internal/jobs/self-heal", async (req, res) => {
 //
 // GATING RULE (Seb's ask): a bet qualifies once it's at least 1 hour past (lastStart + 4h) --
 // i.e. 5 hours after its last leg's kickoff, giving every sport's own box score/play-by-play
-// time to go final. Falls back to firstStart, then to end-of-day on `date`, when lastStart is
-// missing (plenty of real docs don't have it) -- documented here so a future "why did this one
-// take longer to fire" question has an answer.
+// time to go final. Falls back to firstStart, then to a real ESPN kickoff lookup (matching the
+// teams named in the bet's own text against that date's scoreboard), then to createdAt+6h, when
+// lastStart is missing (the FTD-singles path never set it -- see Phase 0c fix on the Post-Cutover
+// Sync routine) -- documented here so a future "why did this one take longer to fire" question
+// has an answer. The old end-of-day-on-`date` guess is kept only as a last-last-resort for the
+// pathological case where createdAt is also missing.
 const STUCK_BET_GATE_HOURS = 5;
 const STUCK_BET_WAKE_COOLDOWN_MS = 60 * 60 * 1000; // at most one fire per hour, same shape as self-heal
 const STUCK_RESOLVER_FIRE_URL = process.env.STUCK_RESOLVER_FIRE_URL;
 const STUCK_RESOLVER_FIRE_TOKEN = process.env.STUCK_RESOLVER_FIRE_TOKEN;
 
-function effectiveLastStart(data) {
+// Pulls the two team names out of a bet's own text, e.g. "...(CHI @ SEA)" -> {away:"CHI", home:"SEA"}.
+// Every bet doc on this desk carries the matchup in that exact "(A @ B)" shape in desc and/or leg text.
+function extractMatchupFromBetText(data) {
+  const texts = [data.desc, ...((Array.isArray(data.legs) ? data.legs : []).map((l) => l.text))].filter(Boolean);
+  for (const t of texts) {
+    const m = t.match(/\(([A-Za-z.' ]+?)\s*@\s*([A-Za-z.' ]+?)\)/);
+    if (m) return { away: m[1].trim(), home: m[2].trim() };
+  }
+  return null;
+}
+
+// One scoreboard fetch per `date` even when several stuck bets share it (e.g. a whole slate).
+const gamesForDateCache = new Map();
+function gamesForDateCached(date) {
+  if (!gamesForDateCache.has(date)) gamesForDateCache.set(date, fetchGamesForDate(date).catch(() => []));
+  return gamesForDateCache.get(date);
+}
+
+async function espnKickoffForBet(data) {
+  if (!data.date) return null;
+  const matchup = extractMatchupFromBetText(data);
+  if (!matchup) return null;
+  const games = await gamesForDateCached(data.date);
+  const game = findGame(games, matchup.away, matchup.home) || findGame(games, matchup.home, matchup.away);
+  if (!game || !game.date) return null;
+  const t = new Date(game.date);
+  return Number.isNaN(t.getTime()) ? null : t;
+}
+
+async function effectiveLastStart(data) {
   if (data.lastStart) return new Date(data.lastStart);
   if (data.firstStart) return new Date(data.firstStart);
+  const espnKickoff = await espnKickoffForBet(data);
+  if (espnKickoff) return espnKickoff;
+  if (data.createdAt) return new Date(new Date(data.createdAt).getTime() + 6 * 60 * 60 * 1000);
   if (data.date) return new Date(`${data.date}T23:59:00Z`);
   return null;
 }
@@ -1133,7 +1168,7 @@ async function findStuckBets(desk) {
     if (d.protected === true) continue;
     if (!["pending", "needs_review"].includes(d.status)) continue; // "cashout"/"won"/"lost"/"push" are all terminal-or-locked
     if (!Array.isArray(d.legs) || d.legs.length === 0) continue; // malformed doc, not a real gradeable bet
-    const start = effectiveLastStart(d);
+    const start = await effectiveLastStart(d);
     if (!start || Number.isNaN(start.getTime())) continue; // no kickoff info at all -- never guess, skip
     if (now - start.getTime() < cutoffMs) continue; // not yet 5h past kickoff
     stuck.push({ desk, docId: doc.doc_id, desc: d.desc || d.ticketId || doc.doc_id });
@@ -1311,7 +1346,7 @@ async function fetchGamesForDate(date) {
           linescores: c.linescores || null,
         }));
         if (competitors.length === 2) {
-          games.push({ sport, league, id: ev.id, competitors, state: ev.status?.type?.state });
+          games.push({ sport, league, id: ev.id, date: ev.date, competitors, state: ev.status?.type?.state });
         }
       }
     } catch (err) {
