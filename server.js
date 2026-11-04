@@ -5313,6 +5313,20 @@ app.get("/internal/test/api-football-diag", async (req, res) => {
   } catch (err) {
     out.probeError = err.message;
   }
+  // Team stats always requires league+season -- confirm the shape on an ALLOWED historical
+  // season (free plan: 2022-2024) since the current season is blocked either way. Man City,
+  // team id 50, is well-known and stable.
+  try {
+    const stats = await getApiFootballJson(`/teams/statistics?league=39&season=2024&team=50`);
+    out.teamStatsHistoricalShape = {
+      results: stats.results,
+      errors: stats.errors,
+      fieldsPresent: stats.response ? Object.keys(stats.response) : null,
+      goalsShape: stats.response?.goals ? Object.keys(stats.response.goals) : null,
+    };
+  } catch (err) {
+    out.teamStatsError = err.message;
+  }
   res.json(out);
 });
 
