@@ -4443,6 +4443,169 @@ app.get("/internal/jobs/cfb-nightly-tracker", async (req, res) => {
   }
 });
 
+// --- NCAAB daily check (2026-11-04, Seb's request, additive). Writes directly to
+// Supabase (desk "main", collection "cbb", doc "today") -- this process has no
+// ArtifactData access, and builders read team data from Supabase for this sport anyway.
+// This doc is engine-owned end to end each day (full replace is safe here, unlike
+// cfbTeams/cbbTeams which other writers also touch) -- the ONE exception is the busy-day
+// Sonnet routine below, which reads the full doc, merges its own "notes" field in, and
+// posts the full doc back, same WRITE-BODY SHAPE convention as every other merge-write on
+// this server. ---
+function normTeamName(s) {
+  return (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9 ]/g, "").trim();
+}
+function oddsTeamMatches(espnName, oddsName) {
+  const a = normTeamName(espnName);
+  const b = normTeamName(oddsName);
+  if (!a || !b) return false;
+  return a === b || a.includes(b) || b.includes(a) || a.split(" ").pop() === b.split(" ").pop();
+}
+
+const CBB_POWER_CONFERENCES = [
+  "southeastern conference", "big ten conference", "big 12 conference", "atlantic coast conference", "big east conference",
+];
+
+async function fetchCbbTodayOddsGames() {
+  if (!ODDS_API_KEY) return [];
+  const markets = "h2h,spreads,totals,h2h_h1,spreads_h1,totals_h1,h2h_h2,spreads_h2,totals_h2";
+  const url = new URL(`${ODDS_BASE}/sports/basketball_ncaab/odds/`);
+  url.searchParams.set("apiKey", ODDS_API_KEY);
+  url.searchParams.set("regions", "us");
+  url.searchParams.set("markets", markets);
+  url.searchParams.set("oddsFormat", "american");
+  url.searchParams.set("bookmakers", "draftkings");
+  try {
+    return await getOddsJson(url.toString());
+  } catch (err) {
+    return []; // unpriced/unavailable -- callers treat an empty match as "no DK line yet"
+  }
+}
+
+function extractDkLinesForGame(oddsGame) {
+  const dk = (oddsGame.bookmakers || []).find((b) => /draftkings/i.test(b.title || ""));
+  if (!dk) return null;
+  const byKey = {};
+  for (const m of dk.markets || []) byKey[m.key] = m.outcomes;
+  const pack = (h2h, spreads, totals) => ({
+    moneyline: byKey[h2h] || null,
+    spread: byKey[spreads] || null,
+    total: byKey[totals] || null,
+  });
+  return { full: pack("h2h", "spreads", "totals"), h1: pack("h2h_h1", "spreads_h1", "totals_h1"), h2: pack("h2h_h2", "spreads_h2", "totals_h2") };
+}
+
+async function buildCbbTodaySnapshot() {
+  const todayYmd = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const scoreboard = await getJson(`${ESPN_BASE}/basketball/mens-college-basketball/scoreboard?dates=${todayYmd}&limit=400`);
+  const events = scoreboard.events || [];
+  const oddsGames = await fetchCbbTodayOddsGames();
+
+  let injuries = [];
+  try {
+    const injRes = await getJson(`${ESPN_BASE}/basketball/mens-college-basketball/injuries`);
+    injuries = injRes.injuries || [];
+  } catch (err) {
+    injuries = [];
+  }
+
+  // Team profiles for everyone playing today, pulled from the engine's own Supabase mirror.
+  const abbrsToday = new Set();
+  for (const ev of events) {
+    for (const c of ev.competitions?.[0]?.competitors || []) {
+      const abbr = cbbDocId(c.team);
+      if (abbr) abbrsToday.add(abbr);
+    }
+  }
+  const profiles = {};
+  if (abbrsToday.size) {
+    const list = await supabaseFetch(
+      `/docs?desk_id=eq.main&collection=eq.cbbTeams&doc_id=in.(${[...abbrsToday].join(",")})&select=doc_id,data`
+    );
+    for (const row of await list.json()) profiles[row.doc_id] = row.data;
+  }
+
+  let busyGameCount = 0;
+  const games = events.map((ev) => {
+    const comp = ev.competitions?.[0];
+    const away = comp?.competitors?.find((c) => c.homeAway === "away");
+    const home = comp?.competitors?.find((c) => c.homeAway === "home");
+    const awayAbbr = cbbDocId(away?.team);
+    const homeAbbr = cbbDocId(home?.team);
+    const awayProfile = profiles[awayAbbr] || null;
+    const homeProfile = profiles[homeAbbr] || null;
+    const isTop25OrPower = (p) =>
+      p && (p.apRank != null || CBB_POWER_CONFERENCES.includes((p.conference || "").toLowerCase()));
+    if (isTop25OrPower(awayProfile) || isTop25OrPower(homeProfile)) busyGameCount++;
+
+    const oddsMatch = oddsGames.find(
+      (g) => oddsTeamMatches(away?.team?.displayName, g.away_team) && oddsTeamMatches(home?.team?.displayName, g.home_team)
+    );
+    const dkLines = oddsMatch ? extractDkLinesForGame(oddsMatch) : null;
+
+    return {
+      gameId: ev.id,
+      matchup: ev.name,
+      tipTime: comp?.date || ev.date,
+      awayTeam: awayAbbr,
+      homeTeam: homeAbbr,
+      dkLines,
+      awayProfile,
+      homeProfile,
+    };
+  });
+
+  return {
+    date: `${todayYmd.slice(0, 4)}-${todayYmd.slice(4, 6)}-${todayYmd.slice(6, 8)}`,
+    games,
+    injuries,
+    busyGameCount,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+app.get("/internal/jobs/cbb-daily-snapshot", async (req, res) => {
+  try {
+    const snapshot = await buildCbbTodaySnapshot();
+    await upsertDoc("main", "cbb", "today", snapshot);
+
+    const BUSY_THRESHOLD = 8;
+    let fired = false;
+    if (snapshot.busyGameCount >= BUSY_THRESHOLD) {
+      fired = await triggerCbbDailyFire().catch((err) => {
+        console.error("cbb-daily-snapshot: busy-day fire failed:", err.message);
+        return false;
+      });
+    }
+    res.json({ ok: true, gamesFound: snapshot.games.length, busyGameCount: snapshot.busyGameCount, fired });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+const CBB_DAILY_FIRE_URL = process.env.CBB_DAILY_FIRE_URL;
+const CBB_DAILY_FIRE_TOKEN = process.env.CBB_DAILY_FIRE_TOKEN;
+
+async function triggerCbbDailyFire() {
+  if (!CBB_DAILY_FIRE_URL || !CBB_DAILY_FIRE_TOKEN) {
+    throw new Error("CBB_DAILY_FIRE_URL/CBB_DAILY_FIRE_TOKEN not configured on the server.");
+  }
+  const fireRes = await fetch(CBB_DAILY_FIRE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${CBB_DAILY_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`CBB daily busy-day fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+  return true;
+}
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`sports-proxy listening on ${PORT}`));
