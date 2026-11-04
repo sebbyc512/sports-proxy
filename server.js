@@ -722,6 +722,48 @@ async function triggerSyncWake() {
   return { ok: true, fired: false, reason: "cooldown", trailingScheduledInMs: delay };
 }
 
+// --- Full (non-fast-path) sync wake (2026-11-04, sync-needed gating) ---
+// Fires the SAME Post-Cutover Sync trigger as triggerSyncWake() above, but WITHOUT the
+// FAST_PATH_WAKE marker text -- Post-Cutover Sync's own prompt already branches on that
+// marker's absence to mean "this is a full run" (same as its plain hourly/daily cron
+// fire), so this needs no prompt change there. Used only by sync-needed's stuck-claim
+// check, which specifically needs the hourly-only stuck-claim-recovery step that a
+// fast-path wake would skip. Own cooldown (separate from the fast-path one above, which
+// app actions and sync-needed's backlog check both still use) so a persistently-stuck
+// claim can't loop-fire a full run more than once an hour.
+const FULL_SYNC_WAKE_COOLDOWN_MS = 60 * 60 * 1000;
+let lastFullSyncWakeAt = 0;
+
+async function sendFullSyncWake() {
+  lastFullSyncWakeAt = Date.now();
+  const fireRes = await fetch(CLAUDE_FIRE_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${CLAUDE_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`Full sync wake fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+}
+
+async function triggerFullSyncWake() {
+  if (!CLAUDE_FIRE_URL || !CLAUDE_FIRE_TOKEN) {
+    throw new Error("CLAUDE_FIRE_URL/CLAUDE_FIRE_TOKEN not configured on the server.");
+  }
+  const sinceLast = Date.now() - lastFullSyncWakeAt;
+  if (sinceLast < FULL_SYNC_WAKE_COOLDOWN_MS) {
+    return { ok: true, fired: false, reason: "cooldown" };
+  }
+  await sendFullSyncWake();
+  return { ok: true, fired: true };
+}
+
 app.post("/internal/jobs/wake-sync", async (req, res) => {
   try {
     res.json(await triggerSyncWake());
@@ -1093,6 +1135,81 @@ app.get("/internal/jobs/self-heal", async (req, res) => {
     }
 
     res.json({ ok: true, action: "mismatch-handled", actions, ...summary });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Sync-needed gate (2026-11-04, Seb's request -- replaces hourly Post-Cutover Sync
+// polling with an engine-gated wake). Post-Cutover Sync itself now runs once daily
+// (6:00 AM ET) as a backup sweep; instant wakes on real app actions (the docs_app_insert_
+// dispatch trigger, the builders' post-answer wake) are untouched and still fire
+// immediately. This endpoint is pg_cron-driven, every 10 minutes, and catches the gap
+// those two don't: a request/appUpload/appEdit that's been sitting queued/pending for a
+// while (the instant-wake path missed it, or never fired) and a claim stuck in
+// "processing" after a crash. Pure Supabase reads -- this process has no ArtifactData
+// access, so it can only ever see what's already mirrored here, never the real desk
+// directly; see the two FTD/FBM-side wake-sync calls added to the prep routines for how
+// desk-side changes (new picks, stale-doc archiving) get mirrored instead -- at the
+// source, not polled for here.
+const SYNC_NEEDED_PENDING_STALE_MS = 5 * 60 * 1000;
+const SYNC_NEEDED_STUCK_CLAIM_MS = 20 * 60 * 1000;
+const SYNC_NEEDED_COLLECTIONS = ["requests", "appUploads", "appEdits"];
+
+async function syncNeededCheckDesk(desk) {
+  const now = Date.now();
+  const backlog = [];
+  const stuck = [];
+  for (const collection of SYNC_NEEDED_COLLECTIONS) {
+    const listRes = await supabaseFetch(
+      `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.${collection}&select=doc_id,data,updated_at`
+    );
+    const docs = await listRes.json();
+    for (const doc of docs) {
+      const d = doc.data || {};
+      if (["queued", "pending"].includes(d.status)) {
+        const ref = d.createdAt || doc.updated_at;
+        if (ref && now - new Date(ref).getTime() > SYNC_NEEDED_PENDING_STALE_MS) {
+          backlog.push({ desk, collection, docId: doc.doc_id });
+        }
+      }
+      if (d.status === "processing" && d.claimedAt) {
+        if (now - new Date(d.claimedAt).getTime() > SYNC_NEEDED_STUCK_CLAIM_MS) {
+          stuck.push({ desk, collection, docId: doc.doc_id });
+        }
+      }
+    }
+  }
+  return { desk, backlog, stuck };
+}
+
+app.get("/internal/jobs/sync-needed", async (req, res) => {
+  try {
+    const results = await Promise.all(["main", "steve"].map(syncNeededCheckDesk));
+    const allBacklog = results.flatMap((r) => r.backlog);
+    const allStuck = results.flatMap((r) => r.stuck);
+
+    if (allBacklog.length === 0 && allStuck.length === 0) {
+      return res.json({ ok: true, action: "none" });
+    }
+
+    const actions = {};
+    if (allBacklog.length > 0) {
+      actions.fastWake = await triggerSyncWake().catch((err) => ({ ok: false, error: err.message }));
+    }
+    if (allStuck.length > 0) {
+      actions.fullWake = await triggerFullSyncWake().catch((err) => ({ ok: false, error: err.message }));
+    }
+
+    await upsertDoc("main", "selfHealLog", `sn-${Date.now()}`, {
+      source: "sync-needed",
+      foundAt: new Date().toISOString(),
+      backlog: allBacklog,
+      stuck: allStuck,
+      actions,
+    });
+
+    res.json({ ok: true, action: "handled", backlog: allBacklog, stuck: allStuck, actions });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
