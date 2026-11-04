@@ -4585,7 +4585,7 @@ app.get("/internal/jobs/cbb-daily-snapshot", async (req, res) => {
 const CBB_DAILY_FIRE_URL = process.env.CBB_DAILY_FIRE_URL;
 const CBB_DAILY_FIRE_TOKEN = process.env.CBB_DAILY_FIRE_TOKEN;
 
-async function triggerCbbDailyFire() {
+async function triggerCbbDailyFire(text) {
   if (!CBB_DAILY_FIRE_URL || !CBB_DAILY_FIRE_TOKEN) {
     throw new Error("CBB_DAILY_FIRE_URL/CBB_DAILY_FIRE_TOKEN not configured on the server.");
   }
@@ -4597,7 +4597,7 @@ async function triggerCbbDailyFire() {
       "anthropic-beta": "experimental-cc-routine-2026-04-01",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({}),
+    body: JSON.stringify(text ? { text } : {}),
   });
   if (!fireRes.ok) {
     const body = await fireRes.text();
@@ -4605,6 +4605,29 @@ async function triggerCbbDailyFire() {
   }
   return true;
 }
+
+// Diagnostic/manual test for the CBB_DAILY_FIRE_URL/TOKEN wiring (2026-11-04, Seb's
+// request). GET with no params: reports whether both env vars are present, never their
+// values, and fires nothing. GET ?fire=true: also sends ONE fire with the
+// "BUSY_DAY_FIRE_TEST" marker -- the routine's own prompt branches on that marker to DM
+// Seb only ("busy-day fire test OK", no group post) and make no desk/Supabase writes,
+// skipping every real step.
+app.get("/internal/jobs/cbb-daily-fire-test", async (req, res) => {
+  const urlSet = !!CBB_DAILY_FIRE_URL;
+  const tokenSet = !!CBB_DAILY_FIRE_TOKEN;
+  if (req.query.fire !== "true") {
+    return res.json({ ok: true, urlSet, tokenSet, fired: false });
+  }
+  if (!urlSet || !tokenSet) {
+    return res.json({ ok: true, urlSet, tokenSet, fired: false, error: "CBB_DAILY_FIRE_URL/CBB_DAILY_FIRE_TOKEN not configured" });
+  }
+  try {
+    await triggerCbbDailyFire("BUSY_DAY_FIRE_TEST");
+    res.json({ ok: true, urlSet, tokenSet, fired: true });
+  } catch (err) {
+    res.status(502).json({ ok: false, urlSet, tokenSet, fired: false, error: err.message });
+  }
+});
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
