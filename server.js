@@ -5484,12 +5484,15 @@ async function getApiFootballUsageToday() {
 // literally "Inter" (not "Inter Milan"), and a substring/word match on "inter" would wrongly
 // catch "Inter Miami" (MLS, a real team Seb absolutely can bet on). "AC Milan" has no such
 // collision risk but is kept as an exact match for the same reason/consistency.
-function isMilanFixture(fixture) {
-  const names = [fixture.teams?.home?.name, fixture.teams?.away?.name];
-  return names.includes("Inter") || names.includes("AC Milan");
+function isMilanFixture(home, away) {
+  return home === "Inter" || away === "Inter" || home === "AC Milan" || away === "AC Milan";
 }
 
-async function fetchSoccerCandidateFixtures() {
+// The actual API-Football fetch (2 calls, today ET + tomorrow ET) -- ONLY called once per
+// calendar day, never per-tick. Reduces each fixture to just the fields anything downstream
+// needs, so the cached-from-Supabase path and the freshly-fetched path return the exact
+// same shape and nothing downstream has to know which one it got.
+async function fetchSoccerCandidateFixturesFresh() {
   const targetIds = new Set(Object.values(API_FOOTBALL_LEAGUE_IDS));
   const dates = [etDateDaysAgo(0), etDateDaysAgo(-1)]; // today ET, tomorrow ET
   const byId = new Map();
@@ -5497,32 +5500,53 @@ async function fetchSoccerCandidateFixtures() {
     const j = await apiFootballGuardedCall(`/fixtures?date=${date}`);
     for (const f of j.response || []) {
       if (!targetIds.has(f.league?.id)) continue;
-      if (isMilanFixture(f)) continue;
-      byId.set(f.fixture.id, f);
+      const home = f.teams?.home?.name;
+      const away = f.teams?.away?.name;
+      if (isMilanFixture(home, away)) continue;
+      byId.set(f.fixture.id, {
+        fixtureId: f.fixture.id,
+        league: f.league?.name,
+        leagueId: f.league?.id,
+        kickoff: f.fixture?.date,
+        status: f.fixture?.status?.short,
+        home,
+        away,
+      });
     }
   }
-  return [...byId.values()];
+  const fixtures = [...byId.values()];
+  await upsertDoc("main", "soccer", "fixturesToday", { date: etDateDaysAgo(0), updatedAt: new Date().toISOString(), fixtures });
+  return fixtures;
 }
 
-async function writeSoccerFixturesDoc(fixtures) {
-  const doc = {
-    updatedAt: new Date().toISOString(),
-    fixtures: fixtures.map((f) => ({
-      fixtureId: f.fixture.id,
-      league: f.league?.name,
-      leagueId: f.league?.id,
-      kickoff: f.fixture?.date,
-      status: f.fixture?.status?.short,
-      home: f.teams?.home?.name,
-      away: f.teams?.away?.name,
-    })),
-  };
-  await upsertDoc("main", "soccer", "fixturesToday", doc);
-  return doc;
+// Quota guard (2026-11-04, Seb's catch): the 30-min cron must NOT re-fetch fixtures on
+// every tick -- that's 48 ticks/day x 2 calls = 96, nearly the whole daily cap on fixtures
+// alone. Reuses the Supabase-cached soccer/fixturesToday doc all day; only calls the real
+// API when the cached date isn't today (first tick of the day, or the doc doesn't exist
+// yet) -- i.e. actually 2 calls/day for this part, not 96.
+async function getSoccerCandidateFixtures() {
+  const today = etDateDaysAgo(0);
+  const cached = await getDoc("main", "soccer", "fixturesToday");
+  if (cached?.data?.date === today && Array.isArray(cached.data.fixtures)) return cached.data.fixtures;
+  return fetchSoccerCandidateFixturesFresh();
 }
 
 function soccerPlayerTeamShape(teamName) {
   return { abbr: null, location: null, name: teamName };
+}
+
+// Cheap, zero-API-cost pre-filter: does ANY open leg's text plausibly reference one of
+// this fixture's two teams? If not, there is nothing this fixture could ever alert on, so
+// it's never worth spending a lineups+injuries call on it just because it's "a candidate
+// fixture" -- that's the difference between ~2 calls/day (no open soccer bets) and
+// burning the whole daily cap checking matches nobody has money on.
+function fixtureHasOpenLegInterest(fixture, openLegs) {
+  const homeNorm = normTeamName(fixture.home);
+  const awayNorm = normTeamName(fixture.away);
+  return openLegs.some((leg) => {
+    const t = normTeamName(leg.legText);
+    return (homeNorm && t.includes(homeNorm)) || (awayNorm && t.includes(awayNorm));
+  });
 }
 
 // Builds matchable "status items" for one fixture: every starting-XI player (status
@@ -5530,7 +5554,7 @@ function soccerPlayerTeamShape(teamName) {
 // (status "not_starting" -- this is what triggers a lineup-absence DM), and every injury
 // list entry for either side (status taken from API-Football's own injury "type" field,
 // e.g. "Missing Fixture", passed through as-is as the alert status).
-function buildSoccerLineupStatusItems(fixture, lineupsResponse, injuriesResponse) {
+function buildSoccerLineupStatusItems(lineupsResponse, injuriesResponse) {
   const items = [];
   for (const side of lineupsResponse || []) {
     const teamName = side.team?.name;
@@ -5579,19 +5603,19 @@ async function checkSoccerFixtureAgainstOpenBets(fixture, openLegs, notified, dm
   // so two calls "in parallel" here would just both wait on the same pacing gate anyway.
   // A HARD_STOP error is let through (not caught here) so the caller can break the whole
   // pass instead of silently limping through the remaining fixtures with empty data.
-  const lineups = await apiFootballGuardedCall(`/fixtures/lineups?fixture=${fixture.fixture.id}`)
+  const lineups = await apiFootballGuardedCall(`/fixtures/lineups?fixture=${fixture.fixtureId}`)
     .then((j) => j.response)
     .catch((err) => {
       if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) throw err;
       return [];
     });
-  const injuries = await apiFootballGuardedCall(`/injuries?fixture=${fixture.fixture.id}`)
+  const injuries = await apiFootballGuardedCall(`/injuries?fixture=${fixture.fixtureId}`)
     .then((j) => j.response)
     .catch((err) => {
       if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) throw err;
       return [];
     });
-  const statusItems = buildSoccerLineupStatusItems(fixture, lineups, injuries);
+  const statusItems = buildSoccerLineupStatusItems(lineups, injuries);
   const alertable = statusItems.filter((i) => i.status !== "starting");
   if (!alertable.length) return;
   for (const leg of openLegs) {
@@ -5612,30 +5636,36 @@ async function checkSoccerFixtureAgainstOpenBets(fixture, openLegs, notified, dm
 }
 
 async function runSoccerLineupCheck({ dryRun = false, forceFixtureId = null } = {}) {
-  const fixtures = await fetchSoccerCandidateFixtures();
-  await writeSoccerFixturesDoc(fixtures);
+  const fixtures = await getSoccerCandidateFixtures(); // cached all day -- real fetch only once/day
 
   const now = Date.now();
   const horizon = now + 3 * 60 * 60 * 1000;
+  const openLegs = await getOpenSoccerLegs();
+
   let imminent = fixtures.filter((f) => {
-    const ts = new Date(f.fixture?.date).getTime();
+    const ts = new Date(f.kickoff).getTime();
     return Number.isFinite(ts) && ts > now - 15 * 60 * 1000 && ts <= horizon; // kickoff within 3h, or just started (<=15 min ago)
   });
+  // Quota guard (2026-11-04, Seb's catch): a candidate fixture is only worth an actual
+  // lineups/injuries call if an open leg could possibly be about it -- checking every
+  // imminent match in all 7 leagues regardless of whether Seb/Steve have money on it is
+  // exactly what blows the daily cap on a busy UCL night. On a day with zero open soccer
+  // bets this alone takes the per-fixture call count to zero.
+  imminent = imminent.filter((f) => fixtureHasOpenLegInterest(f, openLegs));
   // Manual verification only (never set by the cron SQL): force-checks one specific
-  // candidate fixture regardless of kickoff time, so the matching mechanism can be proven
-  // against real data without waiting for a real match to fall inside the 3h window.
+  // candidate fixture regardless of kickoff time or open-leg interest, so the matching
+  // mechanism can be proven against real data without waiting for a real match/bet.
   if (forceFixtureId) {
-    const forced = fixtures.find((f) => String(f.fixture.id) === String(forceFixtureId));
-    if (forced && !imminent.some((f) => f.fixture.id === forced.fixture.id)) imminent = [forced];
+    const forced = fixtures.find((f) => String(f.fixtureId) === String(forceFixtureId));
+    if (forced && !imminent.some((f) => f.fixtureId === forced.fixtureId)) imminent = [forced];
   }
 
-  const openLegs = await getOpenSoccerLegs();
   const notified = await getNotifiedState();
   const newKeys = {};
   const dmsByDesk = {};
   const checkedFixtures = [];
   for (const f of imminent) {
-    checkedFixtures.push({ fixtureId: f.fixture.id, home: f.teams?.home?.name, away: f.teams?.away?.name, kickoff: f.fixture?.date });
+    checkedFixtures.push({ fixtureId: f.fixtureId, home: f.home, away: f.away, kickoff: f.kickoff });
     try {
       await checkSoccerFixtureAgainstOpenBets(f, openLegs, notified, dmsByDesk, newKeys);
     } catch (err) {
@@ -5662,6 +5692,7 @@ async function runSoccerLineupCheck({ dryRun = false, forceFixtureId = null } = 
   const usage = await getApiFootballUsageToday();
   return {
     totalCandidateFixtures: fixtures.length,
+    imminentWithOpenLegInterest: imminent.length,
     imminentFixturesChecked: checkedFixtures,
     newAlerts: Object.keys(newKeys).length,
     sentSummary,
