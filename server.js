@@ -3966,6 +3966,303 @@ app.get("/internal/jobs/cbb-learning-gate", async (req, res) => {
   }
 });
 
+// --- CFB (FBS college football) engine tracker (2026-11-04, Seb's request, additive --
+// same pattern as the NBA/NHL/NCAAB trackers above, nothing existing touched). ---
+function cfbDocId(team) {
+  const base = team?.abbreviation || team?.displayName || String(team?.id || "");
+  return base.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10) || `T${team?.id}`;
+}
+
+// FBS season runs Aug(camp)/Sep-Jan(playoff). Jul-Dec dates belong to the season STARTING
+// that year; Jan-Jun dates (playoff/bowls) belong to the season that started the PREVIOUS
+// year. Used to tag every cfb_game_logs row so last season's backfilled rows stay
+// queryable for PATTERNS without ever being averaged into this season's live cfbTeams
+// ratings (same purpose as CBB's seasonForDate()).
+function seasonForCfbDate(yyyymmdd) {
+  const year = Number(yyyymmdd.slice(0, 4));
+  const month = Number(yyyymmdd.slice(4, 6));
+  return String(month >= 7 ? year : year - 1);
+}
+
+function extractCfbTeamStats(teamBlock) {
+  const stats = teamBlock?.statistics || [];
+  const find = (name) => stats.find((s) => s.name === name)?.displayValue;
+  const num = (name) => {
+    const v = Number(find(name));
+    return Number.isFinite(v) ? v : null;
+  };
+  return {
+    totalYards: num("totalYards"),
+    passYards: num("netPassingYards"),
+    rushYards: num("rushingYards"),
+    turnovers: num("turnovers"),
+  };
+}
+
+async function upsertCfbGameRow(row) {
+  await supabaseFetch(`/cfb_game_logs?on_conflict=game_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ ...row, updated_at: new Date().toISOString() }]),
+  });
+}
+
+async function trackCfbForDate(yyyymmdd) {
+  const result = { date: yyyymmdd, gamesFound: 0, gamesRecorded: 0, skipped: [] };
+  let scoreboard;
+  try {
+    scoreboard = await getJson(
+      `${ESPN_BASE}/football/college-football/scoreboard?dates=${yyyymmdd}&groups=80&limit=200`
+    );
+  } catch (err) {
+    result.error = err.message;
+    return result;
+  }
+  const events = (scoreboard.events || []).filter((ev) => ev.status?.type?.state === "post");
+  result.gamesFound = events.length;
+  const isoDate = `${yyyymmdd.slice(0, 4)}-${yyyymmdd.slice(4, 6)}-${yyyymmdd.slice(6, 8)}`;
+
+  for (const ev of events) {
+    try {
+      const comp = ev.competitions?.[0];
+      const away = comp?.competitors?.find((c) => c.homeAway === "away");
+      const home = comp?.competitors?.find((c) => c.homeAway === "home");
+      if (!away || !home) {
+        result.skipped.push({ id: ev.id, reason: "missing competitors" });
+        continue;
+      }
+      const awayAbbr = cfbDocId(away.team);
+      const homeAbbr = cfbDocId(home.team);
+
+      const summary = await getJson(`${ESPN_BASE}/football/college-football/summary?event=${ev.id}`);
+      const teamBlocks = summary.boxscore?.teams || [];
+      const awayBlock = teamBlocks.find((tb) => cfbDocId(tb.team) === awayAbbr);
+      const homeBlock = teamBlocks.find((tb) => cfbDocId(tb.team) === homeAbbr);
+      if (!awayBlock || !homeBlock) {
+        result.skipped.push({ id: ev.id, reason: "no boxscore.teams match for one side" });
+        continue;
+      }
+      const awayStats = extractCfbTeamStats(awayBlock);
+      const homeStats = extractCfbTeamStats(homeBlock);
+      const closingLine = extractCbbClosingLine(summary); // generic over summary.pickcenter, not basketball-specific
+
+      await upsertCfbGameRow({
+        game_id: ev.id,
+        date: isoDate,
+        season: seasonForCfbDate(yyyymmdd),
+        away_team: awayAbbr,
+        home_team: homeAbbr,
+        away_score: Number(away.score),
+        home_score: Number(home.score),
+        line_provider: closingLine.provider,
+        home_spread: closingLine.homeSpread,
+        total_line: closingLine.total,
+        home_moneyline: closingLine.homeMoneyline,
+        away_moneyline: closingLine.awayMoneyline,
+        away_total_yards: awayStats.totalYards,
+        home_total_yards: homeStats.totalYards,
+        away_pass_yards: awayStats.passYards,
+        home_pass_yards: homeStats.passYards,
+        away_rush_yards: awayStats.rushYards,
+        home_rush_yards: homeStats.rushYards,
+        away_turnovers: awayStats.turnovers,
+        home_turnovers: homeStats.turnovers,
+      });
+      result.gamesRecorded++;
+    } catch (err) {
+      result.skipped.push({ id: ev.id, reason: err.message });
+    }
+    await sleep(200); // pace ESPN calls, esp. during the season-long backfill
+  }
+  return result;
+}
+
+// Aggregates cfb_game_logs into per-team season numbers (own + allowed yards/turnovers,
+// home/away, last-3), merges in ESPN standings (overall record, conference, conference
+// record -- via stat entries typed "total"/"homerecord"/"awayrecord"/"vsconf", each
+// carrying a ready-made "W-L" `summary` string) and both polls available on the
+// rankings endpoint (AP Top 25 + the CFP committee's "Playoff Committee Rankings", once
+// it starts -- usually not until a few weeks into the season, same not-out-yet
+// tolerance as CBB's AP poll before week 1). SOS proxy: same disclosed approximation as
+// NBA/CBB (average current win% of opponents actually played), never a real formula.
+async function refreshCfbTeams() {
+  const currentSeason = seasonForCfbDate(new Date().toISOString().slice(0, 10).replace(/-/g, ""));
+  const standings = await getJson(`${ESPN_V2_BASE}/football/college-football/standings?group=80`);
+  const byTeam = {};
+  const conferenceOf = {};
+  for (const child of standings.children || []) {
+    for (const e of child.standings?.entries || []) {
+      const abbr = cfbDocId(e.team);
+      if (!abbr) continue;
+      conferenceOf[abbr] = child.name || null;
+      const findSummary = (type) => e.stats?.find((s) => s.type === type)?.summary ?? null;
+      byTeam[abbr] = {
+        teamName: e.team?.displayName,
+        record: findSummary("total"),
+        confRecord: findSummary("vsconf"),
+        homeRecord: findSummary("homerecord"),
+        awayRecord: findSummary("awayrecord"),
+      };
+    }
+  }
+
+  let apRanks = {};
+  let cfpRanks = {};
+  try {
+    const rankings = await getJson(`${ESPN_BASE}/football/college-football/rankings`);
+    const apPoll = (rankings.rankings || []).find((r) => /ap top 25/i.test(r.name || r.shortName || ""));
+    for (const r of apPoll?.ranks || []) {
+      const abbr = cfbDocId(r.team);
+      if (abbr) apRanks[abbr] = r.current;
+    }
+    const cfpPoll = (rankings.rankings || []).find((r) => /playoff committee/i.test(r.name || r.shortName || ""));
+    for (const r of cfpPoll?.ranks || []) {
+      const abbr = cfbDocId(r.team);
+      if (abbr) cfpRanks[abbr] = r.current;
+    }
+  } catch (err) {
+    // No poll out yet (early season, before the CFP committee starts ranking) or shape
+    // differs -- leave empty rather than guess, same tolerance as CBB's AP poll.
+  }
+
+  const gamesRes = await supabaseFetch(
+    `/cfb_game_logs?season=eq.${currentSeason}&select=away_team,home_team,away_score,home_score,away_total_yards,home_total_yards,away_pass_yards,home_pass_yards,away_rush_yards,home_rush_yards,away_turnovers,home_turnovers,date&order=date.asc&limit=5000`
+  );
+  const games = await gamesRes.json();
+
+  const agg = {};
+  const ensure = (abbr) =>
+    (agg[abbr] ||= {
+      played: 0, wins: 0,
+      ptsFor: 0, ptsAgainst: 0,
+      yardsFor: [], yardsAgainst: [], passYardsFor: [], rushYardsFor: [],
+      turnoversFor: [], turnoversForced: [],
+      opponents: [], last3: [],
+    });
+
+  for (const g of games) {
+    for (const side of ["away", "home"]) {
+      const other = side === "away" ? "home" : "away";
+      const abbr = g[`${side}_team`];
+      const oppAbbr = g[`${other}_team`];
+      if (!abbr) continue;
+      const t = ensure(abbr);
+      const my = g[`${side}_score`];
+      const opp = g[`${other}_score`];
+      if (my == null || opp == null) continue;
+      t.played++;
+      const won = my > opp;
+      if (won) t.wins++;
+      t.ptsFor += my; t.ptsAgainst += opp;
+      if (g[`${side}_total_yards`] != null) t.yardsFor.push(g[`${side}_total_yards`]);
+      if (g[`${other}_total_yards`] != null) t.yardsAgainst.push(g[`${other}_total_yards`]);
+      if (g[`${side}_pass_yards`] != null) t.passYardsFor.push(g[`${side}_pass_yards`]);
+      if (g[`${side}_rush_yards`] != null) t.rushYardsFor.push(g[`${side}_rush_yards`]);
+      if (g[`${side}_turnovers`] != null) t.turnoversFor.push(g[`${side}_turnovers`]);
+      if (g[`${other}_turnovers`] != null) t.turnoversForced.push(g[`${other}_turnovers`]);
+      if (oppAbbr) t.opponents.push(oppAbbr);
+      t.last3.push({ date: g.date, win: won });
+    }
+  }
+
+  const avg = (arr) => (arr.length ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1)) : null);
+  const winPct = (abbr) => {
+    const bt = byTeam[abbr];
+    const m = /^(\d+)-(\d+)/.exec(bt?.record || "");
+    if (m) {
+      const w = Number(m[1]), l = Number(m[2]);
+      if (w + l > 0) return w / (w + l);
+    }
+    const a = agg[abbr];
+    return a?.played ? a.wins / a.played : null;
+  };
+
+  const result = { teamsUpdated: 0, errors: [] };
+  const abbrs = new Set([...Object.keys(byTeam), ...Object.keys(agg)]);
+  for (const abbr of abbrs) {
+    const bt = byTeam[abbr] || {};
+    const a = agg[abbr];
+    const patch = {
+      teamName: bt.teamName ?? undefined,
+      conference: conferenceOf[abbr] ?? undefined,
+      record: bt.record ?? undefined,
+      confRecord: bt.confRecord ?? undefined,
+      homeRecord: bt.homeRecord ?? undefined,
+      awayRecord: bt.awayRecord ?? undefined,
+      apRank: apRanks[abbr] ?? undefined,
+      cfpRank: cfpRanks[abbr] ?? undefined,
+      approxRatings: true,
+    };
+    if (a) {
+      patch.ptsFor = a.played ? Number((a.ptsFor / a.played).toFixed(1)) : undefined;
+      patch.ptsAgainst = a.played ? Number((a.ptsAgainst / a.played).toFixed(1)) : undefined;
+      patch.yardsFor = avg(a.yardsFor) ?? undefined;
+      patch.yardsAgainst = avg(a.yardsAgainst) ?? undefined;
+      patch.passYardsFor = avg(a.passYardsFor) ?? undefined;
+      patch.rushYardsFor = avg(a.rushYardsFor) ?? undefined;
+      patch.turnoversPerGame = avg(a.turnoversFor) ?? undefined;
+      patch.turnoversForcedPerGame = avg(a.turnoversForced) ?? undefined;
+      const last3 = a.last3.slice(-3);
+      patch.last3 = last3.length ? `${last3.filter((g) => g.win).length}-${last3.filter((g) => !g.win).length}` : undefined;
+      const oppWinPcts = a.opponents.map(winPct).filter((v) => v != null);
+      patch.sosProxy = oppWinPcts.length ? Number((oppWinPcts.reduce((s, v) => s + v, 0) / oppWinPcts.length).toFixed(3)) : undefined;
+      patch.sampleGames = a.played;
+    }
+    try {
+      await mergeUpsertDoc("main", "cfbTeams", abbr, patch);
+      result.teamsUpdated++;
+    } catch (err) {
+      result.errors.push({ abbr, error: err.message });
+    }
+  }
+
+  await mergeUpsertDoc("main", "cfb", "meta", {
+    lastUpdated: new Date().toISOString().slice(0, 10),
+    apTop25Available: Object.keys(apRanks).length > 0,
+    cfpRankingsAvailable: Object.keys(cfpRanks).length > 0,
+    currentSeason,
+  });
+  return result;
+}
+
+// Pulled nightly by a Supabase pg_cron job (see sql/cfb-tracker-cron-run-me.sql). Same
+// date/from/to backfill convention as the CBB/NHL trackers above -- from/to here covers
+// the one-time whole-2026-season backfill Seb asked for, run manually once.
+app.get("/internal/jobs/cfb-nightly-tracker", async (req, res) => {
+  try {
+    const { date, from, to } = req.query;
+    const dates = [];
+    if (from && to) {
+      let d = new Date(Date.UTC(Number(from.slice(0, 4)), Number(from.slice(4, 6)) - 1, Number(from.slice(6, 8))));
+      const end = new Date(Date.UTC(Number(to.slice(0, 4)), Number(to.slice(4, 6)) - 1, Number(to.slice(6, 8))));
+      while (d <= end) {
+        dates.push(d.toISOString().slice(0, 10).replace(/-/g, ""));
+        d.setUTCDate(d.getUTCDate() + 1);
+      }
+    } else if (date) {
+      dates.push(date);
+    } else {
+      const yesterdayET = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      dates.push(yesterdayET.toISOString().slice(0, 10).replace(/-/g, ""));
+    }
+    const results = [];
+    for (const d of dates) {
+      results.push(await trackCfbForDate(d));
+      await sleep(300);
+    }
+    const teamsResult = await refreshCfbTeams();
+    res.json({
+      ok: true,
+      nights: results.length,
+      gamesRecorded: results.reduce((s, r) => s + r.gamesRecorded, 0),
+      results,
+      cfbTeams: teamsResult,
+    });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`sports-proxy listening on ${PORT}`));
