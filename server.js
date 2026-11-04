@@ -5262,6 +5262,30 @@ const API_FOOTBALL_LEAGUE_IDS = {
   MLS: 253,
 };
 
+// Diagnostic only (2026-11-04): the main swap test got 0 fixtures back for every league
+// using ?league=X&next=3 with no season -- narrowing down why, EPL only, a handful of
+// param variants.
+app.get("/internal/test/api-football-diag", async (req, res) => {
+  if (!API_FOOTBALL_KEY) return res.status(400).json({ error: "API_FOOTBALL_KEY not set" });
+  const variants = {
+    "league+next_no_season": "/fixtures?league=39&next=3",
+    "league+season2026+next": "/fixtures?league=39&season=2026&next=3",
+    "league+season2025+next": "/fixtures?league=39&season=2025&next=3",
+    today_date: `/fixtures?date=${new Date().toISOString().slice(0, 10)}`,
+    leagues_info: "/leagues?id=39",
+  };
+  const out = {};
+  for (const [name, path] of Object.entries(variants)) {
+    try {
+      const j = await getApiFootballJson(path);
+      out[name] = { results: j.results, errors: j.errors, sample: JSON.stringify(j.response).slice(0, 500) };
+    } catch (err) {
+      out[name] = { error: err.message };
+    }
+  }
+  res.json(out);
+});
+
 app.get("/internal/test/soccer-source-swap", async (req, res) => {
   if (!API_FOOTBALL_KEY) return res.status(400).json({ error: "API_FOOTBALL_KEY not set" });
   const calls = [];
