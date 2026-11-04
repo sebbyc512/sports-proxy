@@ -18,9 +18,19 @@ const PORT = process.env.PORT || 3000;
 const PROXY_TOKEN_NEXT = process.env.PROXY_TOKEN_NEXT;
 const PROXY_TOKEN = PROXY_TOKEN_NEXT || process.env.PROXY_TOKEN;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
+const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
 
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports";
 const ODDS_BASE = "https://api.the-odds-api.com/v4";
+const API_FOOTBALL_BASE = "https://v3.football.api-sports.io";
+
+async function getApiFootballJson(path) {
+  const res = await fetch(`${API_FOOTBALL_BASE}${path}`, {
+    headers: { "x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "sports-proxy/0.1" },
+  });
+  if (!res.ok) throw new Error(`${path} -> HTTP ${res.status}`);
+  return res.json();
+}
 
 function requireToken(req, res, next) {
   if (!PROXY_TOKEN) {
@@ -5232,6 +5242,129 @@ app.get("/internal/jobs/news-check-fast", async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
+});
+
+// --- Soccer data source swap -- read-only test (2026-11-04, Seb's request) ------------
+// Nothing here is wired into anything live. Just proves out API-Football + Understat as
+// potential replacements/supplements for the current sofascore/fotmob soccer source, and
+// reports real call usage against the free-tier 100/day cap.
+app.get("/internal/test/api-football-key", (req, res) => {
+  res.json({ keySet: !!API_FOOTBALL_KEY });
+});
+
+const API_FOOTBALL_LEAGUE_IDS = {
+  EPL: 39,
+  LA_LIGA: 140,
+  SERIE_A: 135,
+  BUNDESLIGA: 78,
+  LIGUE_1: 61,
+  UCL: 2,
+  MLS: 253,
+};
+
+app.get("/internal/test/soccer-source-swap", async (req, res) => {
+  if (!API_FOOTBALL_KEY) return res.status(400).json({ error: "API_FOOTBALL_KEY not set" });
+  const calls = [];
+  const report = { apiFootball: {}, understat: {} };
+  try {
+    // 1 call: confirms the key works and shows the real plan/quota from api-sports itself.
+    calls.push("status");
+    report.apiFootball.status = await getApiFootballJson("/status");
+
+    // Fixtures-only pass across all 7 competitions (1 call each) -- proves every league id
+    // resolves and returns real upcoming fixtures.
+    report.apiFootball.fixturesByLeague = {};
+    for (const [key, id] of Object.entries(API_FOOTBALL_LEAGUE_IDS)) {
+      calls.push(`fixtures:${key}`);
+      try {
+        const fx = await getApiFootballJson(`/fixtures?league=${id}&next=3`);
+        report.apiFootball.fixturesByLeague[key] = {
+          resultsCount: fx.results,
+          sample: (fx.response || []).slice(0, 1).map((f) => ({
+            fixtureId: f.fixture?.id,
+            date: f.fixture?.date,
+            home: f.teams?.home?.name,
+            away: f.teams?.away?.name,
+            season: f.league?.season,
+          })),
+        };
+      } catch (err) {
+        report.apiFootball.fixturesByLeague[key] = { error: err.message };
+      }
+    }
+
+    // Full depth pass (lineups/injuries/team stats) for EPL only -- representative sample,
+    // not every competition, to keep this test well under budget.
+    const eplFixture = report.apiFootball.fixturesByLeague.EPL?.sample?.[0];
+    if (eplFixture?.fixtureId) {
+      calls.push("lineups:EPL");
+      try {
+        const lu = await getApiFootballJson(`/fixtures/lineups?fixture=${eplFixture.fixtureId}`);
+        report.apiFootball.lineupsSample = { resultsCount: lu.results, hasLineups: (lu.response || []).length > 0 };
+      } catch (err) {
+        report.apiFootball.lineupsSample = { error: err.message };
+      }
+      calls.push("injuries:EPL");
+      try {
+        const inj = await getApiFootballJson(`/injuries?league=${API_FOOTBALL_LEAGUE_IDS.EPL}&season=${eplFixture.season}`);
+        report.apiFootball.injuriesSample = {
+          resultsCount: inj.results,
+          sample: (inj.response || []).slice(0, 3).map((i) => ({ player: i.player?.name, type: i.player?.type, team: i.team?.name })),
+        };
+      } catch (err) {
+        report.apiFootball.injuriesSample = { error: err.message };
+      }
+      calls.push("teamStats:EPL");
+      try {
+        const homeTeamId = (await getApiFootballJson(`/fixtures?id=${eplFixture.fixtureId}`)).response?.[0]?.teams?.home?.id;
+        calls.push("fixtureDetail:EPL");
+        if (homeTeamId) {
+          const stats = await getApiFootballJson(`/teams/statistics?league=${API_FOOTBALL_LEAGUE_IDS.EPL}&season=${eplFixture.season}&team=${homeTeamId}`);
+          report.apiFootball.teamStatsSample = {
+            team: stats.response?.team?.name,
+            fixturesPlayed: stats.response?.fixtures?.played?.total,
+            goalsFor: stats.response?.goals?.for?.total?.total,
+            goalsAgainst: stats.response?.goals?.against?.total?.total,
+          };
+        } else {
+          report.apiFootball.teamStatsSample = { error: "no home team id from fixture detail" };
+        }
+      } catch (err) {
+        report.apiFootball.teamStatsSample = { error: err.message };
+      }
+    }
+    report.apiFootball.callsThisTest = calls.length;
+    report.apiFootball.quota = report.apiFootball.status?.response?.requests;
+  } catch (err) {
+    report.apiFootball.fatalError = err.message;
+  }
+
+  // Understat has no official API -- scrape the league page's embedded JSON (same approach
+  // every unofficial Understat client uses: a <script> tag assigns JSON.parse('...') to a
+  // teamsData/datesData var). Tested here for EPL only as a viability check.
+  try {
+    const UNDERSTAT_LEAGUE_SLUGS = { EPL: "EPL", LA_LIGA: "La_liga", SERIE_A: "Serie_A", BUNDESLIGA: "Bundesliga", LIGUE_1: "Ligue_1" };
+    const html = await (await fetch("https://understat.com/league/EPL/2025", { headers: { "User-Agent": "sports-proxy/0.1" } })).text();
+    const m = html.match(/JSON\.parse\('(.+?)'\)/);
+    if (m) {
+      const decoded = m[1].replace(/\\x([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+      const parsed = JSON.parse(decoded);
+      const firstTeam = Object.values(parsed)[0];
+      report.understat = {
+        scrapeWorked: true,
+        teamCount: Object.keys(parsed).length,
+        sampleTeam: firstTeam?.title,
+        sampleFields: firstTeam?.history?.[0] ? Object.keys(firstTeam.history[0]) : null,
+        leagueSlugsAvailable: UNDERSTAT_LEAGUE_SLUGS,
+      };
+    } else {
+      report.understat = { scrapeWorked: false, reason: "no JSON.parse(...) block matched in page" };
+    }
+  } catch (err) {
+    report.understat = { scrapeWorked: false, error: err.message };
+  }
+
+  res.json(report);
 });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
