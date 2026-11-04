@@ -4988,8 +4988,12 @@ app.get("/internal/jobs/news-matcher-test", async (req, res) => {
       cases.push({ case: "lastname_plus_team_doubtful", legText, player: doubtfulPlayer.player, status: doubtfulPlayer.status, result: matchLegToInjury(legText, doubtfulPlayer) });
     }
     if (outPlayer) {
-      const legText = `${outPlayer.lastName} (WRONGTEAMXYZ) to score a TD`;
-      cases.push({ case: "lastname_wrong_team_should_not_match", legText, player: outPlayer.player, status: outPlayer.status, result: matchLegToInjury(legText, { ...outPlayer, team: { abbr: "WRONGTEAMXYZ", location: "Nowhere", name: "Nothing" } }) });
+      // Same last name, but the leg names a DIFFERENT team than the player's real one
+      // (outPlayer.team is left untouched) -- anyTeamMatch should fail, so this must be
+      // null, never a match.
+      const fakeOtherTeam = normTeamName(outPlayer.team?.abbr) === normTeamName("ZZZ") ? "YYY" : "ZZZ";
+      const legText = `${outPlayer.lastName} (${fakeOtherTeam}) to score a TD`;
+      cases.push({ case: "lastname_wrong_team_should_not_match", legText, player: outPlayer.player, status: outPlayer.status, realTeam: outPlayer.team, result: matchLegToInjury(legText, outPlayer) });
     }
     res.json({ ok: true, cases });
   } catch (err) {
