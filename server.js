@@ -5611,16 +5611,23 @@ async function checkSoccerFixtureAgainstOpenBets(fixture, openLegs, notified, dm
   }
 }
 
-async function runSoccerLineupCheck({ dryRun = false } = {}) {
+async function runSoccerLineupCheck({ dryRun = false, forceFixtureId = null } = {}) {
   const fixtures = await fetchSoccerCandidateFixtures();
   await writeSoccerFixturesDoc(fixtures);
 
   const now = Date.now();
   const horizon = now + 3 * 60 * 60 * 1000;
-  const imminent = fixtures.filter((f) => {
+  let imminent = fixtures.filter((f) => {
     const ts = new Date(f.fixture?.date).getTime();
     return Number.isFinite(ts) && ts > now - 15 * 60 * 1000 && ts <= horizon; // kickoff within 3h, or just started (<=15 min ago)
   });
+  // Manual verification only (never set by the cron SQL): force-checks one specific
+  // candidate fixture regardless of kickoff time, so the matching mechanism can be proven
+  // against real data without waiting for a real match to fall inside the 3h window.
+  if (forceFixtureId) {
+    const forced = fixtures.find((f) => String(f.fixture.id) === String(forceFixtureId));
+    if (forced && !imminent.some((f) => f.fixture.id === forced.fixture.id)) imminent = [forced];
+  }
 
   const openLegs = await getOpenSoccerLegs();
   const notified = await getNotifiedState();
@@ -5665,7 +5672,7 @@ async function runSoccerLineupCheck({ dryRun = false } = {}) {
 
 app.get("/internal/jobs/soccer-lineup-check", async (req, res) => {
   try {
-    const result = await runSoccerLineupCheck({ dryRun: req.query.dryRun === "true" });
+    const result = await runSoccerLineupCheck({ dryRun: req.query.dryRun === "true", forceFixtureId: req.query.forceFixtureId || null });
     res.json({ ok: true, ...result });
   } catch (err) {
     res.status(502).json({ error: err.message });
