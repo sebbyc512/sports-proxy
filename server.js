@@ -4337,6 +4337,22 @@ async function refreshCfbTeams() {
     return a?.played ? a.wins / a.played : null;
   };
 
+  // League-wide rank positions (2026-11-04, Seb's request, same spirit as NBA's offRank/
+  // defRank -- matches the existing weekly Claude tracker's field semantics: offRank/
+  // defRank by scoring (ptsFor/ptsAgainst), totalOffRank/totalDefRank by total yards
+  // (yardsFor/yardsAgainst allowed), among every FBS team with at least one played game.
+  const rankBy = (getter, ascending) => {
+    const withValue = Object.keys(agg).filter((abbr) => agg[abbr].played > 0 && getter(agg[abbr]) != null);
+    withValue.sort((x, y) => (ascending ? getter(agg[x]) - getter(agg[y]) : getter(agg[y]) - getter(agg[x])));
+    const ranks = {};
+    withValue.forEach((abbr, i) => (ranks[abbr] = i + 1));
+    return ranks;
+  };
+  const offRanks = rankBy((a) => a.ptsFor / a.played, false);
+  const defRanks = rankBy((a) => a.ptsAgainst / a.played, true);
+  const totalOffRanks = rankBy((a) => avg(a.yardsFor), false);
+  const totalDefRanks = rankBy((a) => avg(a.yardsAgainst), true);
+
   const result = { teamsUpdated: 0, errors: [] };
   const abbrs = new Set([...Object.keys(byTeam), ...Object.keys(agg)]);
   for (const abbr of abbrs) {
@@ -4351,6 +4367,10 @@ async function refreshCfbTeams() {
       awayRecord: bt.awayRecord ?? undefined,
       apRank: apRanks[abbr] ?? undefined,
       cfpRank: cfpRanks[abbr] ?? undefined,
+      offRank: offRanks[abbr] ?? undefined,
+      defRank: defRanks[abbr] ?? undefined,
+      totalOffRank: totalOffRanks[abbr] ?? undefined,
+      totalDefRank: totalDefRanks[abbr] ?? undefined,
       approxRatings: true,
     };
     if (a) {
