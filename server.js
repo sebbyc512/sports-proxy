@@ -5435,6 +5435,263 @@ app.get("/internal/test/soccer-source-swap", async (req, res) => {
   res.json(report);
 });
 
+// =========================================================================================
+// Soccer data source swap -- real build (2026-11-04, Seb's approval + 6 refinements)
+// =========================================================================================
+// API-Football free tier: 100 calls/day, 10 calls/minute (confirmed by the test endpoints
+// above). This section is a hard-stop-at-80/day, >=7s-apart-paced wrapper around it, plus:
+//   - fixtures for today+tomorrow ET (2 calls) -> filtered to the 7 target competitions,
+//     Milan fixtures dropped before any further per-fixture call is ever made
+//   - lineups+injuries per candidate fixture, ONLY once its kickoff is within 3 hours
+//     (same cadence the NFL/NBA news layer already uses for inactives)
+//   - a lineup-absence/injury check against every OPEN soccer leg on both desks, DMing
+//     only the bet's own owner (same dollar-guard, Steve chat-id guard, and notifiedState
+//     dedupe the existing News Layer already uses)
+//   - a weekly Understat up/down check (no xG wiring yet -- that's explicitly deferred)
+// No team-stats/xG fields are written anywhere here; the free tier can't supply current-
+// season team stats and Understat itself is down, so sofascore/fotmob remains the only
+// source for anything stats/xG-shaped until one of those changes.
+
+const API_FOOTBALL_HARD_STOP_PER_DAY = 80; // Seb's ask: real cap is 100, stop well short so a manual test never gets locked out
+const API_FOOTBALL_MIN_GAP_MS = 7000; // >=7s apart, well under the 10/min (6s) limit with margin
+
+async function apiFootballGuardedCall(path) {
+  const today = etDateDaysAgo(0);
+  const usageDoc = await getDoc("main", "engineMeta", "apiFootballUsage");
+  let usage = usageDoc?.data || { date: today, callsUsed: 0, lastCallAt: null };
+  if (usage.date !== today) usage = { date: today, callsUsed: 0, lastCallAt: null };
+  if (usage.callsUsed >= API_FOOTBALL_HARD_STOP_PER_DAY) {
+    throw new Error(`API_FOOTBALL_HARD_STOP: ${usage.callsUsed}/${API_FOOTBALL_HARD_STOP_PER_DAY} used today`);
+  }
+  if (usage.lastCallAt) {
+    const elapsed = Date.now() - new Date(usage.lastCallAt).getTime();
+    if (elapsed < API_FOOTBALL_MIN_GAP_MS) await new Promise((r) => setTimeout(r, API_FOOTBALL_MIN_GAP_MS - elapsed));
+  }
+  const result = await getApiFootballJson(path);
+  await upsertDoc("main", "engineMeta", "apiFootballUsage", { date: today, callsUsed: usage.callsUsed + 1, lastCallAt: new Date().toISOString() });
+  return result;
+}
+
+async function getApiFootballUsageToday() {
+  const today = etDateDaysAgo(0);
+  const usageDoc = await getDoc("main", "engineMeta", "apiFootballUsage");
+  const usage = usageDoc?.data;
+  if (!usage || usage.date !== today) return { date: today, callsUsed: 0 };
+  return usage;
+}
+
+// Exact-name match, not substring -- API-Football's own team.name for Internazionale is
+// literally "Inter" (not "Inter Milan"), and a substring/word match on "inter" would wrongly
+// catch "Inter Miami" (MLS, a real team Seb absolutely can bet on). "AC Milan" has no such
+// collision risk but is kept as an exact match for the same reason/consistency.
+function isMilanFixture(fixture) {
+  const names = [fixture.teams?.home?.name, fixture.teams?.away?.name];
+  return names.includes("Inter") || names.includes("AC Milan");
+}
+
+async function fetchSoccerCandidateFixtures() {
+  const targetIds = new Set(Object.values(API_FOOTBALL_LEAGUE_IDS));
+  const dates = [etDateDaysAgo(0), etDateDaysAgo(-1)]; // today ET, tomorrow ET
+  const byId = new Map();
+  for (const date of dates) {
+    const j = await apiFootballGuardedCall(`/fixtures?date=${date}`);
+    for (const f of j.response || []) {
+      if (!targetIds.has(f.league?.id)) continue;
+      if (isMilanFixture(f)) continue;
+      byId.set(f.fixture.id, f);
+    }
+  }
+  return [...byId.values()];
+}
+
+async function writeSoccerFixturesDoc(fixtures) {
+  const doc = {
+    updatedAt: new Date().toISOString(),
+    fixtures: fixtures.map((f) => ({
+      fixtureId: f.fixture.id,
+      league: f.league?.name,
+      leagueId: f.league?.id,
+      kickoff: f.fixture?.date,
+      status: f.fixture?.status?.short,
+      home: f.teams?.home?.name,
+      away: f.teams?.away?.name,
+    })),
+  };
+  await upsertDoc("main", "soccer", "fixturesToday", doc);
+  return doc;
+}
+
+function soccerPlayerTeamShape(teamName) {
+  return { abbr: null, location: null, name: teamName };
+}
+
+// Builds matchable "status items" for one fixture: every starting-XI player (status
+// "starting", informational only, never alerted on), every benched/unused-squad player
+// (status "not_starting" -- this is what triggers a lineup-absence DM), and every injury
+// list entry for either side (status taken from API-Football's own injury "type" field,
+// e.g. "Missing Fixture", passed through as-is as the alert status).
+function buildSoccerLineupStatusItems(fixture, lineupsResponse, injuriesResponse) {
+  const items = [];
+  for (const side of lineupsResponse || []) {
+    const teamName = side.team?.name;
+    const startingIds = new Set((side.startXI || []).map((p) => p.player?.id));
+    for (const p of side.startXI || []) {
+      items.push({ player: p.player?.name, lastName: (p.player?.name || "").split(" ").pop(), team: soccerPlayerTeamShape(teamName), status: "starting" });
+    }
+    for (const p of side.substitutes || []) {
+      if (startingIds.has(p.player?.id)) continue;
+      items.push({ player: p.player?.name, lastName: (p.player?.name || "").split(" ").pop(), team: soccerPlayerTeamShape(teamName), status: "not_starting" });
+    }
+  }
+  for (const i of injuriesResponse || []) {
+    items.push({ player: i.player?.name, lastName: (i.player?.name || "").split(" ").pop(), team: soccerPlayerTeamShape(i.team?.name), status: i.player?.type || "injured" });
+  }
+  return items;
+}
+
+// Pulls every OPEN ("pending"/"needs_review") leg on both desks whose bet doc is tagged
+// SOCCER (single-league or inside a MULTI's legLeagues) -- the only legs this check can
+// possibly match, so the only ones worth the matching work.
+async function getOpenSoccerLegs() {
+  const out = [];
+  for (const desk of ["main", "steve"]) {
+    const r = await supabaseFetch(`/docs?desk_id=eq.${desk}&collection=eq.pnlEntries&select=doc_id,data`);
+    const docs = await r.json();
+    for (const doc of docs) {
+      const d = doc.data || {};
+      if (d.type !== "bet" || !["pending", "needs_review"].includes(d.status)) continue;
+      const isSoccer = d.league === "SOCCER" || (Array.isArray(d.legLeagues) && d.legLeagues.includes("SOCCER"));
+      if (!isSoccer) continue;
+      for (const leg of d.legs || []) {
+        if (!leg.text || !["pending", "needs_review", undefined, null].includes(leg.status)) continue;
+        out.push({ desk, betId: doc.doc_id, betLabel: d.desc || d.ticketId || doc.doc_id, legText: leg.text });
+      }
+    }
+  }
+  return out;
+}
+
+// One fixture's worth of the actual check -- shared by the live job and the dry-run
+// endpoint (dryRun just skips the DM + notifiedState write at the end, same convention as
+// the rest of the News Layer).
+async function checkSoccerFixtureAgainstOpenBets(fixture, openLegs, notified, dmsByDesk, newKeys) {
+  // Sequential, not Promise.all -- apiFootballGuardedCall already paces itself (>=7s apart),
+  // so two calls "in parallel" here would just both wait on the same pacing gate anyway.
+  // A HARD_STOP error is let through (not caught here) so the caller can break the whole
+  // pass instead of silently limping through the remaining fixtures with empty data.
+  const lineups = await apiFootballGuardedCall(`/fixtures/lineups?fixture=${fixture.fixture.id}`)
+    .then((j) => j.response)
+    .catch((err) => {
+      if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) throw err;
+      return [];
+    });
+  const injuries = await apiFootballGuardedCall(`/injuries?fixture=${fixture.fixture.id}`)
+    .then((j) => j.response)
+    .catch((err) => {
+      if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) throw err;
+      return [];
+    });
+  const statusItems = buildSoccerLineupStatusItems(fixture, lineups, injuries);
+  const alertable = statusItems.filter((i) => i.status !== "starting");
+  if (!alertable.length) return;
+  for (const leg of openLegs) {
+    for (const item of alertable) {
+      const m = matchNameInLegText(normTeamName(leg.legText), item.player, item.lastName, item.team);
+      if (!m) continue;
+      const key = `soccerlineup|${normTeamName(item.player)}|${item.status}|${leg.betId}`;
+      if (notified.keys?.[key] || newKeys[key]) continue;
+      newKeys[key] = { at: new Date().toISOString() };
+      (dmsByDesk[leg.desk] ||= []).push({
+        betLabel: leg.betLabel,
+        player: item.player,
+        status: item.status === "not_starting" ? "not in the starting XI" : item.status,
+        confidence: m.confidence,
+      });
+    }
+  }
+}
+
+async function runSoccerLineupCheck({ dryRun = false } = {}) {
+  const fixtures = await fetchSoccerCandidateFixtures();
+  await writeSoccerFixturesDoc(fixtures);
+
+  const now = Date.now();
+  const horizon = now + 3 * 60 * 60 * 1000;
+  const imminent = fixtures.filter((f) => {
+    const ts = new Date(f.fixture?.date).getTime();
+    return Number.isFinite(ts) && ts > now - 15 * 60 * 1000 && ts <= horizon; // kickoff within 3h, or just started (<=15 min ago)
+  });
+
+  const openLegs = await getOpenSoccerLegs();
+  const notified = await getNotifiedState();
+  const newKeys = {};
+  const dmsByDesk = {};
+  const checkedFixtures = [];
+  for (const f of imminent) {
+    checkedFixtures.push({ fixtureId: f.fixture.id, home: f.teams?.home?.name, away: f.teams?.away?.name, kickoff: f.fixture?.date });
+    try {
+      await checkSoccerFixtureAgainstOpenBets(f, openLegs, notified, dmsByDesk, newKeys);
+    } catch (err) {
+      if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) break; // stop the whole pass, not just this fixture
+    }
+  }
+
+  const sentSummary = { main: 0, steve: 0 };
+  for (const desk of Object.keys(dmsByDesk)) {
+    const items = dmsByDesk[desk];
+    if (!items.length) continue;
+    const lines = items.map((it) => `${it.player} (${it.status}) -- may affect: ${it.betLabel}`);
+    const text = `⚽ Soccer lineup check:\n${lines.join("\n")}`;
+    if (dryRun) {
+      sentSummary[desk] += items.length;
+      continue;
+    }
+    const r = await sendNewsAlertDm(desk, text).catch((err) => ({ sent: false, error: err.message }));
+    if (r.sent) sentSummary[desk] += items.length;
+  }
+  if (!dryRun && Object.keys(newKeys).length) {
+    await upsertDoc("main", "news", "notifiedState", { keys: { ...(notified.keys || {}), ...newKeys } });
+  }
+  const usage = await getApiFootballUsageToday();
+  return {
+    totalCandidateFixtures: fixtures.length,
+    imminentFixturesChecked: checkedFixtures,
+    newAlerts: Object.keys(newKeys).length,
+    sentSummary,
+    dmsByDesk: dryRun ? dmsByDesk : undefined,
+    apiFootballCallsUsedToday: usage.callsUsed,
+  };
+}
+
+app.get("/internal/jobs/soccer-lineup-check", async (req, res) => {
+  try {
+    const result = await runSoccerLineupCheck({ dryRun: req.query.dryRun === "true" });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Understat weekly up/down check (2026-11-04, Seb's ask) -- no xG wiring, just a status
+// flag so a human (or a future build step) knows the moment it's viable again. DMs Seb
+// directly rather than editing the live Monday-recap routine in place.
+app.get("/internal/jobs/understat-weekly-check", async (req, res) => {
+  try {
+    const html = await (await fetch("https://understat.com/", { headers: { "User-Agent": "sports-proxy/0.1" } })).text();
+    const isDown = /we will come back soon/i.test(html);
+    const isUp = !isDown && /JSON\.parse\(/.test(html);
+    const prev = await getDoc("main", "engineMeta", "understatStatus");
+    const wasUp = prev?.data?.isUp === true;
+    await upsertDoc("main", "engineMeta", "understatStatus", { isUp, checkedAt: new Date().toISOString() });
+    if (isUp && !wasUp) {
+      await sendTelegramRaw(TELEGRAM_SEB_CHAT_ID, "⚽ Understat is back up -- xG data could be added to the soccer build now.").catch(() => {});
+    }
+    res.json({ ok: true, isUp, wasUp, notifiedSeb: isUp && !wasUp });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`sports-proxy listening on ${PORT}`));
