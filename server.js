@@ -5288,15 +5288,21 @@ app.get("/internal/test/api-football-diag", async (req, res) => {
   // injuries work the same way (not season-blocked since they're tied to one match)?
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const next7 = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    const dateLeague = await getApiFootballJson(`/fixtures?date=${today}&league=39`);
-    out.date_plus_league_today = { results: dateLeague.results, errors: dateLeague.errors };
-    let probeFixtureId = dateLeague.response?.[0]?.fixture?.id;
-    if (!probeFixtureId) {
-      const dateLeagueNext = await getApiFootballJson(`/fixtures?from=${today}&to=${next7}&league=39`);
-      out.date_range_plus_league = { results: dateLeagueNext.results, errors: dateLeagueNext.errors };
-      probeFixtureId = dateLeagueNext.response?.[0]?.fixture?.id;
-    }
+    // date-only (no league, no season) is the one param shape that worked above --
+    // pull today's full global slate and filter to our 7 target leagues client-side.
+    const dateOnly = await getApiFootballJson(`/fixtures?date=${today}`);
+    const targetIds = new Set(Object.values(API_FOOTBALL_LEAGUE_IDS));
+    const todaysTargetMatches = (dateOnly.response || []).filter((f) => targetIds.has(f.league?.id));
+    out.dateOnlyResultsTotal = dateOnly.results;
+    out.todaysTargetLeagueMatches = todaysTargetMatches.map((f) => ({
+      league: f.league?.name,
+      leagueId: f.league?.id,
+      fixtureId: f.fixture?.id,
+      home: f.teams?.home?.name,
+      away: f.teams?.away?.name,
+      status: f.fixture?.status?.short,
+    }));
+    let probeFixtureId = todaysTargetMatches[0]?.fixture?.id;
     out.probeFixtureId = probeFixtureId || null;
     if (probeFixtureId) {
       const lu = await getApiFootballJson(`/fixtures/lineups?fixture=${probeFixtureId}`);
