@@ -4700,12 +4700,38 @@ function extractInjuryItems(teamsBlock) {
   return items;
 }
 
+// Transaction classification (2026-11-04, Seb's ask, tightened after the test run's 14
+// false alarms were all roster noise): each description is one or more sentences, each
+// naming at most one player and one action. Alert-worthy actions are trade/release/
+// suspension/a NEW injured-reserve placement -- IGNORE wins when a sentence matches both
+// (e.g. "Released ... from the practice squad" is a release, but practice-squad makes it
+// noise, not a real roster move). Call-ups/send-downs/minors/waivers/practice-squad/an
+// IR ACTIVATION (a player returning, not getting hurt)/reinstatement are all ignored for
+// alerting purposes -- but every transaction, alert-worthy or not, still gets stored in
+// news/<league> so builders can read the full feed regardless.
+const TXN_ALERT_RE = /\btraded\b|\breleased\b|\bsuspended\b|\bplaced\b.*\binjured reserve\b/i;
+const TXN_IGNORE_RE = /\brecalled\b|\bassigned\b.*\bminors\b|\bsent\b.*\bdown\b|\bwaivers\b|\bpractice squad\b|\bactivated\b.*\binjured reserve\b|\breinstated\b|\bdesignated\b.*\breturn\b/i;
+const TXN_PLAYER_RE = /\b[A-Z]{1,3}\s+([A-Z][a-zA-Z'.-]+(?:\s+[A-Z][a-zA-Z'.-]+){0,3}?)(?=\s+(?:to|from|on|for|without|off|down|\d|\(|\.|$)|\.|$)/;
+
+function classifyTransactionSentence(sentence) {
+  const isIgnore = TXN_IGNORE_RE.test(sentence);
+  const isAlertWorthy = !isIgnore && TXN_ALERT_RE.test(sentence);
+  const m = TXN_PLAYER_RE.exec(sentence);
+  const player = m ? m[1].replace(/\.$/, "").trim() : null;
+  return { text: sentence.trim(), isAlertWorthy, player, lastName: player ? player.split(" ").pop() : null };
+}
+
 function extractTransactionItems(txns) {
-  return (txns || []).map((t) => ({
-    date: t.date || null,
-    team: { abbr: t.team?.abbreviation || null, location: t.team?.location || null, name: t.team?.name || null },
-    description: t.description || null,
-  }));
+  return (txns || []).map((t) => {
+    const description = t.description || "";
+    const sentences = description.split(/(?<=\.)\s+/).filter(Boolean);
+    return {
+      date: t.date || null,
+      team: { abbr: t.team?.abbreviation || null, location: t.team?.location || null, name: t.team?.name || null },
+      description,
+      actions: sentences.map(classifyTransactionSentence),
+    };
+  });
 }
 
 async function fetchLeagueNewsRaw(key) {
@@ -4776,25 +4802,42 @@ function newsTeamIdStrings(team) {
 // player name is always a high-confidence match. Last name + team ABBREVIATION is also
 // high-confidence; last name + team CITY/NICKNAME only is "ambiguous" -- still reported,
 // but hedged as "may affect" rather than asserted, per Seb's explicit ask not to skip it.
-function matchLegToInjury(legText, injury) {
-  const text = normTeamName(legText);
-  if (!text || !injury?.player) return null;
-  const full = normTeamName(injury.player);
-  if (full && text.includes(full)) return { confidence: "high" };
-  const last = normTeamName(injury.lastName);
-  if (!last || !text.includes(last)) return null;
-  const abbrNorm = injury.team?.abbr ? normTeamName(injury.team.abbr) : null;
-  const abbrMatch = abbrNorm && text.includes(abbrNorm);
-  const anyTeamMatch = newsTeamIdStrings(injury.team).some((t) => text.includes(t));
+// Shared by the injury matcher and the transaction matcher so both apply the same tiers.
+function matchNameInLegText(normLegText, fullName, lastName, team) {
+  if (!normLegText) return null;
+  const full = fullName ? normTeamName(fullName) : null;
+  if (full && normLegText.includes(full)) return { confidence: "high" };
+  const last = lastName ? normTeamName(lastName) : null;
+  if (!last || !normLegText.includes(last)) return null;
+  const abbrNorm = team?.abbr ? normTeamName(team.abbr) : null;
+  const abbrMatch = abbrNorm && normLegText.includes(abbrNorm);
+  const anyTeamMatch = newsTeamIdStrings(team).some((t) => normLegText.includes(t));
   if (!anyTeamMatch) return null; // last name alone, zero team confirmation -- not a match
   return { confidence: abbrMatch ? "high" : "ambiguous" };
 }
 
+function matchLegToInjury(legText, injury) {
+  const text = normTeamName(legText);
+  if (!text || !injury?.player) return null;
+  return matchNameInLegText(text, injury.player, injury.lastName, injury.team);
+}
+
+// Transaction matching requirement (2026-11-04, Seb's fix after the first live test run
+// alerted on 14 false positives -- all team-only matches on roster noise like call-ups and
+// IR activations). A transaction only ever matches a leg if: (a) at least one of its
+// sentences classified as alert-worthy (trade/release/suspension/new IR placement, never
+// roster noise), AND (b) that sentence named a player, AND (c) that player is also named in
+// the leg text (full name, or last name + team -- same tiers as the injury matcher). A
+// team mentioned anywhere in the transaction is never sufficient on its own.
 function matchLegToTransaction(legText, txn) {
   const text = normTeamName(legText);
-  if (!text) return null;
-  if (!newsTeamIdStrings(txn?.team).some((t) => text.includes(t))) return null;
-  return { confidence: "high" };
+  if (!text || !Array.isArray(txn?.actions)) return null;
+  for (const action of txn.actions) {
+    if (!action.isAlertWorthy || !action.player) continue;
+    const m = matchNameInLegText(text, action.player, action.lastName, txn.team);
+    if (m) return { ...m, player: action.player };
+  }
+  return null;
 }
 
 async function getNewsDocForLeague(key) {
@@ -4836,7 +4879,8 @@ async function sendNewsAlertDm(desk, text) {
 // already existed still gets its own alert, since it's a new key. One DM per owner still
 // bundles every newly-affected ticket for that same underlying news, rather than one DM
 // per ticket.
-async function checkOpenBetsAgainstNews(newsByLeague) {
+async function checkOpenBetsAgainstNews(newsByLeague, opts = {}) {
+  const dryRun = !!opts.dryRun;
   const notified = await getNotifiedState();
   const newKeys = {};
   const dmsByDesk = {};
@@ -4864,11 +4908,10 @@ async function checkOpenBetsAgainstNews(newsByLeague) {
         for (const txn of news.transactions || []) {
           const m2 = matchLegToTransaction(leg.text, txn);
           if (!m2) continue;
-          const teamKey = normTeamName(txn.team?.abbr || txn.team?.name || "");
-          const key = `txn|${teamKey}|${txn.date}|${doc.doc_id}`;
+          const key = `txn|${normTeamName(m2.player)}|${txn.date}|${doc.doc_id}`;
           if (notified.keys?.[key]) continue;
           newKeys[key] = { at: new Date().toISOString() };
-          (dmsByDesk[desk] ||= []).push({ betLabel: d.desc || d.ticketId || doc.doc_id, transaction: true, team: txn.team?.abbr || txn.team?.name });
+          (dmsByDesk[desk] ||= []).push({ betLabel: d.desc || d.ticketId || doc.doc_id, transaction: true, player: m2.player, team: txn.team?.abbr || txn.team?.name, confidence: m2.confidence });
         }
       }
     }
@@ -4879,22 +4922,27 @@ async function checkOpenBetsAgainstNews(newsByLeague) {
     const items = dmsByDesk[desk];
     if (!items.length) continue;
     const lines = items.map((it) => {
-      if (it.transaction) return `Team news for ${it.team} -- may affect: ${it.betLabel}`;
       const hedge = it.confidence === "ambiguous" ? "may affect" : "affects";
+      if (it.transaction) return `${it.player} (${it.team}) -- ${hedge}: ${it.betLabel}`;
       return `${it.player} now ${it.status} -- ${hedge}: ${it.betLabel}`;
     });
     const text = `\u{1F4F0} News check:\n${lines.join("\n")}`;
+    if (dryRun) {
+      sentSummary[desk] += items.length;
+      continue;
+    }
     const r = await sendNewsAlertDm(desk, text).catch((err) => ({ sent: false, error: err.message }));
     if (r.sent) sentSummary[desk] += items.length;
   }
 
-  if (Object.keys(newKeys).length) {
+  if (!dryRun && Object.keys(newKeys).length) {
     await upsertDoc("main", "news", "notifiedState", { keys: { ...(notified.keys || {}), ...newKeys } });
   }
-  return { newAlerts: Object.keys(newKeys).length, sentSummary };
+  return { newAlerts: Object.keys(newKeys).length, sentSummary, dmsByDesk: dryRun ? dmsByDesk : undefined };
 }
 
-async function runNewsCheck() {
+async function runNewsCheck(opts = {}) {
+  const dryRun = !!opts.dryRun;
   const newsByLeague = {};
   const counts = {};
   for (const key of Object.keys(NEWS_LEAGUES)) {
@@ -4902,14 +4950,48 @@ async function runNewsCheck() {
     newsByLeague[key] = doc;
     counts[key] = { injuries: doc.injuries.length, transactions: doc.transactions.length, injuriesStale: doc.injuriesStale, transactionsStale: doc.transactionsStale };
   }
-  const betCheck = await checkOpenBetsAgainstNews(newsByLeague);
+  const betCheck = await checkOpenBetsAgainstNews(newsByLeague, { dryRun });
   return { counts, ...betCheck };
 }
 
+// dryRun=true (manual verification only, never set by the cron SQL): still polls ESPN and
+// writes news/<league> as normal, but skips sending any DM and skips writing notifiedState
+// -- returns dmsByDesk so you can see exactly what WOULD have gone out.
 app.get("/internal/jobs/news-check", async (req, res) => {
   try {
-    const result = await runNewsCheck();
-    res.json({ ok: true, ...result });
+    const dryRun = req.query.dryRun === "true";
+    const result = await runNewsCheck({ dryRun });
+    res.json({ ok: true, dryRun, ...result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Read-only synthetic test for the injury matcher (Seb's ask, 2026-11-04): pulls today's
+// real NFL injuries, picks one real Out player (full-name case) and one real Doubtful
+// player (last-name+team case), plus a fabricated last-name-on-the-wrong-team case that
+// must NOT match. No DMs, no Supabase writes.
+app.get("/internal/jobs/news-matcher-test", async (req, res) => {
+  try {
+    const raw = await fetchLeagueNewsRaw("nfl");
+    const injuries = raw.injuries || [];
+    const outPlayer = injuries.find((i) => (i.status || "").toLowerCase() === "out");
+    const doubtfulPlayer = injuries.find((i) => (i.status || "").toLowerCase() === "doubtful");
+    const cases = [];
+    if (outPlayer) {
+      const legText = `${outPlayer.player} to score a TD`;
+      cases.push({ case: "full_name_out", legText, player: outPlayer.player, status: outPlayer.status, result: matchLegToInjury(legText, outPlayer) });
+    }
+    if (doubtfulPlayer) {
+      const teamTag = doubtfulPlayer.team?.abbr || doubtfulPlayer.team?.name || "";
+      const legText = `${doubtfulPlayer.lastName} (${teamTag}) over 50 rush yards`;
+      cases.push({ case: "lastname_plus_team_doubtful", legText, player: doubtfulPlayer.player, status: doubtfulPlayer.status, result: matchLegToInjury(legText, doubtfulPlayer) });
+    }
+    if (outPlayer) {
+      const legText = `${outPlayer.lastName} (WRONGTEAMXYZ) to score a TD`;
+      cases.push({ case: "lastname_wrong_team_should_not_match", legText, player: outPlayer.player, status: outPlayer.status, result: matchLegToInjury(legText, { ...outPlayer, team: { abbr: "WRONGTEAMXYZ", location: "Nowhere", name: "Nothing" } }) });
+    }
+    res.json({ ok: true, cases });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
