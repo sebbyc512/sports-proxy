@@ -11,6 +11,9 @@ import { teamMatches, findGame } from "./matcher.js";
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PROXY_TOKEN = process.env.PROXY_TOKEN;
+// Temporary dual-accept during token rotation (cutover step 5). Remove PROXY_TOKEN_NEXT
+// and this fallback once Render is confirmed on the new PROXY_TOKEN value.
+const PROXY_TOKEN_NEXT = process.env.PROXY_TOKEN_NEXT;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports";
@@ -21,7 +24,7 @@ function requireToken(req, res, next) {
     return res.status(500).json({ error: "PROXY_TOKEN is not configured on the server." });
   }
   const given = req.query.token || req.get("x-proxy-token");
-  if (given !== PROXY_TOKEN) {
+  if (given !== PROXY_TOKEN && (!PROXY_TOKEN_NEXT || given !== PROXY_TOKEN_NEXT)) {
     return res.status(401).json({ error: "Missing or invalid token." });
   }
   next();
