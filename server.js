@@ -2005,6 +2005,150 @@ function etDateDaysAgo(daysAgo) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York" }).format(d); // YYYY-MM-DD
 }
 
+// --- League auto-tag for new bets (2026-11-04, Seb's ask) -----------------------------
+// Only 16/152 of main's bets had a league field before the one-time backfill -- new bets
+// keep arriving without one. This ports the SAME inference used for that backfill (linked
+// request -> team/player names via live ESPN rosters -> leg wording) into the engine so
+// every new pnlEntries doc gets tagged going forward, code-only, zero Claude runs. Piggy-
+// backs on gradeCollectionForDesk's existing per-tick pass over pnlEntries rather than a
+// new cron job. NEVER touches league/legLeagues once a doc already has one (even "MULTI"
+// with legLeagues:null) -- a human or this backfill already decided it, so auto-tagging
+// only fills in a true blank.
+//
+// NOTE -- Supabase-only (same residual risk as the grader's own writes): this cannot also
+// write ArtifactData (that store is only reachable through Claude's own ArtifactData tool,
+// never from this Node service), so it leans on the same "safe by construction" argument
+// as the engine-only grader -- our write bumps the mirror's updated_at to now, so Post-
+// Cutover Sync's Phase 1 push-up (desk-newer-than-mirror) skips it on its own UNLESS that
+// same bet is edited again in the app/by a routine before this job's next tick, which
+// would push the still-blank desk copy back over our tag. Low-probability (bets settle
+// and then go quiet), but real -- flagging it rather than claiming zero drift risk.
+const LEAGUE_TAG_NFL_TEAMS = ["49ers","bears","bengals","bills","broncos","browns","buccaneers","cardinals","chargers","chiefs","colts","cowboys","dolphins","eagles","falcons","giants","jaguars","jets","lions","packers","panthers","patriots","raiders","rams","ravens","saints","seahawks","steelers","texans","titans","vikings","commanders"];
+const LEAGUE_TAG_NBA_TEAMS = ["hawks","celtics","nets","hornets","bulls","cavaliers","mavericks","nuggets","pistons","warriors","rockets","pacers","clippers","lakers","grizzlies","heat","bucks","timberwolves","pelicans","knicks","thunder","magic","76ers","sixers","suns","blazers","trail blazers","kings","spurs","raptors","jazz","wizards"];
+const LEAGUE_TAG_NHL_TEAMS = ["bruins","sabres","red wings","panthers","canadiens","senators","lightning","maple leafs","hurricanes","blue jackets","devils","islanders","rangers","flyers","penguins","capitals","blackhawks","avalanche","stars","wild","predators","blues","jets","coyotes","ducks","flames","kings","oilers","sharks","kraken","canucks","golden knights"];
+const LEAGUE_TAG_MLB_TEAMS = ["diamondbacks","braves","orioles","red sox","cubs","white sox","reds","guardians","rockies","tigers","astros","royals","angels","dodgers","marlins","brewers","twins","mets","yankees","athletics","phillies","pirates","padres","giants","mariners","cardinals","rays","rangers","blue jays","nationals"];
+const LEAGUE_TAG_CFB_HINTS = ["alabama","georgia","ohio state","michigan","oklahoma","texas","clemson","lsu","oregon","notre dame","penn state","florida state","usc","ucla","auburn","tennessee","wisconsin","iowa","nebraska","miami hurricanes","college football"];
+const LEAGUE_TAG_CBB_HINTS = ["duke","kansas","kentucky","gonzaga","unc","north carolina tar heels","villanova","march madness","ncaab","college basketball"];
+const LEAGUE_TAG_SOCCER_HINTS = ["premier league","la liga","serie a","bundesliga","ligue 1","mls","champions league","uefa","epl","manchester","liverpool","arsenal","chelsea","real madrid","barcelona","juventus","psg","inter milan","ac milan","goalscorer","clean sheet","both teams to score"];
+const LEAGUE_TAG_WORDING_HINTS = [
+  { re: /\bpuck line\b|\bgoalie\b|\bsog\b|\bshots on goal\b/i, league: "NHL" },
+  { re: /\bgoalscorer\b|\bclean sheet\b|\bboth teams to score\b|\banytime goalscorer\b/i, league: "SOCCER" },
+  { re: /\banytime td\b|\bfirst td\b|\brushing yards\b|\breceiving yards\b|\bpassing yards\b|\bqb\b/i, league: "NFL" },
+  { re: /\b3-pointer\b|\bpoints \+ rebounds\b|\brebounds \+ assists\b|\bpra\b/i, league: "NBA" },
+];
+
+function leagueTagEscapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function leagueTagMatchTeamList(text, list) {
+  return list.some((t) => new RegExp(`\\b${leagueTagEscapeRe(t)}\\b`).test(text));
+}
+
+// Player-name index (NFL/NBA/NHL, via ESPN rosters -- ~94 team fetches) is expensive, so it
+// is cached in-memory and rebuilt at most once every 12 hours. Deliberately excludes a bare-
+// last-name fallback: the real backfill run hit a false positive ("Blake Snell", MLB) from
+// an unrelated NHL player whose LAST name happened to be "Blake" -- full names only.
+let leagueTagPlayerIndexCache = { builtAt: 0, byFullName: new Map() };
+async function getLeagueTagPlayerIndex() {
+  if (Date.now() - leagueTagPlayerIndexCache.builtAt < 12 * 60 * 60 * 1000) return leagueTagPlayerIndexCache.byFullName;
+  const byFullName = new Map();
+  const leagues = [
+    { key: "NFL", sport: "football", league: "nfl" },
+    { key: "NBA", sport: "basketball", league: "nba" },
+    { key: "NHL", sport: "hockey", league: "nhl" },
+  ];
+  try {
+    for (const cfg of leagues) {
+      const teamsJson = await getJson(`${ESPN_BASE}/${cfg.sport}/${cfg.league}/teams`);
+      const teamIds = teamsJson.sports[0].leagues[0].teams.map((t) => t.team.id);
+      const CHUNK = 8;
+      for (let i = 0; i < teamIds.length; i += CHUNK) {
+        const batch = teamIds.slice(i, i + CHUNK);
+        const results = await Promise.all(
+          batch.map((id) => getJson(`${ESPN_BASE}/${cfg.sport}/${cfg.league}/teams/${id}/roster`).catch(() => null))
+        );
+        for (const r of results) {
+          for (const group of r?.athletes || []) {
+            const flat = Array.isArray(group.items) ? group.items : [group];
+            for (const a of flat) {
+              if (a.fullName) byFullName.set(normTeamName(a.fullName), cfg.key);
+            }
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // Network hiccup mid-build -- keep whatever was already collected this pass rather than
+    // caching an empty index; next call (12h later, or sooner if this stays empty) retries.
+  }
+  if (byFullName.size > 0) leagueTagPlayerIndexCache = { builtAt: Date.now(), byFullName };
+  return byFullName.size > 0 ? byFullName : leagueTagPlayerIndexCache.byFullName;
+}
+
+function leagueTagNormalizeRequestLeague(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toUpperCase();
+  if (["NFL", "NBA", "NHL", "CFB", "CBB", "MLB", "SOCCER", "MULTI"].includes(s)) return s;
+  if (/premier|la liga|serie a|bundesliga|ligue 1|mls|champions league|soccer/i.test(raw)) return "SOCCER";
+  if (/college football|cfb|ncaaf/i.test(raw)) return "CFB";
+  if (/college basketball|ncaab|cbb/i.test(raw)) return "CBB";
+  if (/multi/i.test(raw)) return "MULTI";
+  return s || null;
+}
+
+// One fetch of the desk's "requests" collection per grading pass (not per doc) -- mirrors
+// the backfill's own linked-ticket lookup.
+async function getLeagueTagRequestIndex(desk) {
+  const byTicketId = new Map();
+  try {
+    const r = await supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.requests&select=data`);
+    const rows = await r.json();
+    for (const row of rows) {
+      const d = row.data?.data || row.data || {};
+      const league = leagueTagNormalizeRequestLeague(d.league);
+      if (!league) continue;
+      const legLeagues =
+        league === "MULTI" && Array.isArray(d.legs) && d.legs.every((l) => typeof l === "string")
+          ? [...new Set(d.legs.map((l) => leagueTagNormalizeRequestLeague(l) || l.toUpperCase()))]
+          : null;
+      const ids = new Set([d.ticketId, ...(Array.isArray(d.ticketIds) ? d.ticketIds : [])].filter(Boolean));
+      for (const id of ids) byTicketId.set(id, { league, legLeagues });
+    }
+  } catch (err) {
+    // requests fetch failed -- inference still works via team/player/wording below.
+  }
+  return byTicketId;
+}
+
+function leagueTagIsBlank(l) {
+  if (l === undefined || l === null) return true;
+  const s = String(l).trim().toLowerCase();
+  return s === "" || s === "unknown" || s === "n/a" || s === "none";
+}
+
+function inferLeagueForBet(data, requestIndex, playerIndex) {
+  const reqMatch = data.ticketId ? requestIndex.get(data.ticketId) : null;
+  if (reqMatch) return { league: reqMatch.league, legLeagues: reqMatch.legLeagues, confidence: reqMatch.league === "MULTI" && !reqMatch.legLeagues ? "low" : "high" };
+
+  const text = normTeamName([(data.legs || []).map((l) => l.text).join(" | "), data.desc || ""].join(" "));
+  const hits = [];
+  if (leagueTagMatchTeamList(text, LEAGUE_TAG_NFL_TEAMS)) hits.push("NFL");
+  if (leagueTagMatchTeamList(text, LEAGUE_TAG_NBA_TEAMS)) hits.push("NBA");
+  if (leagueTagMatchTeamList(text, LEAGUE_TAG_NHL_TEAMS)) hits.push("NHL");
+  if (leagueTagMatchTeamList(text, LEAGUE_TAG_MLB_TEAMS)) hits.push("MLB");
+  if (leagueTagMatchTeamList(text, LEAGUE_TAG_CFB_HINTS)) hits.push("CFB");
+  if (leagueTagMatchTeamList(text, LEAGUE_TAG_CBB_HINTS)) hits.push("CBB");
+  if (leagueTagMatchTeamList(text, LEAGUE_TAG_SOCCER_HINTS)) hits.push("SOCCER");
+  for (const w of LEAGUE_TAG_WORDING_HINTS) if (w.re.test(text) && !hits.includes(w.league)) hits.push(w.league);
+  for (const [fullName, league] of playerIndex) {
+    if (text.includes(fullName) && !hits.includes(league)) hits.push(league);
+  }
+
+  if (hits.length === 1) return { league: hits[0], legLeagues: null, confidence: "high" };
+  if (hits.length > 1) return { league: "MULTI", legLeagues: [...new Set(hits)], confidence: "low" };
+  return null; // undecided -- leave blank, same as the backfill
+}
+
 async function gradeCollectionForDesk(desk, collection, mode) {
   const dateFloor = etDateDaysAgo(3);
   const base = `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.${encodeURIComponent(collection)}&select=doc_id,data,version`;
@@ -2035,8 +2179,23 @@ async function gradeCollectionForDesk(desk, collection, mode) {
     if (!(key in newsCacheByLeague)) newsCacheByLeague[key] = await getNewsDocForLeague(key);
     return newsCacheByLeague[key];
   }
+  // League auto-tag (2026-11-04, Seb's ask) -- built once per call, not per doc.
+  const leagueTagRequestIndex = collection === "pnlEntries" ? await getLeagueTagRequestIndex(desk) : null;
+  const leagueTagPlayerIndex = collection === "pnlEntries" ? await getLeagueTagPlayerIndex() : null;
   for (const doc of docs) {
     const data = doc.data;
+    // League auto-tag: fills a genuinely blank league on any bet doc, independent of its
+    // grading status -- a settled/protected/cashout bet still needs tagging, it just skips
+    // every grading step below. Never touches a doc that already has a league (MULTI with
+    // legLeagues:null included) -- that's a prior decision, not this pass's to make.
+    if (collection === "pnlEntries" && data.type === "bet" && leagueTagIsBlank(data.league)) {
+      const inferred = inferLeagueForBet(data, leagueTagRequestIndex, leagueTagPlayerIndex);
+      if (inferred) {
+        await upsertDoc(desk, collection, doc.doc_id, { ...data, league: inferred.league, legLeagues: inferred.legLeagues, leagueSource: "auto", leagueConfidence: inferred.confidence });
+        data.league = inferred.league;
+        data.legLeagues = inferred.legLeagues;
+      }
+    }
     // A protected (Early Exit / manually-locked) bet is permanent per Post-Cutover Sync's
     // own LOCK rule -- the engine must never re-grade it, in shadow OR live mode. Found
     // 2026-10-30: the shadow grader would have flipped a real protected win back to a
@@ -2241,6 +2400,35 @@ app.get("/internal/jobs/grade-dry-run", async (req, res) => {
   try {
     const graded = await gradeOneLeg({ text, type }, date);
     res.json(graded);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Dry run for the league auto-tag (2026-11-04, Seb's ask, item 4): reports what WOULD be
+// written for every CURRENTLY-blank-league bet dated within the last `days` (default 3,
+// i.e. "today's bets" plus a little slack), on both desks. No writes.
+app.get("/internal/jobs/league-autotag-test", async (req, res) => {
+  try {
+    const days = Number(req.query.days) || 3;
+    const dateFloor = etDateDaysAgo(days);
+    const playerIndex = await getLeagueTagPlayerIndex();
+    const out = {};
+    for (const desk of DESKS) {
+      const requestIndex = await getLeagueTagRequestIndex(desk);
+      const r = await supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data`);
+      const docs = await r.json();
+      const rows = [];
+      for (const doc of docs) {
+        const d = doc.data || {};
+        if (d.type !== "bet" || !leagueTagIsBlank(d.league)) continue;
+        if (!d.date || d.date < dateFloor) continue;
+        const inferred = inferLeagueForBet(d, requestIndex, playerIndex);
+        rows.push({ docId: doc.doc_id, date: d.date, ticket: (d.desc || d.ticketId || "").slice(0, 60), wouldSet: inferred || null });
+      }
+      out[desk] = rows;
+    }
+    res.json({ ok: true, dateFloor, playerIndexSize: playerIndex.size, ...out });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
