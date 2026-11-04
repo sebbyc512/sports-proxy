@@ -2195,6 +2195,18 @@ async function gradeCollectionForDesk(desk, collection, mode) {
         data.league = inferred.league;
         data.legLeagues = inferred.legLeagues;
       }
+    } else if (collection === "pnlEntries" && data.type === "bet" && typeof data.league === "string") {
+      // Case normalization (2026-11-04, Seb's ask): the app sometimes writes a title-case
+      // league (e.g. "Soccer") instead of the engine's uppercase convention. Uppercase an
+      // existing value in place -- this never changes WHICH league is recorded, only its
+      // casing, so it's safe even though the doc already "has" a league.
+      const upperLeague = data.league.toUpperCase();
+      const upperLegLeagues = Array.isArray(data.legLeagues) ? data.legLeagues.map((l) => (typeof l === "string" ? l.toUpperCase() : l)) : data.legLeagues;
+      if (upperLeague !== data.league || JSON.stringify(upperLegLeagues) !== JSON.stringify(data.legLeagues)) {
+        await upsertDoc(desk, collection, doc.doc_id, { ...data, league: upperLeague, legLeagues: upperLegLeagues });
+        data.league = upperLeague;
+        data.legLeagues = upperLegLeagues;
+      }
     }
     // A protected (Early Exit / manually-locked) bet is permanent per Post-Cutover Sync's
     // own LOCK rule -- the engine must never re-grade it, in shadow OR live mode. Found
