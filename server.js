@@ -2026,6 +2026,15 @@ async function gradeCollectionForDesk(desk, collection, mode) {
     docs = await listRes.json();
   }
   const results = [];
+  // News cache for this call only (2026-11-04, Seb's ask -- newsFlag/newsTiming on a lost
+  // leg): one read per distinct league across every doc graded this pass, never per-leg.
+  const newsCacheByLeague = {};
+  async function getCachedNewsForLeague(leagueRaw) {
+    const key = (leagueRaw || "").toLowerCase();
+    if (!NEWS_LEAGUES[key]) return null;
+    if (!(key in newsCacheByLeague)) newsCacheByLeague[key] = await getNewsDocForLeague(key);
+    return newsCacheByLeague[key];
+  }
   for (const doc of docs) {
     const data = doc.data;
     // A protected (Early Exit / manually-locked) bet is permanent per Post-Cutover Sync's
@@ -2065,6 +2074,33 @@ async function gradeCollectionForDesk(desk, collection, mode) {
       if (graded.status !== (l.status || "pending")) {
         newLegs[i] = { ...l, status: graded.status };
         changed = true;
+        // newsFlag/newsTiming (2026-11-04, Seb's ask): only on a leg that just became
+        // LOST, and only when it matches a real Out/Doubtful injury or transaction news
+        // item for its player/team -- split by whether that news predates the bet
+        // (newsTiming "before_bet", a real foreseeable-miss case) or came in after the
+        // bet was already placed ("after_bet", not foreseeable). Never touches a won/push
+        // leg; never invents a match.
+        if (graded.status === "lost") {
+          const news = await getCachedNewsForLeague(data.league).catch(() => null);
+          if (news) {
+            let matchedDate = null;
+            for (const inj of news.injuries || []) {
+              if (!["out", "doubtful"].includes((inj.status || "").toLowerCase())) continue;
+              if (matchLegToInjury(l.text, inj)) { matchedDate = inj.date; break; }
+            }
+            if (!matchedDate) {
+              for (const txn of news.transactions || []) {
+                if (matchLegToTransaction(l.text, txn)) { matchedDate = txn.date; break; }
+              }
+            }
+            if (matchedDate) {
+              const newsMs = new Date(matchedDate).getTime();
+              const betMs = new Date(data.createdAt).getTime();
+              const timing = Number.isFinite(newsMs) && Number.isFinite(betMs) && newsMs < betMs ? "before_bet" : "after_bet";
+              newLegs[i] = { ...newLegs[i], newsFlag: true, newsTiming: timing };
+            }
+          }
+        }
       }
     }
     const newTicketStatus = rollUpTicketStatus(newLegs);
@@ -4626,6 +4662,289 @@ app.get("/internal/jobs/cbb-daily-fire-test", async (req, res) => {
     res.json({ ok: true, urlSet, tokenSet, fired: true });
   } catch (err) {
     res.status(502).json({ ok: false, urlSet, tokenSet, fired: false, error: err.message });
+  }
+});
+
+// --- News layer (2026-11-04, Seb's request, additive, code-only -- fires no Claude
+// routine, ever). Collections "news" and "news"/"notifiedState" are NOT in
+// docs_app_insert_dispatch's collection whitelist ('requests'/'appUploads'/'appEdits')
+// and NOT in sync-needed's SYNC_NEEDED_COLLECTIONS -- writing to them cannot trigger any
+// wake/Claude run through any existing path. Soccer is intentionally excluded below --
+// ESPN's injuries/transactions feeds are confirmed empty for soccer (2026-11-04); soccer
+// injury context stays on the existing sofascore/fotmob Claude routine (rule
+// soccer-stats-source), unaffected by any of this.
+const NEWS_LEAGUES = {
+  nfl: { sport: "football", league: "nfl", hasTransactions: true },
+  nba: { sport: "basketball", league: "nba", hasTransactions: true },
+  nhl: { sport: "hockey", league: "nhl", hasTransactions: true },
+  cbb: { sport: "basketball", league: "mens-college-basketball", hasTransactions: true },
+  cfb: { sport: "football", league: "college-football", hasTransactions: false }, // confirmed empty/non-existent for CFB
+};
+
+function extractInjuryItems(teamsBlock) {
+  const items = [];
+  for (const team of teamsBlock || []) {
+    for (const inj of team.injuries || []) {
+      const a = inj.athlete || {};
+      items.push({
+        player: a.displayName || null,
+        lastName: a.lastName || null,
+        team: { abbr: a.team?.abbreviation || null, location: a.team?.location || team.displayName || null, name: a.team?.name || null },
+        position: a.position?.abbreviation || null,
+        status: inj.status || null,
+        date: inj.date || null,
+        note: inj.shortComment || null,
+      });
+    }
+  }
+  return items;
+}
+
+function extractTransactionItems(txns) {
+  return (txns || []).map((t) => ({
+    date: t.date || null,
+    team: { abbr: t.team?.abbreviation || null, location: t.team?.location || null, name: t.team?.name || null },
+    description: t.description || null,
+  }));
+}
+
+async function fetchLeagueNewsRaw(key) {
+  const cfg = NEWS_LEAGUES[key];
+  const result = { injuries: null, injuriesError: null, transactions: null, transactionsError: null };
+  try {
+    const j = await getJson(`${ESPN_BASE}/${cfg.sport}/${cfg.league}/injuries`);
+    result.injuries = extractInjuryItems(j.injuries);
+  } catch (err) {
+    result.injuriesError = err.message;
+  }
+  if (cfg.hasTransactions) {
+    try {
+      const j = await getJson(`${ESPN_BASE}/${cfg.sport}/${cfg.league}/transactions`);
+      result.transactions = extractTransactionItems(j.transactions);
+    } catch (err) {
+      result.transactionsError = err.message;
+    }
+  } else {
+    result.transactions = [];
+  }
+  return result;
+}
+
+// Stale-on-failure write (2026-11-04, Seb's ask): never silently wipes a league's news to
+// empty just because one poll errored or regressed from real data to zero. Keeps the
+// PREVIOUS sub-feed's items in that case and marks it stale -- CFB's always-empty
+// transactions feed never trips this (it never "had items" to regress from).
+async function writeLeagueNewsDoc(key) {
+  const fresh = await fetchLeagueNewsRaw(key);
+  const prevRes = await supabaseFetch(`/docs?desk_id=eq.main&collection=eq.news&doc_id=eq.${key}&select=data`);
+  const prevRows = await prevRes.json();
+  const prev = prevRows[0]?.data || {};
+
+  function resolve(freshItems, freshError, prevItems) {
+    if (freshError) return { items: prevItems || [], stale: true, reason: freshError };
+    if ((freshItems || []).length === 0 && (prevItems || []).length > 0) {
+      return { items: prevItems, stale: true, reason: "regressed to 0 items this run" };
+    }
+    return { items: freshItems || [], stale: false, reason: null };
+  }
+
+  const inj = resolve(fresh.injuries, fresh.injuriesError, prev.injuries);
+  const tx = resolve(fresh.transactions, fresh.transactionsError, prev.transactions);
+  const now = new Date().toISOString();
+  const doc = {
+    league: key,
+    injuries: inj.items,
+    injuriesStale: inj.stale,
+    injuriesStaleReason: inj.reason,
+    transactions: tx.items,
+    transactionsStale: tx.stale,
+    transactionsStaleReason: tx.reason,
+    lastGoodInjuriesAt: inj.stale ? prev.lastGoodInjuriesAt || null : now,
+    lastGoodTransactionsAt: tx.stale ? prev.lastGoodTransactionsAt || null : now,
+    checkedAt: now,
+  };
+  await upsertDoc("main", "news", key, doc);
+  return doc;
+}
+
+function newsTeamIdStrings(team) {
+  return [team?.abbr, team?.location, team?.name].filter(Boolean).map(normTeamName);
+}
+
+// Matching requirement (2026-11-04, Seb's ask): a bare last name with no team confirmation
+// anywhere in the leg text is NOT a match at all (too risky -- common surnames). A full
+// player name is always a high-confidence match. Last name + team ABBREVIATION is also
+// high-confidence; last name + team CITY/NICKNAME only is "ambiguous" -- still reported,
+// but hedged as "may affect" rather than asserted, per Seb's explicit ask not to skip it.
+function matchLegToInjury(legText, injury) {
+  const text = normTeamName(legText);
+  if (!text || !injury?.player) return null;
+  const full = normTeamName(injury.player);
+  if (full && text.includes(full)) return { confidence: "high" };
+  const last = normTeamName(injury.lastName);
+  if (!last || !text.includes(last)) return null;
+  const abbrNorm = injury.team?.abbr ? normTeamName(injury.team.abbr) : null;
+  const abbrMatch = abbrNorm && text.includes(abbrNorm);
+  const anyTeamMatch = newsTeamIdStrings(injury.team).some((t) => text.includes(t));
+  if (!anyTeamMatch) return null; // last name alone, zero team confirmation -- not a match
+  return { confidence: abbrMatch ? "high" : "ambiguous" };
+}
+
+function matchLegToTransaction(legText, txn) {
+  const text = normTeamName(legText);
+  if (!text) return null;
+  if (!newsTeamIdStrings(txn?.team).some((t) => text.includes(t))) return null;
+  return { confidence: "high" };
+}
+
+async function getNewsDocForLeague(key) {
+  const r = await supabaseFetch(`/docs?desk_id=eq.main&collection=eq.news&doc_id=eq.${key}&select=data`);
+  const rows = await r.json();
+  return rows[0]?.data || null;
+}
+
+async function getNotifiedState() {
+  const r = await supabaseFetch(`/docs?desk_id=eq.main&collection=eq.news&doc_id=eq.notifiedState&select=data`);
+  const rows = await r.json();
+  return rows[0]?.data || { keys: {} };
+}
+
+// Steve's private-chat routing (2026-11-04, Seb's ask): hardcoded, with a startup assertion
+// that it can never equal the group chat id -- same belt-and-suspenders pattern as the
+// one-off Steve weekly-report endpoint already uses. A news alert also runs through the
+// SAME dollar-amount guard the group-post path uses (GROUP_DOLLAR_AMOUNT_RE), even though
+// these are private DMs never headed to the group -- this feature's own text generation
+// should never produce a $ amount at all, so this is a safety net, not the primary control.
+const NEWS_STEVE_CHAT_ID = "1294297670";
+if (NEWS_STEVE_CHAT_ID === TELEGRAM_GROUP_CHAT_ID) {
+  throw new Error("FATAL: NEWS_STEVE_CHAT_ID equals TELEGRAM_GROUP_CHAT_ID -- refusing to start.");
+}
+
+async function sendNewsAlertDm(desk, text) {
+  if (GROUP_DOLLAR_AMOUNT_RE.test(text)) {
+    console.error("news-check: DM blocked by $-guard, not sent. desk:", desk);
+    return { sent: false, blocked: true };
+  }
+  const chatId = desk === "steve" ? NEWS_STEVE_CHAT_ID : TELEGRAM_SEB_CHAT_ID;
+  if (!chatId) return { sent: false, error: "chat id not configured" };
+  if (chatId === TELEGRAM_GROUP_CHAT_ID) throw new Error("news-check: refusing to send -- chat id resolved to the group.");
+  await sendTelegramRaw(chatId, text, false);
+  return { sent: true };
+}
+
+// Dedupe key = player + status + betId (2026-11-04, Seb's ask): a bet placed AFTER news
+// already existed still gets its own alert, since it's a new key. One DM per owner still
+// bundles every newly-affected ticket for that same underlying news, rather than one DM
+// per ticket.
+async function checkOpenBetsAgainstNews(newsByLeague) {
+  const notified = await getNotifiedState();
+  const newKeys = {};
+  const dmsByDesk = {};
+
+  for (const desk of ["main", "steve"]) {
+    const r = await supabaseFetch(`/docs?desk_id=eq.${desk}&collection=eq.pnlEntries&select=doc_id,data`);
+    const docs = await r.json();
+    for (const doc of docs) {
+      const d = doc.data || {};
+      if (d.type !== "bet") continue;
+      if (!["pending", "needs_review"].includes(d.status)) continue;
+      const leagueKey = (d.league || "").toLowerCase();
+      const news = newsByLeague[leagueKey];
+      if (!news) continue;
+      for (const leg of d.legs || []) {
+        for (const inj of news.injuries || []) {
+          if (!["out", "doubtful"].includes((inj.status || "").toLowerCase())) continue;
+          const m = matchLegToInjury(leg.text, inj);
+          if (!m) continue;
+          const key = `inj|${normTeamName(inj.player)}|${(inj.status || "").toLowerCase()}|${doc.doc_id}`;
+          if (notified.keys?.[key]) continue;
+          newKeys[key] = { at: new Date().toISOString() };
+          (dmsByDesk[desk] ||= []).push({ betLabel: d.desc || d.ticketId || doc.doc_id, player: inj.player, status: inj.status, confidence: m.confidence });
+        }
+        for (const txn of news.transactions || []) {
+          const m2 = matchLegToTransaction(leg.text, txn);
+          if (!m2) continue;
+          const teamKey = normTeamName(txn.team?.abbr || txn.team?.name || "");
+          const key = `txn|${teamKey}|${txn.date}|${doc.doc_id}`;
+          if (notified.keys?.[key]) continue;
+          newKeys[key] = { at: new Date().toISOString() };
+          (dmsByDesk[desk] ||= []).push({ betLabel: d.desc || d.ticketId || doc.doc_id, transaction: true, team: txn.team?.abbr || txn.team?.name });
+        }
+      }
+    }
+  }
+
+  const sentSummary = { main: 0, steve: 0 };
+  for (const desk of Object.keys(dmsByDesk)) {
+    const items = dmsByDesk[desk];
+    if (!items.length) continue;
+    const lines = items.map((it) => {
+      if (it.transaction) return `Team news for ${it.team} -- may affect: ${it.betLabel}`;
+      const hedge = it.confidence === "ambiguous" ? "may affect" : "affects";
+      return `${it.player} now ${it.status} -- ${hedge}: ${it.betLabel}`;
+    });
+    const text = `\u{1F4F0} News check:\n${lines.join("\n")}`;
+    const r = await sendNewsAlertDm(desk, text).catch((err) => ({ sent: false, error: err.message }));
+    if (r.sent) sentSummary[desk] += items.length;
+  }
+
+  if (Object.keys(newKeys).length) {
+    await upsertDoc("main", "news", "notifiedState", { keys: { ...(notified.keys || {}), ...newKeys } });
+  }
+  return { newAlerts: Object.keys(newKeys).length, sentSummary };
+}
+
+async function runNewsCheck() {
+  const newsByLeague = {};
+  const counts = {};
+  for (const key of Object.keys(NEWS_LEAGUES)) {
+    const doc = await writeLeagueNewsDoc(key);
+    newsByLeague[key] = doc;
+    counts[key] = { injuries: doc.injuries.length, transactions: doc.transactions.length, injuriesStale: doc.injuriesStale, transactionsStale: doc.transactionsStale };
+  }
+  const betCheck = await checkOpenBetsAgainstNews(newsByLeague);
+  return { counts, ...betCheck };
+}
+
+app.get("/internal/jobs/news-check", async (req, res) => {
+  try {
+    const result = await runNewsCheck();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Fast path (2026-11-04, Seb's ask -- NFL inactives post ~90 min before kickoff): every 30
+// min, but a cheap no-op unless an open bet (either desk) has a leg kicking off within the
+// next 3 hours -- only then does it actually hit ESPN/run the full check. Still code-only,
+// zero Claude usage either way.
+app.get("/internal/jobs/news-check-fast", async (req, res) => {
+  try {
+    const now = Date.now();
+    const horizon = now + 3 * 60 * 60 * 1000;
+    let imminent = false;
+    for (const desk of ["main", "steve"]) {
+      const r = await supabaseFetch(`/docs?desk_id=eq.${desk}&collection=eq.pnlEntries&select=data`);
+      const docs = await r.json();
+      for (const doc of docs) {
+        const d = doc.data || {};
+        if (d.type !== "bet" || !["pending", "needs_review"].includes(d.status)) continue;
+        const t = d.lastStart || d.firstStart;
+        if (!t) continue;
+        const ts = new Date(t).getTime();
+        if (Number.isFinite(ts) && ts > now && ts <= horizon) {
+          imminent = true;
+          break;
+        }
+      }
+      if (imminent) break;
+    }
+    if (!imminent) return res.json({ ok: true, action: "none", imminent: false });
+    const result = await runNewsCheck();
+    res.json({ ok: true, imminent: true, ...result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
   }
 });
 
