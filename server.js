@@ -1747,6 +1747,17 @@ function settlePnlRet(status, data) {
   return undefined; // not a terminal status -- caller must not write ret from this
 }
 
+// Leg-status vocabulary is normally "hit"/"miss"/"push"/"pending"/"needs_review", but a
+// manual correction (an app edit, or Claude fixing a bet by hand) sometimes writes the
+// ticket-level words "lost"/"won" onto a LEG instead -- treat those as synonyms for
+// "miss"/"hit" respectively, rather than as unrecognized, so a manual fix can't itself
+// get silently re-flipped by the vacuous-won bug below (found 2026-11-03: a hand-reverted
+// FTD leg written as status:"lost" wasn't recognized as a miss, fell through to the old
+// unconditional "every leg is hit or push" default, and the next live grader tick flipped
+// the ticket back to "won" and sent a wrong WON alert).
+const LEG_LOSS_STATUSES = new Set(["miss", "lost"]);
+const LEG_WIN_STATUSES = new Set(["hit", "won", "push"]);
+
 function rollUpTicketStatus(legs) {
   // An empty/missing legs array is a malformed-doc signal (e.g. a double-wrapped
   // Supabase row where the real legs sit one level deeper) -- NOT "every leg resolved."
@@ -1759,10 +1770,16 @@ function rollUpTicketStatus(legs) {
   // left real losers stuck "needs_review" forever instead of resolving to "lost" the
   // moment any leg missed -- found 2026-10-30 comparing shadow-grader output to real
   // production results.
-  if (legs.some((l) => l.status === "miss")) return "lost";
+  if (legs.some((l) => LEG_LOSS_STATUSES.has(l.status))) return "lost";
   if (legs.some((l) => l.status === "needs_review")) return "needs_review";
   if (legs.some((l) => l.status === "pending")) return "pending";
-  return "won"; // every leg is hit or push
+  // Every leg must be AFFIRMATIVELY recognized as a win/push to call the ticket won --
+  // never a vacuous default. An unrecognized leg status (a typo, a future new status this
+  // function hasn't learned yet, anything that isn't one of the sets above) falls to
+  // needs_review instead of silently becoming "won" -- this is the actual fix for the
+  // 2026-11-03 incident, not just the "lost" synonym above.
+  if (legs.every((l) => LEG_WIN_STATUSES.has(l.status))) return "won";
+  return "needs_review";
 }
 
 app.get("/internal/jobs/grader", async (req, res) => {
@@ -1780,11 +1797,18 @@ app.get("/internal/jobs/grader", async (req, res) => {
     const results = [];
     for (const doc of docs) {
       const data = doc.data;
-      // Same guard as gradeCollectionForDesk below (see its comment): a protected/cashout
-      // bet's legs can still be "pending" -- without this, re-grading them for real and
-      // rolling up a fresh status overwrites a real manual lock/cash-out the moment the
-      // game goes final. This route had no such guard at all until 2026-11-02.
-      if (data.protected === true || data.status === "cashout") continue;
+      // TERMINAL LOCK (2026-11-03, Seb's ask, after a manually-reverted FTD bet got flipped
+      // back by the next grader tick): once a ticket is already won/lost/push/cashout --
+      // whether by this engine, the stuck-bet resolver, or a manual app edit -- the engine
+      // never re-grades it again, period. The only way back in is a manual "pending" app
+      // edit (Post-Cutover Sync Phase 0b's "pending" action), which clears the status and
+      // makes it eligible again on its own, no special-case needed here. Same guard as
+      // gradeCollectionForDesk below (see its comment) -- a protected/cashout bet's legs can
+      // still be "pending", so without this, re-grading them for real and rolling up a fresh
+      // status overwrites a real manual lock/cash-out/settlement the moment the game goes
+      // final. This route had no such guard at all until 2026-11-02 (protected/cashout only;
+      // won/lost/push added 2026-11-03).
+      if (data.protected === true || ["won", "lost", "push", "cashout"].includes(data.status)) continue;
       const legs = data.legs || [];
       // Re-check "needs_review" too, not just "pending" -- a leg can land on needs_review
       // while its game is still in progress (stillAwaitingResult correctly defers a hard
@@ -1897,6 +1921,16 @@ async function gradeCollectionForDesk(desk, collection, mode) {
     // real $135.07 cashout to "lost"/ret:0 in Supabase this way. Restored by hand; this
     // guard is the actual fix.
     if (data.status === "cashout") continue;
+    // TERMINAL LOCK (2026-11-03, Seb's ask): once a ticket is already won/lost/push -- by
+    // this engine, the stuck-bet resolver, or a manual app edit -- never re-grade it again.
+    // Before this, a ticket's CURRENT status being won/lost/push didn't exempt it: the
+    // pendingIdx/rollUpTicketStatus pass below still ran every tick (intentionally, to catch
+    // a stale ticket-level status behind already-graded legs), which is exactly how an
+    // already-correct "lost" got silently flipped back to "won" by the vacuous-won bug in
+    // rollUpTicketStatus on 2026-11-03. The only way back in is a manual "pending" app edit
+    // (Post-Cutover Sync Phase 0b), which clears `status` and makes the doc eligible again
+    // with no special-case needed here.
+    if (["won", "lost", "push"].includes(data.status)) continue;
     const legs = data.legs || [];
     const pendingIdx = legs
       .map((l, i) => ({ l, i }))
