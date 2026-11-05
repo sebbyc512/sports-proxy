@@ -1221,46 +1221,48 @@ app.get("/internal/jobs/self-heal", async (req, res) => {
 // settling, a deposit/withdrawal, or a DraftKings-match adjustment. This is a tripwire, not a
 // fixer -- it never writes anything to pnlEntries itself, only reads and alerts.
 const BALANCE_GUARD_THRESHOLD = 50;
-const BALANCE_GUARD_EXPLAIN_TOLERANCE = 2; // rounding/odds-math slack before calling a delta "unexplained"
 
-function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+// BALANCE FORMULA (2026-11-05, Seb's rule: "must match the app, exactly") -- ported verbatim
+// from the real app's own data.js loadDesk(), NOT the simpler start+deposits-withdrawals+pnl
+// sum this guard used before 2026-11-05 (that gave main $1190.36 while the app showed ~$1,500+
+// in play -- wrong, because it ignored the app's own DK-match anchor mechanic entirely). The
+// app pins the balance to the most recent "Balance update: set to $X" (adj-/type:"adjust") row
+// -- the DraftKings-match anchor -- then adds only what happened AFTER it: full net of bets
+// placed after the anchor, the full payout (not net) of bets that were still open AT the
+// anchor and have since settled (their stake was already removed from the DK balance the
+// anchor captured), and deposits/withdrawals dated after it. Falls back to the plain
+// start+deposits-withdrawals+pnl sum only when there is no anchor row at all. Keep this in
+// lockstep with data.js's loadDesk() if that formula ever changes -- the two must never drift.
+const bgN = (v) => (v === null || v === undefined || v === "" ? 0 : Number(v) || 0);
+const bgPick = (o, ...keys) => {
+  for (const k of keys) if (o && o[k] !== undefined && o[k] !== null && o[k] !== "") return o[k];
+  return undefined;
+};
+const bgTs = (v) => {
+  if (!v) return 0;
+  const str = String(v);
+  const t = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(str) ? str + "T23:59:59" : str);
+  return Number.isNaN(t) ? 0 : t;
+};
+function bgIsAdjRow(docId, d) {
+  return /^adj-/i.test(docId) || /adjust|balance|sync/i.test(String(d.type || ""));
 }
 
-// Same inPnl() gate Post-Cutover Sync's balanceUpdate math uses: a history-only row (stats
-// tracking, never money) or one dated before the desk's own balance-start floor never counts.
-function inPnlGuard(d, settingsDate) {
-  if (d.history) return false;
-  if (!settingsDate) return true;
-  return (d.date || todayIso()) >= settingsDate;
-}
-
-// One lightweight fingerprint per pnlEntries doc -- just enough fields to tell, on the NEXT
-// run, whether this exact doc is new or changed in a way that would move the balance. Never
-// stores leg text/analysis/etc -- this state doc is a monitoring checkpoint, not a mirror.
-function balanceGuardFingerprint(d) {
+// One lightweight fingerprint per pnlEntries doc -- just enough fields for the explain-delta
+// heuristic below to tell, on the NEXT run, whether this exact doc is new or changed in a way
+// that would move the balance. Never stores leg text/analysis/etc -- this state doc is a
+// monitoring checkpoint, not a mirror. (The actual balance NUMBER is recomputed from scratch
+// every run via the anchored formula below, never accumulated from these fingerprints.)
+function balanceGuardFingerprint(docId, d) {
   return {
-    type: d.type || "bet",
+    docId,
+    isAdj: bgIsAdjRow(docId, d),
+    type: d.type || (/^wd-/i.test(docId) ? "withdrawal" : /^dep-/i.test(docId) ? "deposit" : "bet"),
     status: d.status ?? null,
-    amount: Number(d.amount) || 0,
-    stake: Number(d.stake) || 0,
+    amount: bgN(bgPick(d, "amount", "value", "stake")),
+    stake: bgN(d.stake),
     ret: d.ret === null || d.ret === undefined ? null : Number(d.ret),
-    bonus: d.bonus === true,
-    odds: d.odds ?? null,
-    boost: Number(d.boost) || 0,
-    history: !!d.history,
-    protected: !!d.protected,
   };
-}
-
-// The amount a single pnlEntries doc should contribute to the running balance, same shape as
-// PCS's 0b balanceUpdate `bal` computation: deposit/adjust add `amount`, withdrawal subtracts
-// it, a bet's net is pnlDelta() (already nets stake against payout, bonus-aware).
-function balanceGuardContribution(fp) {
-  if (fp.type === "deposit" || fp.type === "adjust") return fp.amount;
-  if (fp.type === "withdrawal") return -fp.amount;
-  if (fp.type === "bet") return pnlDelta(fp);
-  return 0;
 }
 
 async function computeDeskBalance(desk) {
@@ -1268,58 +1270,116 @@ async function computeDeskBalance(desk) {
     getDoc(desk, "pnl", "settings"),
     supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data`),
   ]);
-  const start = Number(settingsDoc?.data?.start) || 0;
-  const settingsDate = settingsDoc?.data?.date || null;
-  const entries = await entriesRes.json();
+  const settings = settingsDoc?.data || {};
+  const start = bgN(bgPick(settings, "start", "startBalance", "startingBalance", "starting", "startAmount", "startingBankroll", "bankroll", "initialBalance"));
+  const rows = await entriesRes.json();
 
   const fingerprints = {};
-  let balance = start;
-  for (const row of entries) {
+  const bets = [];
+  const cashRows = [];
+  const adjRows = [];
+  for (const row of rows) {
     const d = row.data || {};
-    if (!inPnlGuard(d, settingsDate)) continue;
-    const fp = balanceGuardFingerprint(d);
+    const fp = balanceGuardFingerprint(row.doc_id, d);
     fingerprints[row.doc_id] = fp;
-    balance += balanceGuardContribution(fp);
+
+    if (fp.isAdj) {
+      let val = bgN(bgPick(d, "setTo", "balance", "newBalance", "target", "value"));
+      if (!val) {
+        const m = String(d.desc || d.note || "").match(/set to \$?([\d,]+(?:\.\d+)?)/i);
+        if (m) val = Number(m[1].replace(/,/g, ""));
+      }
+      const exact = bgTs(d.createdAt || d.updatedAt);
+      const day = String(d.date || (row.doc_id.match(/(\d{8})/)?.[1] || "").replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3"));
+      const dayStart = /^\d{4}-\d{2}-\d{2}$/.test(day) ? Date.parse(day + "T00:00:00") : 0;
+      if (val && (exact || bgTs(day))) adjRows.push({ val, day, t: exact || bgTs(day), tSettle: exact || dayStart });
+      continue;
+    }
+    if (d.type && d.type !== "bet") {
+      cashRows.push({
+        type: /withdraw/i.test(d.type) || /^wd-/i.test(row.doc_id) ? "withdrawal" : /deposit/i.test(d.type) || /^dep-/i.test(row.doc_id) ? "deposit" : "other",
+        amount: Math.abs(bgN(bgPick(d, "amount", "value", "stake"))),
+        date: bgPick(d, "date", "createdAt", "settledAt") || "",
+        exact: bgTs(d.createdAt),
+      });
+      continue;
+    }
+    bets.push({
+      status: (bgPick(d, "status", "result") || "open").toLowerCase(),
+      stake: bgN(bgPick(d, "stake", "risk", "wager", "amount")),
+      ret: bgN(bgPick(d, "ret", "payout", "return", "toReturn")),
+      placedAt: bgPick(d, "placedAt", "createdAt", "created_at", "date"),
+      loggedAt: bgPick(d, "createdAt", "created_at", "uploadedAt", "loggedAt") || ((String(row.doc_id).match(/(\d{13})/) || [])[1] ? new Date(Number(String(row.doc_id).match(/(\d{13})/)[1])).toISOString() : ""),
+      settledAt: bgPick(d, "settledAt", "settled_at"),
+    });
   }
-  return { balance: Math.round(balance * 100) / 100, fingerprints, start, settingsDate };
+
+  const withdrawn = cashRows.filter((c) => c.type === "withdrawal").reduce((t, c) => t + c.amount, 0);
+  const deposited = cashRows.filter((c) => c.type === "deposit").reduce((t, c) => t + c.amount, 0);
+  const settledBets = bets.filter((b) => ["won", "lost", "push", "cashout"].includes(b.status));
+  const pnlAll = settledBets.reduce((t, b) => t + (b.status === "push" ? 0 : b.ret - b.stake), 0);
+
+  adjRows.sort((a, b) => b.t - a.t);
+  const anchor = adjRows[0];
+  let anchored = 0;
+  let anchorDate = "";
+  if (anchor) {
+    anchored = anchor.val;
+    for (const b of bets) {
+      const placed = bgTs(b.placedAt);
+      const settledT = bgTs(b.settledAt);
+      const done = ["won", "lost", "push", "cashout"].includes(b.status);
+      const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(String(b.placedAt || ""));
+      const sameDay = dateOnly && String(b.placedAt) === String(anchor.day).slice(0, 10);
+      const logged = Date.parse(b.loggedAt || "") || 0;
+      const isNew = placed && (dateOnly ? (String(b.placedAt) > String(anchor.day).slice(0, 10) || (sameDay && logged > anchor.t)) : placed > anchor.t);
+      if (isNew) anchored += done ? b.ret - b.stake : -b.stake;
+      else if (done && settledT >= anchor.tSettle) anchored += b.ret;
+    }
+    for (const c of cashRows) {
+      const after = c.exact ? c.exact > anchor.t : String(c.date).slice(0, 10) > String(anchor.day).slice(0, 10);
+      if (after) anchored += c.type === "withdrawal" ? -c.amount : c.type === "deposit" ? c.amount : 0;
+    }
+    anchored = Math.round(anchored * 100) / 100;
+    anchorDate = new Date(anchor.t).toISOString();
+  }
+
+  const synced = anchored || bgN(bgPick(settings, "balance", "dkBalance", "syncedBalance"));
+  const balance = synced || start + deposited - withdrawn + pnlAll;
+  return { balance: Math.round(balance * 100) / 100, fingerprints, anchored: !!anchor, anchorDate, start };
 }
 
-// Compares the previous run's fingerprints to this run's, and sums up the balance change that
-// every doc explained by a qualifying event (new or changed deposit/withdrawal/adjust, or a
-// bet whose status just left "pending") should have produced. Whatever balance movement is
-// LEFT OVER after subtracting that is the unexplained part this guard actually alerts on.
-function balanceGuardExplainedDelta(prevFingerprints, currFingerprints) {
-  let explained = 0;
+// Finds every qualifying event since the last check: a new or re-valued DK-match anchor, a
+// new deposit/withdrawal (or an edit to one), or a bet leaving "pending"/"open" for a real
+// result. Seb's rule is binary, not a dollar reconciliation: if ANY such event happened, the
+// whole balance move is explained by definition -- never try to partially attribute how much
+// of a move "came from" which event (the anchor mechanic re-pins the ENTIRE balance, so there
+// is no clean per-doc split anyway). Only when NONE of these fired at all is a move flagged.
+function balanceGuardFindEvents(prevFingerprints, currFingerprints) {
   const events = [];
   for (const [docId, fp] of Object.entries(currFingerprints)) {
     const prev = prevFingerprints[docId];
     if (!prev) {
-      // Brand-new doc since last check.
-      if (fp.type === "deposit" || fp.type === "adjust" || fp.type === "withdrawal") {
-        explained += balanceGuardContribution(fp);
-        events.push({ docId, type: fp.type, why: "new deposit/withdrawal/adjust" });
-      } else if (fp.type === "bet" && fp.status && fp.status !== "pending" && fp.status !== "needs_review") {
-        explained += balanceGuardContribution(fp);
+      if (fp.isAdj) events.push({ docId, type: "adjust", why: "new DK-match anchor" });
+      else if (fp.type === "deposit" || fp.type === "withdrawal") events.push({ docId, type: fp.type, why: `new ${fp.type}` });
+      else if (fp.type === "bet" && fp.status && !["pending", "needs_review", "open"].includes(fp.status))
         events.push({ docId, type: "bet", why: `new bet already ${fp.status}` });
-      }
       continue;
     }
-    if (fp.type !== prev.type) continue; // a type change is itself unexplained -- never paper over it
+    if (fp.isAdj || prev.isAdj) {
+      if (fp.isAdj !== prev.isAdj || fp.amount !== prev.amount) events.push({ docId, type: "adjust", why: "DK-match anchor changed" });
+      continue;
+    }
+    if (fp.type !== prev.type) continue; // a type change with no adj row involved is itself unexplained
     if (fp.type === "bet") {
-      const wasOpen = !prev.status || prev.status === "pending" || prev.status === "needs_review";
-      const nowSettled = fp.status && fp.status !== "pending" && fp.status !== "needs_review";
-      if (wasOpen && nowSettled) {
-        explained += balanceGuardContribution(fp);
-        events.push({ docId, type: "bet", why: `bet settled (${fp.status})` });
-      }
-    } else if (fp.type === "deposit" || fp.type === "adjust" || fp.type === "withdrawal") {
-      if (fp.amount !== prev.amount) {
-        explained += balanceGuardContribution(fp) - balanceGuardContribution(prev);
-        events.push({ docId, type: fp.type, why: "deposit/withdrawal/adjust amount changed" });
-      }
+      const wasOpen = !prev.status || ["pending", "needs_review", "open"].includes(prev.status);
+      const nowSettled = fp.status && !["pending", "needs_review", "open"].includes(fp.status);
+      if (wasOpen && nowSettled) events.push({ docId, type: "bet", why: `bet settled (${fp.status})` });
+    } else if ((fp.type === "deposit" || fp.type === "withdrawal") && fp.amount !== prev.amount) {
+      events.push({ docId, type: fp.type, why: `${fp.type} amount changed` });
     }
   }
-  return { explained: Math.round(explained * 100) / 100, events };
+  return events;
 }
 
 async function balanceGuardCheckDesk(desk, dryRun) {
@@ -1339,12 +1399,15 @@ async function balanceGuardCheckDesk(desk, dryRun) {
 
   const prevBalance = Number(prevState.data.balance) || 0;
   const rawDelta = Math.round((current.balance - prevBalance) * 100) / 100;
-  const { explained, events } = balanceGuardExplainedDelta(prevState.data.fingerprints || {}, current.fingerprints);
-  const unexplained = Math.round((rawDelta - explained) * 100) / 100;
+  const events = balanceGuardFindEvents(prevState.data.fingerprints || {}, current.fingerprints);
+  // Binary per Seb's rule: any qualifying event at all makes the WHOLE move explained (no
+  // per-doc dollar attribution -- see balanceGuardFindEvents for why). Only a move with zero
+  // qualifying events, past the threshold, is unexplained.
+  const unexplained = events.length > 0 ? 0 : rawDelta;
 
-  const result = { desk, rawDelta, explained, unexplained, events, balance: current.balance };
+  const result = { desk, rawDelta, unexplained, events, balance: current.balance };
 
-  if (Math.abs(unexplained) <= BALANCE_GUARD_THRESHOLD + BALANCE_GUARD_EXPLAIN_TOLERANCE) {
+  if (Math.abs(unexplained) <= BALANCE_GUARD_THRESHOLD) {
     result.action = "no-op";
     if (!dryRun) {
       await upsertDoc(desk, "balanceGuardState", "status", {
@@ -1375,7 +1438,6 @@ async function balanceGuardCheckDesk(desk, dryRun) {
       desk,
       foundAt: new Date().toISOString(),
       rawDelta,
-      explained,
       unexplained,
       events,
     });
