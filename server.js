@@ -3454,7 +3454,8 @@ const BEYONDELO_ALIASES = {
   "vfb stuttgart": "vfb-stuttgart", "stuttgart": "vfb-stuttgart", "psg": "paris-saint-germain",
   "paris st germain": "paris-saint-germain", "sporting lisbon": "sporting-cp", "sporting": "sporting-cp",
   "dortmund": "borussia-dortmund", "monza brianza": "monza", "lecce": "us-lecce",
-  "deportivo": "deportivo-la-coruna", "shakhtar": "shakhtar-donetsk", "elversberg": "sv-elversberg",
+  "deportivo": "deportivo", "dep la coruna": "deportivo", "deportivo la coruna": "deportivo",
+  "shakhtar": "shakhtar-donetsk", "elversberg": "sv-elversberg",
 };
 
 function resolveBeyondEloSlug(teamName, clubsByName) {
@@ -5947,7 +5948,8 @@ async function getDkSoccerMoneylinesToday() {
         if (!h2h) continue;
         const homePrice = h2h.outcomes?.find((o) => o.name === g.home_team)?.price;
         const awayPrice = h2h.outcomes?.find((o) => o.name === g.away_team)?.price;
-        games.push({ homeTeam: g.home_team, awayTeam: g.away_team, commenceTime: g.commence_time, homePrice, awayPrice });
+        const leagueCode = Object.keys(ODDS_API_SOCCER_SPORT_KEYS).find((k) => ODDS_API_SOCCER_SPORT_KEYS[k] === sportKey);
+        games.push({ homeTeam: g.home_team, awayTeam: g.away_team, commenceTime: g.commence_time, homePrice, awayPrice, league: leagueCode });
       }
     } catch (err) {
       console.error(`soccer odds fetch failed for ${sportKey}: ${err.message}`);
@@ -6005,6 +6007,31 @@ async function attachSoccerEloAndOdds(fixtures) {
   return fixtures;
 }
 
+// eloEdge fallback (2026-11-05, Seb's ask): builds a lighter fixture list straight from
+// the DK odds events we fetch anyway, with no fixtureId, so ELO/eloEdge still fills in on a
+// day API-Football is out of calls or returns nothing. The lineup/injury check still needs
+// a real fixtureId and API-Football, so these fallback fixtures just won't get checked for
+// lineups -- that's expected; this path exists for eloEdge continuity, not lineup alerts.
+function buildFallbackFixturesFromDkOdds(games) {
+  const byKey = new Map();
+  for (const g of games) {
+    if (isMilanFixture(g.homeTeam, g.awayTeam)) continue;
+    const key = `${g.homeTeam}|${g.awayTeam}|${g.commenceTime}`;
+    if (byKey.has(key)) continue;
+    byKey.set(key, {
+      fixtureId: null,
+      league: g.league || null,
+      leagueId: null,
+      kickoff: g.commenceTime,
+      status: "NS",
+      home: g.homeTeam,
+      away: g.awayTeam,
+      source: "dk-odds-fallback",
+    });
+  }
+  return [...byKey.values()];
+}
+
 // The actual API-Football fetch (2 calls, today ET + tomorrow ET) -- ONLY called once per
 // calendar day, never per-tick. Reduces each fixture to just the fields anything downstream
 // needs, so the cached-from-Supabase path and the freshly-fetched path return the exact
@@ -6013,31 +6040,55 @@ async function fetchSoccerCandidateFixturesFresh() {
   const targetIds = new Set(Object.values(API_FOOTBALL_LEAGUE_IDS));
   const dates = [etDateDaysAgo(0), etDateDaysAgo(-1)]; // today ET, tomorrow ET
   const byId = new Map();
-  for (const date of dates) {
-    const j = await apiFootballGuardedCall(`/fixtures?date=${date}`);
-    for (const f of j.response || []) {
-      if (!targetIds.has(f.league?.id)) continue;
-      const home = f.teams?.home?.name;
-      const away = f.teams?.away?.name;
-      if (isMilanFixture(home, away)) continue;
-      byId.set(f.fixture.id, {
-        fixtureId: f.fixture.id,
-        league: f.league?.name,
-        leagueId: f.league?.id,
-        kickoff: f.fixture?.date,
-        status: f.fixture?.status?.short,
-        home,
-        away,
-      });
+  let apiFootballFailed = false;
+  try {
+    for (const date of dates) {
+      const j = await apiFootballGuardedCall(`/fixtures?date=${date}`);
+      for (const f of j.response || []) {
+        if (!targetIds.has(f.league?.id)) continue;
+        const home = f.teams?.home?.name;
+        const away = f.teams?.away?.name;
+        if (isMilanFixture(home, away)) continue;
+        byId.set(f.fixture.id, {
+          fixtureId: f.fixture.id,
+          league: f.league?.name,
+          leagueId: f.league?.id,
+          kickoff: f.fixture?.date,
+          status: f.fixture?.status?.short,
+          home,
+          away,
+        });
+      }
+    }
+  } catch (err) {
+    apiFootballFailed = true;
+    console.error(`fetchSoccerCandidateFixturesFresh: API-Football unavailable (${err.message}), falling back to DK-odds fixture list for eloEdge`);
+  }
+
+  let fixtures = [...byId.values()];
+  let usedFallback = false;
+  if (!fixtures.length) {
+    try {
+      const games = await getDkSoccerMoneylinesToday();
+      fixtures = buildFallbackFixturesFromDkOdds(games);
+      usedFallback = fixtures.length > 0;
+    } catch (err) {
+      console.error(`DK-odds fixture fallback failed: ${err.message}`);
     }
   }
-  const fixtures = [...byId.values()];
+
   try {
     await attachSoccerEloAndOdds(fixtures);
   } catch (err) {
     console.error(`attachSoccerEloAndOdds failed: ${err.message}`);
   }
-  await upsertDoc("main", "soccer", "fixturesToday", { date: etDateDaysAgo(0), updatedAt: new Date().toISOString(), fixtures });
+  await upsertDoc("main", "soccer", "fixturesToday", {
+    date: etDateDaysAgo(0),
+    updatedAt: new Date().toISOString(),
+    fixtures,
+    apiFootballFailed,
+    usedDkOddsFallback: usedFallback,
+  });
   return fixtures;
 }
 
@@ -6117,26 +6168,62 @@ async function getOpenSoccerLegs() {
   return out;
 }
 
+// Per-fixture lineups/injuries cache (2026-11-05, fix for the 2026-11-04 80/80
+// API-Football exhaustion). Root cause: the 30-min lineup-check cron re-fetched BOTH
+// lineups and injuries for every imminent fixture on EVERY tick for its whole ~3h
+// pre-kickoff + 15-min-live window -- a single busy UCL night with several simultaneous
+// kickoffs easily hit 2 calls x 6-7 ticks x several fixtures = the full daily cap. Once a
+// fixture's lineups are officially announced (a non-empty response), they don't change, so
+// that fixture is "confirmed" and never refetched again that day; until announced, it still
+// retries every tick (lineups are usually released ~60 min before kickoff), just without the
+// extra multiplier.
+async function getSoccerLineupCache() {
+  const doc = await getDoc("main", "engineMeta", "soccerLineupCache");
+  return doc?.data?.entries || {};
+}
+
+async function saveSoccerLineupCache(entries) {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000; // prune anything older than a day
+  const pruned = {};
+  for (const [fixtureId, entry] of Object.entries(entries)) {
+    if (new Date(entry.fetchedAt).getTime() >= cutoff) pruned[fixtureId] = entry;
+  }
+  await upsertDoc("main", "engineMeta", "soccerLineupCache", { entries: pruned, updatedAt: new Date().toISOString() });
+}
+
 // One fixture's worth of the actual check -- shared by the live job and the dry-run
 // endpoint (dryRun just skips the DM + notifiedState write at the end, same convention as
 // the rest of the News Layer).
-async function checkSoccerFixtureAgainstOpenBets(fixture, openLegs, notified, dmsByDesk, newKeys) {
-  // Sequential, not Promise.all -- apiFootballGuardedCall already paces itself (>=7s apart),
-  // so two calls "in parallel" here would just both wait on the same pacing gate anyway.
-  // A HARD_STOP error is let through (not caught here) so the caller can break the whole
-  // pass instead of silently limping through the remaining fixtures with empty data.
-  const lineups = await apiFootballGuardedCall(`/fixtures/lineups?fixture=${fixture.fixtureId}`)
-    .then((j) => j.response)
-    .catch((err) => {
-      if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) throw err;
-      return [];
-    });
-  const injuries = await apiFootballGuardedCall(`/injuries?fixture=${fixture.fixtureId}`)
-    .then((j) => j.response)
-    .catch((err) => {
-      if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) throw err;
-      return [];
-    });
+async function checkSoccerFixtureAgainstOpenBets(fixture, openLegs, notified, dmsByDesk, newKeys, lineupCache) {
+  let lineups, injuries;
+  const cached = lineupCache[fixture.fixtureId];
+  if (cached?.confirmed) {
+    lineups = cached.lineups;
+    injuries = cached.injuries;
+  } else {
+    // Sequential, not Promise.all -- apiFootballGuardedCall already paces itself (>=7s apart),
+    // so two calls "in parallel" here would just both wait on the same pacing gate anyway.
+    // A HARD_STOP error is let through (not caught here) so the caller can break the whole
+    // pass instead of silently limping through the remaining fixtures with empty data.
+    lineups = await apiFootballGuardedCall(`/fixtures/lineups?fixture=${fixture.fixtureId}`)
+      .then((j) => j.response)
+      .catch((err) => {
+        if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) throw err;
+        return [];
+      });
+    injuries = await apiFootballGuardedCall(`/injuries?fixture=${fixture.fixtureId}`)
+      .then((j) => j.response)
+      .catch((err) => {
+        if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) throw err;
+        return [];
+      });
+    lineupCache[fixture.fixtureId] = {
+      lineups,
+      injuries,
+      confirmed: Array.isArray(lineups) && lineups.length > 0,
+      fetchedAt: new Date().toISOString(),
+    };
+  }
   const statusItems = buildSoccerLineupStatusItems(lineups, injuries);
   const alertable = statusItems.filter((i) => i.status !== "starting");
   if (!alertable.length) return;
@@ -6174,6 +6261,10 @@ async function runSoccerLineupCheck({ dryRun = false, forceFixtureId = null } = 
   // exactly what blows the daily cap on a busy UCL night. On a day with zero open soccer
   // bets this alone takes the per-fixture call count to zero.
   imminent = imminent.filter((f) => fixtureHasOpenLegInterest(f, openLegs));
+  // DK-odds fallback fixtures (used when API-Football is unavailable, for eloEdge
+  // continuity only) have no real fixtureId, so the lineups/injuries endpoints can't be
+  // called on them -- skip rather than erroring on `fixture=null`.
+  imminent = imminent.filter((f) => f.fixtureId != null);
   // Manual verification only (never set by the cron SQL): force-checks one specific
   // candidate fixture regardless of kickoff time or open-leg interest, so the matching
   // mechanism can be proven against real data without waiting for a real match/bet.
@@ -6183,17 +6274,19 @@ async function runSoccerLineupCheck({ dryRun = false, forceFixtureId = null } = 
   }
 
   const notified = await getNotifiedState();
+  const lineupCache = await getSoccerLineupCache();
   const newKeys = {};
   const dmsByDesk = {};
   const checkedFixtures = [];
   for (const f of imminent) {
     checkedFixtures.push({ fixtureId: f.fixtureId, home: f.home, away: f.away, kickoff: f.kickoff });
     try {
-      await checkSoccerFixtureAgainstOpenBets(f, openLegs, notified, dmsByDesk, newKeys);
+      await checkSoccerFixtureAgainstOpenBets(f, openLegs, notified, dmsByDesk, newKeys, lineupCache);
     } catch (err) {
       if (String(err.message).startsWith("API_FOOTBALL_HARD_STOP")) break; // stop the whole pass, not just this fixture
     }
   }
+  await saveSoccerLineupCache(lineupCache);
 
   const sentSummary = { main: 0, steve: 0 };
   for (const desk of Object.keys(dmsByDesk)) {
