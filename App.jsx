@@ -437,7 +437,7 @@ function UploadRow({ b, desk, profile, canEdit }) {
       {pl !== null && <span className={`pl ${pl < 0 ? 'neg' : 'pos'}`}>{pl >= 0 ? '+' : '-'}${Math.abs(pl).toFixed(2)}</span>}
     </div>
     {b.readBy && <div className="readby">Read by {cap(b.readBy)}</div>}
-    <div className="slip-title">{b.legs.length > 1 ? `${b.legs.length}-Leg Parlay${b.sgp ? ' (SGPx)' : ''}` : b.title}{b.title && b.legs.length > 1 ? `: ${b.title}` : ''}</div>
+    <div className="slip-title">{b.legs.length > 1 ? `${b.legs.length}-Leg Parlay${b.sgp ? ' (SGPx)' : ''}` : b.title}{b.title && b.legs.length > 1 && !/^\d+-Leg/i.test(b.title) ? `: ${b.title}` : ''}</div>
     <ul className="legs plain">{b.legs.map((l, i) => <li key={i} className={`leg leg-${l.status}`}><i />{l.text}{/void/.test(l.status) ? ' — Early Exit Protected' : ['won', 'lost'].includes(l.status) ? ` — ${l.status === 'won' ? 'hit' : 'miss'}` : ''}</li>)}</ul>
     <div className="muted small">{stamp(b.loggedAt || b.placedAt || b.settledAt)} · ${(b.bonus ? b.bonusStake || 0 : b.stake).toFixed(2)}{b.bonus ? ' bonus' : ''} at {b.odds || '—'}{b.units !== '' ? ` · ${b.units}${/^\d/.test(String(b.units)) ? 'u' : ''}` : ''}</div>
     <div className="actions">
@@ -622,7 +622,7 @@ function RequestList({ title, list }) {
         {r.risk && <span className="who">{r.risk}</span>}
         {r.question && r.game && <p className="muted small">{r.question}</p>}
         {(r.tickets && r.tickets.length ? r.tickets : (r.ticket ? [r.ticket] : [])).map((tk, n) => <div key={tk.id || n} className="ticket"><div className="ticket-h">★ SEBAS DESK PICKS{r.tickets && r.tickets.length > 1 ? ` · ${n + 1} of ${r.tickets.length}` : ''}</div>
-          <div className="slip-top"><b>{tk.title}</b>{tk.legs.length > 0 && <span className="pill" style={{ marginLeft: 6 }}>{tk.legs.length} leg{tk.legs.length === 1 ? '' : 's'}</span>}{tk.odds && <span className="odds-b">{tk.odds}</span>}</div>
+          <div className="slip-top"><b>{tk.title}</b>{tk.odds && <span className="odds-b">{tk.odds}</span>}</div>
           <ul className="legs plain">{tk.legs.map((l, i) => <li key={i} className="leg"><i />{l}</li>)}</ul></div>)}
         {r.status === 'answered' && !(r.tickets && r.tickets.length) && !r.ticket && r.answer && <p className="muted small">{r.answer}</p>}
       </div>))}
@@ -687,7 +687,7 @@ function Candidates({ title, kind, list, loading, empty, record }) {
 function ClaudePicks({ picks }) {
   return (<>
     {picks.length === 0 ? <p className="muted">No picks yet.</p> : picks.map((p) => (
-      <div key={p.id} className="card pick"><div className="bet-top"><span className="pill">{p.sport}</span><span className="bet-title">{p.title}</span>{p.legs.length > 0 && <span className="pill" style={{ marginLeft: 6 }}>{p.legs.length} leg{p.legs.length === 1 ? '' : 's'}</span>}<span className="odds">{p.odds}</span></div>
+      <div key={p.id} className="card pick"><div className="bet-top"><span className="pill">{p.sport}</span><span className="bet-title">{p.title}</span><span className="odds">{p.odds}</span></div>
         <ul className="legs">{p.legs.map((l, i) => <li key={i} className="leg">{l}</li>)}</ul>
         <div className="card-sub">{p.createdAt ? `Built ${stamp(p.createdAt)} · ` : ''}{p.confidence ? `Confidence ${Math.round(p.confidence * 100)}% · ` : ''}{p.model}</div>
         {p.sources?.length > 0 && <div className="sources">{p.sources.map((s, i) => <span key={i} className="src">{typeof s === 'string' ? s : s.label || s.type}</span>)}</div>}

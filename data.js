@@ -28,6 +28,10 @@ export function whenMs(x = {}, id = '') {
 }
 export const newestFirst = (a, b) => whenMs(b, b.id) - whenMs(a, a.id)
 
+// Parlay names always say how many legs: "7 Pick Parlay" / "7 leg parlay" → "7-Leg Parlay"
+export const legLabel = (t) => String(t || '').replace(/\b(\d+)\s*[- ]?\s*(?:pick|leg)s?\s+(parlay|sgp)\b/gi, (m, n, k) => `${n}-Leg ${k.toUpperCase() === 'SGP' ? 'SGP' : 'Parlay'}`)
+export const withLegs = (title, legCount) => { const t = legLabel(title); if (!(legCount > 1)) return t; return /\d+-Leg/i.test(t) ? t : `${t ? t + ' · ' : ''}${legCount}-Leg Parlay` }
+
 // The desk uses several words for the same thing (pending, placed, live, win, loss, hit, miss, void...). Anything not settled = open.
 const norm = (v) => { const raw = String(v || '').toLowerCase().trim()
   return /^(won|win|hit|cashed)$/.test(raw) ? 'won' : /^(lost|loss|lose|miss(ed)?)$/.test(raw) ? 'lost'
@@ -53,7 +57,7 @@ function mapBetRaw(id, x = {}) {
   return {
     id, legs, status, review: /review/i.test(String(x.status || '') + String(x.result || '')),
     sport: (() => { const sp = String(pick(x, 'sport', 'league') || '').toUpperCase(); return /^(NCAAB|NCAAM|CBB|MENS-COLLEGE-BASKETBALL|COLLEGE BASKETBALL|NCAA BASKETBALL)$/.test(sp) ? 'CBB' : sp })(),
-    title: pick(x, 'title', 'name', 'label', 'ticket') || (legs.length ? `${legs.length}-leg ticket` : 'Bet'),
+    title: legLabel(pick(x, 'title', 'name', 'label', 'ticket') || (legs.length > 1 ? `${legs.length}-Leg Parlay` : 'Bet')),
     stake: n(pick(x, 'stake', 'risk', 'wager', 'amount', 'wagered', 'wagerAmount', 'betAmount', 'stakeAmount', 'risked')),
     ret: n(pick(x, 'ret', 'payout', 'return', 'toReturn')),
     odds: pick(x, 'odds', 'price', 'americanOdds') || '',
@@ -200,7 +204,7 @@ export async function loadDesk(desk) {
     .sort((a, b) => whenMs(b.data || {}, b.doc_id) - whenMs(a.data || {}, a.doc_id))
     .slice(0, 20).map((r) => {
       const b = mapBet(r.doc_id, { ...r.data, sport: r.data?.league || r.data?.sport, title: r.data?.label || r.data?.game })
-      return { id: b.id, sport: b.sport, title: b.title, legs: b.legs.map((l) => l.text), odds: b.odds,
+      return { id: b.id, sport: b.sport, title: withLegs(b.title, b.legs.length), legs: b.legs.map((l) => l.text), odds: b.odds,
         createdAt: pick(r.data, 'createdAt', 'builtAt') || '', confidence: n(pick(r.data, 'confidence', 'conf')), model: pick(r.data, 'builtWith', 'model', 'modelVersion') || '', sources: pick(r.data, 'sources') || [] }
     })
   // Settings can live in a few places (pnl/settings, taskConfig, ...): look for any "settings" doc too
@@ -330,7 +334,7 @@ export async function loadPicksExtra(desk) {
     const ids = [x.ticketId, x.answerTicketId, ...(Array.isArray(x.ticketIds) ? x.ticketIds : []), ...(Array.isArray(x.answerTicketIds) ? x.answerTicketIds : [])].filter(Boolean)
     const linked = tickets.filter((tk) => [tk.requestId, tk.realRequestId, tk.answersRequest].some((v) => v && (v === r.doc_id || v === x.realRequestId)))
     const all = [...ids.map((id) => byId[id]).filter(Boolean), ...linked].filter((tk, i, a) => a.findIndex((o) => o.id === tk.id) === i)
-    const mapT = (t) => ({ id: t.id, title: t.label || t.game || 'Ticket', odds: t.odds || '', legs: (t.legs || []).map((l) => (typeof l === 'string' ? l : l.text || l.label || '')) })
+    const mapT = (t) => ({ id: t.id, title: withLegs(t.label || t.game || 'Ticket', (t.legs || []).length), odds: t.odds || '', legs: (t.legs || []).map((l) => (typeof l === 'string' ? l : l.text || l.label || '')) })
     const t = all[0] || null
     return { id: r.doc_id, date: x.date || x.createdAt || '', createdAt: x.createdAt || '', answeredAt: x.answeredAt || x.answered_at || '', league: x.league || '', slot: x.slot || '', game: x.game || '', risk: x.risk || x.units || '',
       status: x.status || (t ? 'answered' : 'working'), question: x.question || x.note || x.other || '',
