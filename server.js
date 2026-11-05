@@ -2305,6 +2305,28 @@ function findAthlete(categories, playerName, labelFilter) {
       if (normalizePlayerName(ath.athlete?.displayName) === target) return { cat, ath };
     }
   }
+  // Last-name fallback (2026-11-05, Seb's ask after a real slip-upload ATD leg carried the
+  // wrong first name -- "Brady Tkachuk" entered for a game Ottawa wasn't even in, when the
+  // real goalscorer bet, win or lose, was about Florida's own Tkachuk/Verhaeghe). Deliberately
+  // NOT a global last-name search: `categories` here is already scoped to ONE team of the ONE
+  // game gradeOneLeg resolved from the leg's own text, so two same-surname players can only
+  // collide within that single team's roster -- never across unrelated games. If that still
+  // happens, return no match (needs_review) rather than guess which one.
+  const targetLast = target.split(" ").pop();
+  if (targetLast && targetLast.length > 2) {
+    let found = null;
+    for (const cat of categories) {
+      if (labelFilter && !labelFilter(cat)) continue;
+      for (const ath of cat.athletes || []) {
+        const full = normalizePlayerName(ath.athlete?.displayName);
+        if (full.split(" ").pop() === targetLast) {
+          if (found) return null; // same-surname collision within this one team -- no guess
+          found = { cat, ath };
+        }
+      }
+    }
+    if (found) return found;
+  }
   return null;
 }
 
@@ -2357,6 +2379,16 @@ async function nflStatValue(game, playerName, statKey) {
 
 async function nflAnytimeTd(game, playerName) {
   const n = await nflStatValue(game, playerName, "anyTdCount");
+  return n === null ? null : n >= 1;
+}
+
+// NHL "Anytime TD"/"Anytime Goalscorer" legs are stored under the same "anytimeTd" category
+// as NFL's (the slip-upload text borrows football's "TD" wording for a hockey goal) --
+// settled the same way, just off the "G" column instead of a rush/rec TD count. Added
+// 2026-11-05 after finding these sat needs_review forever: gradeOneLeg used to hard-refuse
+// anytimeTd grading for any sport but football.
+async function nhlAnytimeGoal(game, playerName) {
+  const n = await nhlStatValue(game, playerName, "goals");
   return n === null ? null : n >= 1;
 }
 
@@ -2457,7 +2489,11 @@ async function resolveGameForProp(parsed, games, statKey, ticketDate) {
     const game = findGame(games, parsed.rawA || "", parsed.rawB || "", ticketDate);
     if (game) return { game };
   }
-  const candidates = STAT_SPORT_CANDIDATES[statKey] || (statKey === "anytimeTd" ? [["football", "nfl"]] : []);
+  // anytimeTd with no team context in the leg text: scan both sports it could plausibly be
+  // (football TD or hockey goal) -- resolveGameForProp's own ambiguous-match guard below
+  // already returns no game (never a guess) if the same-named player turns up in more than
+  // one of today's candidate games, so widening this is safe.
+  const candidates = STAT_SPORT_CANDIDATES[statKey] || (statKey === "anytimeTd" ? [["football", "nfl"], ["hockey", "nhl"]] : []);
   const candidateGames = games.filter((g) => candidates.some(([sport, league]) => g.sport === sport && g.league === league));
   let found = null;
   let anyNotFinal = false;
@@ -2530,8 +2566,10 @@ async function gradeOneLeg(leg, ticketDate) {
     if (game.state !== "post") return { status: "pending", reason: "game not final yet" };
 
     if (parsed.category === "anytimeTd") {
-      if (game.sport !== "football") return { status: "needs_review", reason: "anytime-scorer grading only supports NFL for now" };
-      const scored = await nflAnytimeTd(game, parsed.player);
+      if (game.sport !== "football" && game.sport !== "hockey") {
+        return { status: "needs_review", reason: "anytime-scorer grading only supports NFL/NHL for now" };
+      }
+      const scored = game.sport === "hockey" ? await nhlAnytimeGoal(game, parsed.player) : await nflAnytimeTd(game, parsed.player);
       if (scored === null) return { status: "needs_review", reason: "player not found in box score" };
       return { status: scored ? "hit" : "miss" };
     }
