@@ -1512,6 +1512,14 @@ function syncNeededGaveUpText(desk) {
   return desk === "main" ? "Your pick request didn't start — check it" : "Steve's pick request didn't start — check it";
 }
 
+// Plain-language, no $ amounts, no technical detail -- same DM-content rules as the group
+// posts, applied to a direct friend DM. Sent once per request, only on the final give-up
+// (not on every retry), using the same chat id the News Layer already DMs Steve on
+// (NEWS_STEVE_CHAT_ID, defined further down in this file).
+function syncNeededRequesterDelayText() {
+  return "Your pick is delayed — it's being retried, no need to resend the request.";
+}
+
 // True if the real build already landed, even if the Supabase "requests" row hasn't been
 // round-tripped to "answered" yet (PCS's job, not this one's).
 async function syncNeededRequestAlreadyBuilt(desk, docId) {
@@ -1522,6 +1530,33 @@ async function syncNeededRequestAlreadyBuilt(desk, docId) {
   return parlays.some((p) => p.data?.requestId === docId);
 }
 
+// --- Ticket-linkage guard (2026-11-05, Seb's self-healing ask) ---
+// A "requests" row with status "answered" and ticketIds is NOT actually done until every
+// one of those ticket ids exists as a real doc in Supabase's "parlays" collection -- the
+// request mirror and the ticket mirror are two separate writes (confirmed 2026-11-05: a
+// builder run posted its answer straight to the requests endpoint, called wake-sync to
+// carry the parlays doc down, but never verified that second write actually landed; it
+// didn't that time, leaving Steve's app showing an "answered" request with no ticket to
+// show). This checks every ticketId on an answered request still exists in Supabase; any
+// missing one means the request is NOT done regardless of its status field.
+async function syncNeededRequestTicketsLinked(desk, ticketIds) {
+  if (!Array.isArray(ticketIds) || ticketIds.length === 0) return true;
+  const res = await getDocsBulk(desk, "parlays", ticketIds);
+  return ticketIds.every((id) => res.has(id));
+}
+
+// Bulk existence check -- one query for every id in `docIds` instead of N round trips.
+async function getDocsBulk(deskId, collection, docIds) {
+  const idList = docIds.map((id) => encodeURIComponent(id)).join(",");
+  const res = await supabaseFetch(
+    `/docs?desk_id=eq.${encodeURIComponent(deskId)}&collection=eq.${encodeURIComponent(
+      collection
+    )}&doc_id=in.(${idList})&select=doc_id`
+  );
+  const rows = await res.json();
+  return new Set(rows.map((r) => r.doc_id));
+}
+
 // Decides what to do with ONE stale "requests" doc, applying all three guards against a
 // fresh read (never the earlier backlog scan, which can be stale by the time this runs).
 // dryRun skips every write (mergeUpsertDoc, Telegram) and just reports the decision.
@@ -1529,8 +1564,14 @@ async function syncNeededRetryRequest(desk, docId, dryRun) {
   const fresh = await getDoc(desk, "requests", docId);
   const d = fresh?.data || {};
 
-  if (d.status === "answered" || d.status === "working") {
+  if (d.status === "working") {
     return { desk, docId, action: "skip-already-handled", status: d.status };
+  }
+  if (d.status === "answered") {
+    const linked = await syncNeededRequestTicketsLinked(desk, d.ticketIds).catch(() => true);
+    if (linked) return { desk, docId, action: "skip-already-handled", status: d.status };
+    // else: answered but the ticket mirror never landed -- fall through to the normal
+    // retry guards below (gave-up/cooldown/max-retries), which re-fire the desk's builder.
   }
   if (d.retryGaveUp) {
     return { desk, docId, action: "skip-gave-up" };
@@ -1550,6 +1591,14 @@ async function syncNeededRetryRequest(desk, docId, dryRun) {
       await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text: syncNeededGaveUpText(desk) }).catch(
         (err) => console.error("sync-needed: give-up DM failed:", err.message)
       );
+      // Also tell the requester directly, once, on a desk that has its own chat id (Steve's
+      // -- see NEWS_STEVE_CHAT_ID below). MAIN has no separate "requester" to notify (Seb
+      // already got the DM above).
+      if (desk === "steve") {
+        await telegramApi("sendMessage", { chat_id: NEWS_STEVE_CHAT_ID, text: syncNeededRequesterDelayText() }).catch(
+          (err) => console.error("sync-needed: requester give-up DM failed:", err.message)
+        );
+      }
     }
     return { desk, docId, action: dryRun ? "would-give-up" : "gave-up", retryCount };
   }
@@ -1789,6 +1838,12 @@ async function syncNeededCheckDesk(desk) {
       const isStale = ref && now - new Date(ref).getTime() > SYNC_NEEDED_PENDING_STALE_MS;
       if (staleStatuses.includes(d.status)) {
         if (isStale) backlog.push({ desk, collection, docId: doc.doc_id });
+      } else if (collection === "requests" && d.status === "answered" && isStale) {
+        // TICKET-LINKAGE GUARD -- see syncNeededRequestTicketsLinked's own comment above.
+        // "answered" alone doesn't mean done: the ticket write to Supabase is a separate
+        // step from the request-answer write and can silently fail to land.
+        const linked = await syncNeededRequestTicketsLinked(desk, d.ticketIds).catch(() => true);
+        if (!linked) backlog.push({ desk, collection, docId: doc.doc_id, missingTicket: true });
       } else if (collection === "appEdits" && d.status === "applied" && isStale) {
         // COMPLETENESS GUARD -- see syncNeededAppEditIncomplete's own comment above.
         const incomplete = await syncNeededAppEditIncomplete(desk, doc.doc_id, d).catch(() => false);
