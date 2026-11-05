@@ -2749,9 +2749,12 @@ app.get("/internal/jobs/grader", async (req, res) => {
       // catches that. Found 2026-10-28: 2 real MAIN tickets stuck this way, fully graded legs
       // but a stale ticket-level status.
       const newTicketStatus = rollUpTicketStatus(newLegs);
-      if (!changed && newTicketStatus === data.status) continue;
+      // PAPER-TRADE TAG (2026-11-05) -- same as gradeCollectionForDesk below; this route
+      // shares the same collections (parlays/ftd) and needs the same explicit tag.
+      const paperPatch = collection === "pnlEntries" ? {} : { paper: data.played !== true };
+      if (!changed && newTicketStatus === data.status && (collection === "pnlEntries" || data.paper === paperPatch.paper)) continue;
 
-      const newData = { ...data, legs: newLegs, status: newTicketStatus };
+      const newData = { ...data, legs: newLegs, status: newTicketStatus, ...paperPatch };
       await upsertDoc(desk, collection, doc.doc_id, newData);
       results.push({ ticketId: doc.doc_id, newStatus: newTicketStatus, legStatuses: newLegs.map((l) => l.status) });
     }
@@ -3085,8 +3088,15 @@ async function gradeCollectionForDesk(desk, collection, mode) {
       }
     }
 
-    if (!changed && newTicketStatus === prevStatus) continue;
-    const newData = { ...data, legs: newLegs, status: newTicketStatus, ...retPatch };
+    // PAPER-TRADE TAG (2026-11-05, Seb's ask): a parlays/ftd doc with played !== true was
+    // never actually bet -- it's a Claude recommendation that went ungraded/unlabeled
+    // alongside real bets until now. Grading it was already happening (no played-check ever
+    // existed above), it just wasn't marked -- this makes that explicit and queryable rather
+    // than leaving callers to infer it from `played`. Never applied to pnlEntries, which by
+    // definition only holds real placed bets (no pnlEntries doc exists for an unplaced pick).
+    const paperPatch = collection === "pnlEntries" ? {} : { paper: data.played !== true };
+    if (!changed && newTicketStatus === prevStatus && (collection === "pnlEntries" || data.paper === paperPatch.paper)) continue;
+    const newData = { ...data, legs: newLegs, status: newTicketStatus, ...retPatch, ...paperPatch };
     if (mode === "live") {
       await upsertDoc(desk, collection, doc.doc_id, newData);
     } else {
@@ -4987,6 +4997,89 @@ app.get("/internal/jobs/nhl-goalie-tracker", async (req, res) => {
       }
     }
     res.json({ ok: true, gamesChecked: games.length, rowsWritten: results.length, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Paper-vs-bet league summary (2026-11-05, Seb's ask) -------------------------------
+// Read-only aggregation over the real parlays collection (both desks) -- feeds the Monday
+// recap's "paper record vs bet record" line and the NHL/CBB "ready to bet?" check. Nothing
+// here writes anything; it's pure math over whatever the grader has already written
+// (paper:true/false, per the tagging added above).
+function americanToImplied(price) {
+  const n = typeof price === "number" ? price : parseFloat(String(price ?? "").replace(/[^0-9.+-]/g, ""));
+  if (!Number.isFinite(n) || n === 0) return null;
+  return n < 0 ? -n / (-n + 100) : 100 / (n + 100);
+}
+
+function emptyBucket() {
+  return { legs: 0, hit: 0, miss: 0, push: 0, impliedSum: 0, impliedCount: 0 };
+}
+
+app.get("/internal/jobs/paper-vs-bet-summary", async (req, res) => {
+  try {
+    const days = req.query.days ? Number(req.query.days) : null; // omit for all-time
+    const dateFloor = days ? etDateDaysAgo(days) : null;
+    const byLeague = {};
+    for (const desk of ["main", "steve"]) {
+      const listRes = await supabaseFetch(
+        `/docs?desk_id=eq.${desk}&collection=eq.parlays&select=doc_id,data`
+      );
+      const docs = await listRes.json();
+      for (const doc of docs) {
+        const d = doc.data || {};
+        const src = (d.source || "").toLowerCase();
+        if (!src.startsWith("claude")) continue; // Claude-built picks only -- never friends'/Seb's own logged bets
+        if (dateFloor && d.date && d.date < dateFloor) continue;
+        const league = (d.league || "UNKNOWN").toUpperCase();
+        const bucket = d.played === true ? "real" : "paper";
+        byLeague[league] = byLeague[league] || { real: emptyBucket(), paper: emptyBucket() };
+        for (const leg of d.legs || []) {
+          if (!["hit", "miss", "push"].includes(leg.status)) continue;
+          const b = byLeague[league][bucket];
+          b.legs++;
+          b[leg.status]++;
+          // Per-leg price only -- a ticket's combined parlay odds is NOT a per-leg implied
+          // probability and must never be used as one (found doing the NHL leg audit).
+          if (leg.price != null) {
+            const imp = americanToImplied(leg.price);
+            if (imp != null) {
+              b.impliedSum += imp;
+              b.impliedCount++;
+            }
+          }
+        }
+      }
+    }
+    const out = {};
+    for (const [league, buckets] of Object.entries(byLeague)) {
+      out[league] = {};
+      for (const [bucket, b] of Object.entries(buckets)) {
+        const graded = b.hit + b.miss; // push excluded from hit% denominator
+        out[league][bucket] = {
+          legs: b.legs,
+          hit: b.hit,
+          miss: b.miss,
+          push: b.push,
+          hitPct: graded ? Number(((b.hit / graded) * 100).toFixed(1)) : null,
+          impliedPct: b.impliedCount ? Number(((b.impliedSum / b.impliedCount) * 100).toFixed(1)) : null,
+          impliedSampleSize: b.impliedCount,
+        };
+      }
+      // "ready to bet?" -- Seb's bar: 30+ graded paper legs AND paper hit% beats paper implied%.
+      const p = out[league].paper;
+      const gradedPaper = p.hit + p.miss;
+      out[league].readyToBet =
+        gradedPaper >= 30 && p.impliedPct != null ? p.hitPct > p.impliedPct : false;
+      out[league].readyToBetNote =
+        gradedPaper < 30
+          ? `only ${gradedPaper} graded paper legs, need 30+`
+          : p.impliedPct == null
+            ? "no per-leg priced data to compare against yet"
+            : `${p.hitPct}% hit vs ${p.impliedPct}% implied (n=${p.impliedCount} priced legs)`;
+    }
+    res.json({ ok: true, generatedAt: new Date().toISOString(), days: days || "all-time", byLeague: out });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
