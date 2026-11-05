@@ -5737,6 +5737,21 @@ app.get("/internal/test/soccer-fixtures-refresh", async (req, res) => {
   }
 });
 
+// Same verification, but re-attaches ELO/odds onto the ALREADY-CACHED fixturesToday list
+// instead of calling API-Football again -- for days (like today, 2026-11-05) the daily
+// API-Football cap is already hit and a fresh fixture pull isn't possible until it resets.
+app.get("/internal/test/soccer-elo-reattach", async (req, res) => {
+  try {
+    const cached = await getDoc("main", "soccer", "fixturesToday");
+    const fixtures = cached?.data?.fixtures || [];
+    await attachSoccerEloAndOdds(fixtures);
+    await upsertDoc("main", "soccer", "fixturesToday", { ...cached.data, fixtures, updatedAt: new Date().toISOString() });
+    res.json({ ok: true, count: fixtures.length, fixtures });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/internal/test/soccer-source-swap", async (req, res) => {
   if (!API_FOOTBALL_KEY) return res.status(400).json({ error: "API_FOOTBALL_KEY not set" });
   const calls = [];
