@@ -1010,7 +1010,11 @@ function pnlDelta(d) {
   // case silently understated the computed balance by every cashout's net on both sides of
   // self-heal's comparison. Found 2026-11-02 alongside the same gap in the live grader.
   if (d.status === "won" || d.status === "cashout") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
-  if (d.status === "lost") return -(Number(d.stake) || 0);
+  // A bonus/free bet (bonus:true, 2026-11-05) that loses costs nothing real -- `stake` on
+  // that doc is a face amount for ret math only, never actual money at risk, so don't
+  // subtract it. Won/cashout above already nets to winnings-only/stake-returned for a
+  // bonus doc too (ret-stake=profit regardless of bonus), so no change needed there.
+  if (d.status === "lost") return d.bonus === true ? 0 : -(Number(d.stake) || 0);
   return 0; // push/open/pending never move the balance
 }
 
