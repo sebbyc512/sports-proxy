@@ -190,9 +190,13 @@ const STAT_PATTERNS = [
 
 const ANYTIME_TD_PATTERNS = [
   // Case-insensitive, covers "Bijan Robinson anytime TD", "...Anytime TD Scorer", and
-  // "MarShawn Lloyd - Anytime TD Scorer" in one pattern. Kickoff-time parens already stripped
-  // by normalize() before this runs.
-  new RegExp(`^(?<player>${PLAYER})\\s*-?\\s*Anytime (?:TD|Touchdown)(?: Scorer)?\\s*(?:\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\))?\\s*(?:[+-]\\d+)?$`, "iu"),
+  // "MarShawn Lloyd - Anytime TD Scorer" in one pattern. Also covers hockey's own anytime
+  // goalscorer phrasing ("...Anytime Goalscorer", "...Anytime Goal Scorer") -- these settle
+  // the exact same way server-side (>=1 of the relevant stat), just off goals instead of a
+  // rush/rec TD count; found 2026-11-05 on real NHL slip-upload legs that sat needs_review
+  // forever because this pattern only ever recognized the TD/Touchdown wording. Kickoff-time
+  // parens already stripped by normalize() before this runs.
+  new RegExp(`^(?<player>${PLAYER})\\s*-?\\s*Anytime (?:TD|Touchdown|Goalscorer|Goal)(?: Scorer)?\\s*(?:\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\))?\\s*(?:[+-]\\d+)?$`, "iu"),
 ];
 
 // "Alaves vs Malaga draw (3:00 PM ET)" / "A vs B Tie" — a correlated-draw leg, stored with
