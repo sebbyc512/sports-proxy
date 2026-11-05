@@ -202,6 +202,39 @@ const STAT_PATTERNS = [
   new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*) (?<player>${PLAYER}) (?<stat>${STAT_ALT})$`, "iu"),
 ];
 
+// First-TD-scorer legs (2026-11-05, Seb's ask): the Desk's own ftd queue writes this exact
+// shape -- "{Player} ({Position}, {TEAM}) first TD scorer" (see handbooks' ftd-model-spec and
+// real queue docs, e.g. "Chris Rodriguez Jr. (RB, JAX) first TD scorer"). Position is often
+// present but optional; team abbreviation is always the last thing inside the parens. This is
+// the standard "first touchdown of the GAME" market unless the text explicitly says otherwise
+// (checked separately below, scoped detection) -- never confused with anytime-TD, which is a
+// completely different, much easier bet (ANY TD, not the first one) and must stay on its own
+// ANYTIME_TD_PATTERNS path above.
+const FTD_PATTERNS = [
+  // Desk-generated queue format: "Chris Rodriguez Jr. (RB, JAX) first TD scorer" -- position
+  // abbrev + team abbrev inside one paren, no price (the queue doc carries price separately).
+  new RegExp(`^(?<player>${PLAYER})\\s*\\((?:[A-Z]{1,3},\\s*)?(?<team>[A-Z]{2,4})\\)\\s*first\\s*(?:TD|Touchdown)(?:\\s*scorer)?$`, "iu"),
+  // Real slip-upload format: "Jonathan Taylor - First TD Scorer (TEN @ IND) +255" / "Brian
+  // Thomas Jr. First TD Scorer +1900 (HOU @ JAX)" / "Kyren Williams First TD Scorer (ARI @
+  // LAR) +425" -- full A-vs-B matchup in parens, price optional on either side, optional
+  // leading " - ". Found 2026-11-05 covering the actual FTD queue's real historical text
+  // (0/91 parsed before this).
+  new RegExp(`^(?<player>${PLAYER})\\s*-?\\s*First (?:TD|Touchdown) Scorer\\s*(?:[+-]\\d+\\s*)?\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)\\s*(?:[+-]\\d+)?$`, "iu"),
+  // "Tucker Kraft - First TD Scorer +1200" -- no matchup at all; the caller resolves the game
+  // from the ticket's own date/team context, same as a bare total/spread leg elsewhere here.
+  new RegExp(`^(?<player>${PLAYER})\\s*-?\\s*First (?:TD|Touchdown) Scorer\\s*(?:[+-]\\d+)?$`, "iu"),
+  // "Tucker Kraft first TD" / "George Kittle first TD" -- bare, no "Scorer" word, no
+  // matchup, no price. Shortest real variant found; team/game still comes from ticket context.
+  new RegExp(`^(?<player>${PLAYER})\\s*-?\\s*first\\s*(?:TD|Touchdown)\\s*(?:[+-]\\d+)?$`, "iu"),
+];
+// Explicit team-scoping language (2026-11-05, Seb's ask: "per-team if the pick is
+// team-scoped") -- a SEPARATE, rarer market from the standard game-wide first-TD-scorer
+// above: "this team's own first touchdown," which still pays even if the OTHER team scored
+// first. No real example of this phrasing exists in the Desk's data yet, so this is
+// deliberately narrow (only fires on explicit wording) rather than a guess from context --
+// defaulting to the standard game-wide market (far more common) whenever this doesn't match.
+const FTD_TEAM_SCOPED_RE = /\bteam'?s own first\b|\bthat team'?s first\b|\bfor (?:the|his|her) team'?s first\b|\bfirst (?:td|touchdown) for (?:the )?team\b/i;
+
 const ANYTIME_TD_PATTERNS = [
   // Case-insensitive, covers "Bijan Robinson anytime TD", "...Anytime TD Scorer", and
   // "MarShawn Lloyd - Anytime TD Scorer" in one pattern. Also covers hockey's own anytime
@@ -280,6 +313,21 @@ function parseLeg(text, legType) {
   } else if (HALF2_TRAILING_RE.test(tHalf)) {
     period = "2H";
     tHalf = tHalf.replace(HALF2_TRAILING_RE, "");
+  }
+
+  if (legType === "ftd") {
+    const g = tryPatterns(t, FTD_PATTERNS);
+    if (g) {
+      return {
+        category: "ftd",
+        player: g.player.trim(),
+        team: g.team ? g.team.trim() : null,
+        rawA: g.a?.trim() || null,
+        rawB: g.b?.trim() || null,
+        scoped: FTD_TEAM_SCOPED_RE.test(raw),
+      };
+    }
+    return { category: "unsupported", reason: `no FTD pattern matched for "${raw}"` };
   }
 
   if (legType === "ml") {

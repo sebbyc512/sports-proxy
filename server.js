@@ -2288,6 +2288,47 @@ function normalizePlayerName(name) {
 
 const boxScoreCache = new Map(); // "sport/league/id" -> parsed boxscore.players, shared across legs within one process lifetime (cheap, read-only data for a final game)
 
+// First-TD-scorer grading (2026-11-05, Seb's ask): ESPN's own summary response carries a
+// dedicated, already-chronological `scoringPlays` array (separate from boxscore.players) --
+// no full play-by-play parsing needed. Verified against a real finished NFL game 2026-11-05:
+// entries carry {scoringType.name, team.abbreviation, text, period.number, clock.value}, and
+// the scorer's name is always the first thing in `text`, immediately before "{N} Yd " for
+// both rushing ("D'Andre Swift 5 Yd Rush...") and passing ("Luther Burden III 1 Yd pass
+// from...") touchdowns -- the receiver/rusher, never the passer, which is exactly who a
+// first-TD-scorer bet is about.
+const scoringPlaysCache = new Map(); // "sport/league/id" -> normalized scoring plays, same lifetime as boxScoreCache
+async function fetchScoringPlays(game) {
+  const key = `${game.sport}/${game.league}/${game.id}`;
+  if (scoringPlaysCache.has(key)) return scoringPlaysCache.get(key);
+  const data = await getJson(`${ESPN_BASE}/${game.sport}/${game.league}/summary?event=${game.id}`);
+  const raw = data.scoringPlays || [];
+  const plays = raw
+    .map((p) => ({
+      type: p.scoringType?.name || null, // "touchdown" | "field-goal" | "safety" | ...
+      teamAbbr: p.team?.abbreviation || null,
+      text: p.text || "",
+      period: p.period?.number ?? 0,
+      clock: p.clock?.value ?? 0, // counts DOWN within a period -- higher value = earlier
+    }))
+    // Explicit chronological sort rather than trusting ESPN's own array order: period
+    // ascending, then clock value descending (more time remaining = happened first).
+    .sort((a, b) => a.period - b.period || b.clock - a.clock);
+  scoringPlaysCache.set(key, plays);
+  return plays;
+}
+
+// Extracts the scorer's name from a scoring play's own text -- "{Name} {N} Yd Rush (...)" /
+// "{Name} {N} Yd pass from {Passer} (...)" both put the actual scorer first. Falls back to a
+// "... by {Name}" trailing shape (blocked-kick/fumble-recovery touchdowns sometimes render
+// this way) before giving up -- returns null rather than guessing when neither matches.
+function extractTdScorerName(playText) {
+  const m1 = playText.match(/^([^\d]+?)\s+\d+\s*Yd\b/i);
+  if (m1) return m1[1].trim();
+  const m2 = playText.match(/\bby\s+([A-Za-z.'\- ]+?)\s*(?:\(|$)/i);
+  if (m2) return m2[1].trim();
+  return null;
+}
+
 async function fetchBoxScorePlayers(game) {
   const key = `${game.sport}/${game.league}/${game.id}`;
   if (boxScoreCache.has(key)) return boxScoreCache.get(key);
@@ -2552,6 +2593,38 @@ async function gradeOneLeg(leg, ticketDate) {
       return { status: "pending", reason: `${parsed.reason} (game not final yet, so not calling this needs_review)` };
     }
     return { status: "needs_review", reason: parsed.reason };
+  }
+
+  if (parsed.category === "ftd") {
+    if (parsed.scoped && !parsed.team) {
+      return { status: "needs_review", reason: "team-scoped first-TD leg but no team could be determined" };
+    }
+    const teamQuery = parsed.team || parsed.rawA || "";
+    const oppQuery = parsed.team ? "" : parsed.rawB || "";
+    const game = findGame(games, teamQuery, oppQuery, ticketDate);
+    if (!game) {
+      if (stillAwaitingResult(leg.text, games, ticketDate)) return { status: "pending", reason: "no confident game match yet, but game not final" };
+      return { status: "needs_review", reason: "no confident game match for this player's team" };
+    }
+    if (game.sport !== "football" || game.league !== "nfl") {
+      return { status: "needs_review", reason: "first-TD-scorer grading only supports NFL for now" };
+    }
+    if (game.state !== "post") return { status: "pending", reason: "game not final yet" };
+
+    const scoring = await fetchScoringPlays(game);
+    const allTds = scoring.filter((p) => p.type === "touchdown");
+    // A standard sportsbook "no touchdown scored" settlement is a push/refund, never a loss --
+    // this covers both the game-wide market (nobody scored at all) and the team-scoped one
+    // (that specific team never found the end zone, even if the other team did).
+    const relevant = parsed.scoped ? allTds.filter((p) => p.teamAbbr === parsed.team) : allTds;
+    if (relevant.length === 0) return { status: "push" };
+
+    const scorerName = extractTdScorerName(relevant[0].text);
+    if (!scorerName) return { status: "needs_review", reason: "couldn't parse the scorer's name from the scoring play text" };
+    const target = normalizePlayerName(parsed.player);
+    const scored = normalizePlayerName(scorerName);
+    const lastMatch = target.split(" ").pop() === scored.split(" ").pop() && target.split(" ").pop().length > 2;
+    return { status: scored === target || lastMatch ? "hit" : "miss" };
   }
 
   if (parsed.category === "stat" || parsed.category === "anytimeTd") {
