@@ -5077,7 +5077,7 @@ app.get("/internal/jobs/paper-vs-bet-summary", async (req, res) => {
           ? `only ${gradedPaper} graded paper legs, need 30+`
           : p.impliedPct == null
             ? "no per-leg priced data to compare against yet"
-            : `${p.hitPct}% hit vs ${p.impliedPct}% implied (n=${p.impliedCount} priced legs)`;
+            : `${p.hitPct}% hit vs ${p.impliedPct}% implied (n=${p.impliedSampleSize} priced legs)`;
     }
     res.json({ ok: true, generatedAt: new Date().toISOString(), days: days || "all-time", byLeague: out });
   } catch (err) {
