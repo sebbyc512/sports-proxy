@@ -4808,6 +4808,190 @@ app.get("/internal/jobs/nhl-learning-gate", async (req, res) => {
   }
 });
 
+// --- NHL starting-goalie tracker (2026-11-05, Seb's ask) -------------------------------
+// nhl-model-spec's goalie-confirmation mandate was failing 100% of the time in practice --
+// builders had no feed to actually check, just a disclosure tag to fall back on. This is an
+// engine-only job (no Claude run) that fills Supabase nhl_goalies (see
+// sql/nhl-goalies-table.sql) so pick-building routines have something real to read before
+// tagging a leg "(backup goalie)" vs "(goalie unconfirmed)" vs building it plainly.
+//
+// Two tiers, both self-gated here by minutes-to-puck-drop rather than scheduled per-game --
+// one frequent poll (sql/nhl-goalie-tracker-cron.sql) covers every game at whatever stage
+// it's in:
+//   projected (~90 min out): DraftKings' player_total_saves prop via the-odds-api. DK only
+//     posts a goalie saves line for the goalie it expects to start, so whichever name shows
+//     up there IS the projected starter -- verified live 2026-11-05 (DK had it posted hours
+//     before puck drop for a real game). Official sportsbook data, not a scrape.
+//   confirmed (~30 min out): the NHL's own api-web.nhle.com game-landing/boxscore endpoint,
+//     which only carries a real per-game starter once gameState moves off "FUT" -- confirmed
+//     empty hours out against a real game 2026-11-05, as expected. If it's still empty at
+//     T-30 (lineup not locked yet), this tier just stays null until a later poll catches it.
+// Explicitly NOT used: Daily Faceoff or any other scraped site (Seb's ask) -- only the NHL's
+// own API and DraftKings' own posted odds.
+const NHL_GOALIE_PROJECTED_WINDOW_MIN = [70, 110]; // ~90 min out, wide enough for a 10-min poll cadence
+const NHL_GOALIE_CONFIRMED_WINDOW_MIN = [10, 50]; // ~30 min out, same cadence margin
+
+function minutesUntil(iso) {
+  return (new Date(iso).getTime() - Date.now()) / 60000;
+}
+
+// Season gamesStarted per goalie for one team, from the NHL's own club-stats endpoint --
+// used only for backup_flag (a season-starts-rank proxy, not a lineup feed) and to resolve
+// which team a bare player name from the odds API belongs to.
+const nhlClubGoalieCache = new Map(); // team abbr -> {name,last,gamesStarted}[], cached per process run
+async function nhlClubGoalies(teamAbbr) {
+  if (nhlClubGoalieCache.has(teamAbbr)) return nhlClubGoalieCache.get(teamAbbr);
+  let list = [];
+  try {
+    const data = await getJson(`https://api-web.nhle.com/v1/club-stats/${teamAbbr}/now`);
+    list = (data.goalies || []).map((g) => ({
+      name: `${g.firstName?.default || ""} ${g.lastName?.default || ""}`.trim(),
+      last: (g.lastName?.default || "").toLowerCase(),
+      gamesStarted: g.gamesStarted || 0,
+    }));
+  } catch {
+    // Leave empty -- team assignment/backup_flag for this team just can't be resolved
+    // this run, never a reason to fail the whole tracker.
+  }
+  nhlClubGoalieCache.set(teamAbbr, list);
+  return list;
+}
+
+function isBackupStarter(depth, starterName) {
+  if (!depth.length || !starterName) return null; // can't tell -- not the same as "false"
+  const starterLast = starterName.trim().split(" ").pop().toLowerCase();
+  const top = depth.reduce((a, b) => (b.gamesStarted > a.gamesStarted ? b : a), depth[0]);
+  return top.last !== starterLast;
+}
+
+async function nhlProjectedStarterFromOdds(awayAbbr, homeAbbr, awayTeamName, homeTeamName) {
+  // DK's own player_total_saves listing names a goalie with no team label -- resolve which
+  // side it belongs to by checking both teams' own goalie rosters (never a guess: if the
+  // name matches neither team's goalie list, or matches both, this leg is skipped).
+  const [awayDepth, homeDepth] = await Promise.all([nhlClubGoalies(awayAbbr), nhlClubGoalies(homeAbbr)]);
+  const out = { away: null, homeStarter: null };
+  try {
+    const eventsUrl = new URL(`${ODDS_BASE}/sports/icehockey_nhl/events`);
+    eventsUrl.searchParams.set("apiKey", ODDS_API_KEY);
+    const events = await getOddsJson(eventsUrl.toString());
+    const norm = (s) => (s || "").toLowerCase();
+    const match = events.find(
+      (e) => norm(e.home_team).includes(norm(homeTeamName).split(" ").pop()) && norm(e.away_team).includes(norm(awayTeamName).split(" ").pop())
+    );
+    if (!match) return { away: null, home: null };
+    const url = new URL(`${ODDS_BASE}/sports/icehockey_nhl/events/${match.id}/odds`);
+    url.searchParams.set("apiKey", ODDS_API_KEY);
+    url.searchParams.set("regions", "us");
+    url.searchParams.set("markets", "player_total_saves");
+    url.searchParams.set("oddsFormat", "american");
+    url.searchParams.set("bookmakers", "draftkings");
+    const data = await getOddsJson(url.toString());
+    const names = new Set();
+    for (const book of data.bookmakers || []) {
+      for (const m of book.markets || []) {
+        for (const o of m.outcomes || []) if (o.description) names.add(o.description);
+      }
+    }
+    let away = null, home = null;
+    for (const name of names) {
+      const last = name.trim().split(" ").pop().toLowerCase();
+      const onAway = awayDepth.some((g) => g.last === last);
+      const onHome = homeDepth.some((g) => g.last === last);
+      if (onAway && !onHome) away = name;
+      else if (onHome && !onAway) home = name;
+      // onAway && onHome (same surname on both sides) or neither -> skip, no guess
+    }
+    return { away, home };
+  } catch {
+    return { away: null, home: null };
+  }
+}
+
+async function nhlConfirmedStarterFromApiWeb(gameId, awayAbbr, homeAbbr) {
+  try {
+    const landing = await getJson(`https://api-web.nhle.com/v1/gamecenter/${gameId}/landing`);
+    if (landing.gameState === "FUT" || landing.gameState === "PRE") return { away: null, home: null }; // lineup not locked yet
+    const box = await getJson(`https://api-web.nhle.com/v1/gamecenter/${gameId}/boxscore`);
+    const pick = (teamStats) => {
+      const goalies = teamStats?.goalies || [];
+      const started = goalies.find((g) => Number(g.toi?.split(":")?.[0]) > 0 || g.starter);
+      const g = started || goalies[0];
+      return g ? `${g.name?.default || ""}`.trim() || null : null;
+    };
+    return {
+      away: pick(box.playerByGameStats?.awayTeam),
+      home: pick(box.playerByGameStats?.homeTeam),
+    };
+  } catch {
+    return { away: null, home: null };
+  }
+}
+
+app.get("/internal/jobs/nhl-goalie-tracker", async (req, res) => {
+  try {
+    const dateET = etDateDaysAgo(0);
+    const schedule = await getJson(`https://api-web.nhle.com/v1/score/${dateET}`);
+    const games = (schedule.games || []).filter((g) => !["OFF", "FINAL", "OVER"].includes(g.gameState));
+    const results = [];
+    for (const g of games) {
+      const minsOut = minutesUntil(g.startTimeUTC);
+      const inProjectedWindow = minsOut >= NHL_GOALIE_PROJECTED_WINDOW_MIN[0] && minsOut <= NHL_GOALIE_PROJECTED_WINDOW_MIN[1];
+      const inConfirmedWindow = minsOut >= NHL_GOALIE_CONFIRMED_WINDOW_MIN[0] && minsOut <= NHL_GOALIE_CONFIRMED_WINDOW_MIN[1];
+      if (!inProjectedWindow && !inConfirmedWindow) continue;
+
+      const awayAbbr = g.awayTeam?.abbrev;
+      const homeAbbr = g.homeTeam?.abbrev;
+      if (!awayAbbr || !homeAbbr) continue;
+
+      let projected = { away: null, home: null };
+      let confirmed = { away: null, home: null };
+      if (inProjectedWindow) {
+        projected = await nhlProjectedStarterFromOdds(awayAbbr, homeAbbr, g.awayTeam?.name?.default || awayAbbr, g.homeTeam?.name?.default || homeAbbr);
+      }
+      if (inConfirmedWindow) {
+        confirmed = await nhlConfirmedStarterFromApiWeb(g.id, awayAbbr, homeAbbr);
+      }
+
+      for (const [side, abbr, opp] of [["away", awayAbbr, homeAbbr], ["home", homeAbbr, awayAbbr]]) {
+        const proj = side === "away" ? projected.away : projected.home;
+        const conf = side === "away" ? confirmed.away : confirmed.home;
+        if (!proj && !conf) continue; // nothing new to write for this side this run
+        const depth = await nhlClubGoalies(abbr);
+        const starterForFlag = conf || proj;
+        const patch = {
+          game_id: String(g.id),
+          team: abbr,
+          opponent: opp,
+          is_home: side === "home",
+          date: dateET,
+          puck_drop_utc: g.startTimeUTC,
+          backup_flag: isBackupStarter(depth, starterForFlag),
+          updated_at: new Date().toISOString(),
+        };
+        if (proj) {
+          patch.projected_starter = proj;
+          patch.projected_source = "draftkings_player_total_saves";
+          patch.projected_at = new Date().toISOString();
+        }
+        if (conf) {
+          patch.confirmed_starter = conf;
+          patch.confirmed_source = "api-web.nhle.com";
+          patch.confirmed_at = new Date().toISOString();
+        }
+        await supabaseFetch(`/nhl_goalies?on_conflict=game_id,team`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify([patch]),
+        });
+        results.push({ gameId: g.id, team: abbr, ...patch });
+      }
+    }
+    res.json({ ok: true, gamesChecked: games.length, rowsWritten: results.length, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // --- NCAAB nightly tracker + engine-gated learning loop (2026-11-02, Seb's request) ---
 // Same additive pattern as the NBA/NHL/soccer trackers above -- new tables, new endpoints,
 // nothing existing touched. No player props (Seb's call: ML/spread/total only, full game
