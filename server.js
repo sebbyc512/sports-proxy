@@ -2601,13 +2601,17 @@ async function gradeOneLeg(leg, ticketDate) {
     }
     const teamQuery = parsed.team || parsed.rawA || "";
     const oppQuery = parsed.team ? "" : parsed.rawB || "";
-    const game = findGame(games, teamQuery, oppQuery, ticketDate);
+    // Restrict the search to NFL games before matching -- FTD is an NFL-only market
+    // (ftd-model-only), and a bare team abbreviation with no opponent (the Desk's own queue
+    // format never includes one) real-world collides across sports on the same date (e.g.
+    // "CHI" matches the NFL Bears, NBA Bulls AND NHL Blackhawks all on 2026-11-02) and would
+    // otherwise come back falsely ambiguous. Found 2026-11-05 dry-running real archived FTD
+    // picks: 8 of 28 failed this way before the restriction.
+    const nflGames = games.filter((g) => g.sport === "football" && g.league === "nfl");
+    const game = findGame(nflGames, teamQuery, oppQuery, ticketDate);
     if (!game) {
       if (stillAwaitingResult(leg.text, games, ticketDate)) return { status: "pending", reason: "no confident game match yet, but game not final" };
-      return { status: "needs_review", reason: "no confident game match for this player's team" };
-    }
-    if (game.sport !== "football" || game.league !== "nfl") {
-      return { status: "needs_review", reason: "first-TD-scorer grading only supports NFL for now" };
+      return { status: "needs_review", reason: "no confident NFL game match for this player's team" };
     }
     if (game.state !== "post") return { status: "pending", reason: "game not final yet" };
 
