@@ -83,6 +83,13 @@ const SPREAD_PATTERNS = [
   new RegExp(`^(?<team>${TEAM}) (?<num>[+-]\\d+\\.?\\d*)\\s*(?:(?:Spread|Puck Line)\\s*)?(?:\\([+-]\\d+\\)\\s*)?\\(?${SEP} (?<opp>${TEAM})\\)?$`, "iu"),
   // "MTL Canadiens +1.5 Puck Line (MTL vs WAS)"
   new RegExp(`^(?<team>${TEAM}) (?<num>[+-]\\d+\\.?\\d*) (?:Spread|Puck Line)\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)$`, "iu"),
+  // "FLA Panthers +1.5 (CHI @ FLA)" / "OTT Senators +1.5 (OTT @ BUF)" — a real slip-upload
+  // shape found 2026-11-05: the matchup parens hold BOTH team names (no "vs opponent" single
+  // slot, no "Spread"/"Puck Line" keyword at all). Without this, the leg falls through to
+  // "unsupported" even though the matchup is right there in the text — found while grading
+  // two main-desk NHL/NBA tickets that sat pending/needs_review long after their games went
+  // final.
+  new RegExp(`^(?<team>${TEAM}) (?<num>[+-]\\d+\\.?\\d*)\\s*(?:(?:Spread|Puck Line)\\s*)?\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)$`, "iu"),
   // "Colorado +19.5 Spread (-117)" — price in parens, no opponent.
   new RegExp(`^(?<team>${TEAM}) (?<num>[+-]\\d+\\.?\\d*) Spread\\s*\\([+-]\\d+\\)$`, "iu"),
   // "SF 49ers -3.5 Spread" / "Knicks +7.5 spread" — no opponent in text.
@@ -95,6 +102,11 @@ const SPREAD_PATTERNS = [
 const TOTAL_PATTERNS = [
   // "Over 2.5 Total Goals (Inter Milan vs Club Brugge) -250"
   new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*) Total (?:Goals|Points|Runs)\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)\\s*([+-]\\d+)?$`, "iu"),
+  // "Over 4.5 Goals (CGY @ SEA)" — no "Total" keyword at all, just the bare stat word plus
+  // the A-vs-B matchup. Found 2026-11-05 on a real stuck NHL ticket: the "Total " prefix is
+  // mandatory in every pattern above, so this plain slip-upload phrasing fell through to
+  // "unsupported" even with the matchup right there in the text.
+  new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*) (?:Goals|Points|Runs)\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)\\s*([+-]\\d+)?$`, "iu"),
   // "Over 2.5 Total Goals - Eintracht vs Cologne (-285)" / "Eintracht Frankfurt vs Cologne - Over 2.5 Total Goals (-320)"
   new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*) Total (?:Goals|Points|Runs) - (?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\s*(?:\\([+-]\\d+\\))?$`, "iu"),
   new RegExp(`^(?<a>${TEAM}) ${SEP} (?<b>${TEAM}) - (?<dir>Over|Under) (?<num>\\d+\\.?\\d*) Total (?:Goals|Points|Runs)\\s*(?:\\([+-]\\d+\\))?$`, "iu"),

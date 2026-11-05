@@ -1719,7 +1719,7 @@ async function espnKickoffForBet(data) {
   const matchup = extractMatchupFromBetText(data);
   if (!matchup) return null;
   const games = await gamesForDateCached(data.date);
-  const game = findGame(games, matchup.away, matchup.home) || findGame(games, matchup.home, matchup.away);
+  const game = findGame(games, matchup.away, matchup.home, data.date) || findGame(games, matchup.home, matchup.away, data.date);
   if (!game || !game.date) return null;
   const t = new Date(game.date);
   return Number.isNaN(t.getTime()) ? null : t;
@@ -2195,9 +2195,9 @@ const STAT_SPORT_CANDIDATES = {
 // sport(s)' box scores for that date for the player by name — more expensive, only hit when
 // the cheap path has nothing to go on, and returns no match (never a guess) if the player turns
 // up in more than one game that date.
-async function resolveGameForProp(parsed, games, statKey) {
+async function resolveGameForProp(parsed, games, statKey, ticketDate) {
   if (parsed.rawA || parsed.rawB) {
-    const game = findGame(games, parsed.rawA || "", parsed.rawB || "");
+    const game = findGame(games, parsed.rawA || "", parsed.rawB || "", ticketDate);
     if (game) return { game };
   }
   const candidates = STAT_SPORT_CANDIDATES[statKey] || (statKey === "anytimeTd" ? [["football", "nfl"]] : []);
@@ -2263,7 +2263,7 @@ async function gradeOneLeg(leg, ticketDate) {
 
   if (parsed.category === "stat" || parsed.category === "anytimeTd") {
     const statKey = parsed.category === "anytimeTd" ? "anytimeTd" : parsed.statKey;
-    const resolved = await resolveGameForProp(parsed, games, statKey);
+    const resolved = await resolveGameForProp(parsed, games, statKey, ticketDate);
     if (resolved.pending) return { status: "pending", reason: "game not final yet" };
     const game = resolved.game;
     if (!game) {
@@ -2295,7 +2295,7 @@ async function gradeOneLeg(leg, ticketDate) {
 
   const teamQuery = parsed.team || parsed.rawA;
   const oppQuery = parsed.opponent || parsed.rawB;
-  const game = findGame(games, teamQuery || "", oppQuery || "");
+  const game = findGame(games, teamQuery || "", oppQuery || "", ticketDate);
   if (!game) {
     if (stillAwaitingResult(leg.text, games, ticketDate)) return { status: "pending", reason: "no confident game match yet, but game not final" };
     return { status: "needs_review", reason: "no confident game match" };
@@ -2377,6 +2377,16 @@ function rollUpTicketStatus(legs) {
   return "needs_review";
 }
 
+// A "lost" ticket is safe to keep re-grading (to fill in remaining pending legs as their
+// games finish) exactly when a real confirmed-miss leg is what's backing that status --
+// rollUpTicketStatus's unconditional first check means such a ticket can never be rolled
+// back to won/needs_review/pending no matter what the other legs resolve to. A "lost"
+// with no such leg (e.g. a bare manual correction) has nothing proving it's safe, so it
+// stays fully locked by the terminal-lock checks that call this.
+function isEarlyLossBacked(data) {
+  return Array.isArray(data.legs) && data.legs.some((l) => LEG_LOSS_STATUSES.has(l.status));
+}
+
 app.get("/internal/jobs/grader", async (req, res) => {
   const desk = req.query.desk;
   // "collection" lets this same grader run against any single-ticket-shaped collection,
@@ -2393,7 +2403,7 @@ app.get("/internal/jobs/grader", async (req, res) => {
     for (const doc of docs) {
       const data = doc.data;
       // TERMINAL LOCK (2026-11-03, Seb's ask, after a manually-reverted FTD bet got flipped
-      // back by the next grader tick): once a ticket is already won/lost/push/cashout --
+      // back by the next grader tick): once a ticket is already won/push/cashout --
       // whether by this engine, the stuck-bet resolver, or a manual app edit -- the engine
       // never re-grades it again, period. The only way back in is a manual "pending" app
       // edit (Post-Cutover Sync Phase 0b's "pending" action), which clears the status and
@@ -2403,7 +2413,17 @@ app.get("/internal/jobs/grader", async (req, res) => {
       // status overwrites a real manual lock/cash-out/settlement the moment the game goes
       // final. This route had no such guard at all until 2026-11-02 (protected/cashout only;
       // won/lost/push added 2026-11-03).
-      if (data.protected === true || ["won", "lost", "push", "cashout"].includes(data.status)) continue;
+      //
+      // EARLY-LOSS EXCEPTION (2026-11-05, Seb's ask): "lost" is excluded from the lock above
+      // ONLY when that status is actually backed by a confirmed-miss leg (isEarlyLossBacked
+      // below) -- rollUpTicketStatus's very first check is "any miss -> lost", unconditional,
+      // so a ticket in that state can never be rolled back to won/needs_review/pending by
+      // continuing to grade it; the remaining pending legs just get filled in as their games
+      // finish, which is the whole point (full leg-level stats without waiting on every game
+      // in the parlay). A "lost" with NO confirmed-miss leg (a bare manual correction, nothing
+      // for rollUpTicketStatus to re-derive) stays fully locked, same as before.
+      if (data.protected === true || data.status === "cashout" || data.status === "won" || data.status === "push") continue;
+      if (data.status === "lost" && !isEarlyLossBacked(data)) continue;
       const legs = data.legs || [];
       // Re-check "needs_review" too, not just "pending" -- a leg can land on needs_review
       // while its game is still in progress (stillAwaitingResult correctly defers a hard
@@ -2696,7 +2716,7 @@ async function gradeCollectionForDesk(desk, collection, mode) {
     // real $135.07 cashout to "lost"/ret:0 in Supabase this way. Restored by hand; this
     // guard is the actual fix.
     if (data.status === "cashout") continue;
-    // TERMINAL LOCK (2026-11-03, Seb's ask): once a ticket is already won/lost/push -- by
+    // TERMINAL LOCK (2026-11-03, Seb's ask): once a ticket is already won/push -- by
     // this engine, the stuck-bet resolver, or a manual app edit -- never re-grade it again.
     // Before this, a ticket's CURRENT status being won/lost/push didn't exempt it: the
     // pendingIdx/rollUpTicketStatus pass below still ran every tick (intentionally, to catch
@@ -2705,7 +2725,14 @@ async function gradeCollectionForDesk(desk, collection, mode) {
     // rollUpTicketStatus on 2026-11-03. The only way back in is a manual "pending" app edit
     // (Post-Cutover Sync Phase 0b), which clears `status` and makes the doc eligible again
     // with no special-case needed here.
-    if (["won", "lost", "push"].includes(data.status)) continue;
+    //
+    // EARLY-LOSS EXCEPTION (2026-11-05, Seb's ask): a "lost" ticket backed by a real
+    // confirmed-miss leg (isEarlyLossBacked) is excluded from this lock on purpose -- see
+    // the matching comment on the /internal/jobs/grader route above for why this can never
+    // regress the status, only fill in the remaining legs' hit/miss/push as their games
+    // finish.
+    if (data.status === "won" || data.status === "push") continue;
+    if (data.status === "lost" && !isEarlyLossBacked(data)) continue;
     const legs = data.legs || [];
     const pendingIdx = legs
       .map((l, i) => ({ l, i }))
