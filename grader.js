@@ -116,6 +116,13 @@ const TOTAL_PATTERNS = [
   new RegExp(`^(?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\s*:?\\s*(?<dir>Over|Under) (?<num>\\d+\\.?\\d*) Total (?:Goals|Points|Runs)$`, "iu"),
   // "Over 44.5 (Total Alternate)" / "Over 45.5 Total Alternate" — no matchup; use ticket context.
   new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*)\\s*(?:\\(Total\\s*\\)|Total)?$`, "iu"),
+  // "Over 4.5 (CGY vs SEA)" — no stat word at ALL (no "Goals"/"Points"/"Runs"/"Total"), just
+  // the number and the matchup. scoreLeg's "total" category only ever sums the two teams'
+  // scores against direction+line -- it never actually reads a stat name -- so accepting this
+  // maximally bare shape is safe; kept LAST so every more specific pattern above gets first
+  // crack at a leg that actually names its stat. Found 2026-11-05 on Steve's own tail/copy of
+  // a main-desk NHL ticket, uploaded with this even-barer rendering.
+  new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*)\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)\\s*([+-]\\d+)?$`, "iu"),
 ];
 
 // A single TEAM's own total, not the combined game total — needs that team's score alone

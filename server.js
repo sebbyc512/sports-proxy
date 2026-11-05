@@ -1560,6 +1560,103 @@ async function syncNeededRetryRequest(desk, docId, dryRun) {
   return { desk, docId, action: dryRun ? "would-retry" : "retrying", retryCount: retryCount + 1 };
 }
 
+function syncNeededAppEditGaveUpText(desk) {
+  return desk === "main"
+    ? "An app edit (withdrawal/deposit/bet correction) didn't finish going through -- check it"
+    : "An app edit on Steve's desk didn't finish going through -- check it";
+}
+
+// Same three-guard shape as syncNeededRetryRequest (re-check fresh, max 2 retries, 10-min
+// cooldown, DM-and-stop on giveup), generalized to appEdits/appUploads: re-checks the SAME
+// condition that put this doc in the backlog -- still stuck queued/pending past the stale
+// window, OR (appEdits only) "applied" but still incomplete per syncNeededAppEditIncomplete
+// -- against a fresh read before ever retrying, since the earlier scan can be stale by the
+// time this runs. Unlike "requests", there is no desk-specific builder to fire directly here
+// -- the blanket fastWake the caller already fires once per call IS the retry action, so this
+// is pure bookkeeping (retry count / cooldown / giveup), not a second wake.
+async function syncNeededRetryAppEdit(desk, collection, docId, dryRun) {
+  const fresh = await getDoc(desk, collection, docId);
+  const d = fresh?.data || {};
+
+  if (d.retryGaveUp) return { desk, collection, docId, action: "skip-gave-up" };
+
+  const stillStale = (SYNC_NEEDED_STALE_STATUSES[collection] || []).includes(d.status);
+  const stillIncomplete =
+    collection === "appEdits" && d.status === "applied" && (await syncNeededAppEditIncomplete(desk, docId, d).catch(() => false));
+  if (!stillStale && !stillIncomplete) return { desk, collection, docId, action: "skip-already-handled", status: d.status };
+
+  const retryCount = Number(d.retryCount) || 0;
+  const lastRetryAt = d.lastRetryAt ? new Date(d.lastRetryAt).getTime() : 0;
+  if (Date.now() - lastRetryAt < SYNC_NEEDED_RETRY_COOLDOWN_MS) {
+    return { desk, collection, docId, action: "skip-cooldown", retryCount, lastRetryAt: d.lastRetryAt };
+  }
+  if (retryCount >= SYNC_NEEDED_RETRY_MAX) {
+    if (!dryRun) {
+      await mergeUpsertDoc(desk, collection, docId, { retryGaveUp: true });
+      await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text: syncNeededAppEditGaveUpText(desk) }).catch(
+        (err) => console.error("sync-needed: appEdit give-up DM failed:", err.message)
+      );
+    }
+    return { desk, collection, docId, action: dryRun ? "would-give-up" : "gave-up", retryCount };
+  }
+
+  if (!dryRun) {
+    await mergeUpsertDoc(desk, collection, docId, { retryCount: retryCount + 1, lastRetryAt: new Date().toISOString() });
+  }
+  return { desk, collection, docId, action: dryRun ? "would-retry" : "retrying", retryCount: retryCount + 1 };
+}
+
+// --- appEdits completeness guard (2026-11-05, Seb's request) --------------------------
+// Found this day: a $400 withdrawal appEdit was claimed and flipped to status "applied" by
+// Post-Cutover Sync within about a minute -- the real desk write landed fine -- but the
+// Supabase MIRROR copy of the resulting pnlEntries doc was never written. "applied" is PCS's
+// own claim; this engine has no live access to the real desk, so it is not proof the mirror
+// write actually landed, and every engine-side view (self-heal, balance-guard, Steve-side
+// comparisons) stayed blind to the $400 move until this was caught by hand. Deterministic
+// edits -- ones with no judgment call, just a fixed conversion from the edit's own fields --
+// should never sit unresolved more than ~5 minutes, same bar as a plain stuck queued/pending
+// edit.
+const SYNC_NEEDED_DETERMINISTIC_EDIT_ACTIONS = new Set([
+  "withdrawal", "deposit", "balanceUpdate", "keepOut", "private", "live", "stake", "bonus", "won", "lost", "push",
+]);
+
+// Predicts the Supabase pnlEntries doc_id a "pnlEntries/new"-target edit should have produced,
+// ported from the conventions actually observed in real data (wd-app-<editId> for a
+// withdrawal, adj-<editId minus its "ed-" prefix> for a balanceUpdate; deposit mirrors
+// withdrawal's own "dep-app-" shape). Returns null for an action with no "new doc" convention
+// to predict (it targets an EXISTING pnlEntries doc instead) -- never guess a shape that
+// hasn't actually been observed.
+function syncNeededExpectedMirrorDocId(action, editDocId) {
+  if (action === "withdrawal") return `wd-app-${editDocId}`;
+  if (action === "deposit") return `dep-app-${editDocId}`;
+  if (action === "balanceUpdate") return `adj-${editDocId.replace(/^ed-/, "")}`;
+  return null;
+}
+
+// True when a deterministic appEdit already marked "applied" has NOT actually finished
+// landing in the Supabase mirror. For a "pnlEntries/new" edit, predicts the doc id (above) and
+// checks it exists. For an edit against an EXISTING pnlEntries doc (won/lost/push/stake/
+// bonus/private/live/keepOut -- no new id to predict), falls back to checking that doc's own
+// updated_at moved past the edit's createdAt: not a semantic check of WHAT changed, just proof
+// SOME write landed on it after the edit was logged, which is the most this engine (no direct
+// desk access) can verify without guessing at per-action field shapes.
+async function syncNeededAppEditIncomplete(desk, docId, d) {
+  if (!SYNC_NEEDED_DETERMINISTIC_EDIT_ACTIONS.has(d.action)) return false;
+  const target = String(d.target || "");
+  if (target === "pnlEntries/new") {
+    const expectedId = syncNeededExpectedMirrorDocId(d.action, docId);
+    if (!expectedId) return false; // no known convention for this action -- can't verify, don't guess
+    return !(await getDoc(desk, "pnlEntries", expectedId));
+  }
+  const m = target.match(/^pnlEntries\/(.+)$/);
+  if (!m) return false;
+  const targetDoc = await getDoc(desk, "pnlEntries", m[1]);
+  if (!targetDoc) return true; // the edit's own target doesn't even exist -- definitely incomplete
+  const editCreated = new Date(d.createdAt || 0).getTime();
+  const targetUpdated = new Date(targetDoc.updated_at || 0).getTime();
+  return !(editCreated && targetUpdated >= editCreated);
+}
+
 async function syncNeededCheckDesk(desk) {
   const now = Date.now();
   const backlog = [];
@@ -1572,11 +1669,14 @@ async function syncNeededCheckDesk(desk) {
     const staleStatuses = SYNC_NEEDED_STALE_STATUSES[collection] || ["queued", "pending"];
     for (const doc of docs) {
       const d = doc.data || {};
+      const ref = d.createdAt || doc.updated_at;
+      const isStale = ref && now - new Date(ref).getTime() > SYNC_NEEDED_PENDING_STALE_MS;
       if (staleStatuses.includes(d.status)) {
-        const ref = d.createdAt || doc.updated_at;
-        if (ref && now - new Date(ref).getTime() > SYNC_NEEDED_PENDING_STALE_MS) {
-          backlog.push({ desk, collection, docId: doc.doc_id });
-        }
+        if (isStale) backlog.push({ desk, collection, docId: doc.doc_id });
+      } else if (collection === "appEdits" && d.status === "applied" && isStale) {
+        // COMPLETENESS GUARD -- see syncNeededAppEditIncomplete's own comment above.
+        const incomplete = await syncNeededAppEditIncomplete(desk, doc.doc_id, d).catch(() => false);
+        if (incomplete) backlog.push({ desk, collection, docId: doc.doc_id, incomplete: true });
       }
       if (d.status === "processing" && d.claimedAt) {
         if (now - new Date(d.claimedAt).getTime() > SYNC_NEEDED_STUCK_CLAIM_MS) {
@@ -1640,6 +1740,25 @@ app.get("/internal/jobs/sync-needed", async (req, res) => {
               : await triggerBuilderFire(desk, "SYNC_NEEDED_WAKE").catch((err) => ({ ok: false, error: err.message }));
           }
           actions.requestRetries[desk] = entry;
+        }
+      }
+
+      // appEdits/appUploads backlog -- no desk-specific builder to fire (the blanket
+      // fastWake above is the retry action itself), just the per-doc retry-count/cooldown/
+      // giveup bookkeeping.
+      const appEditBacklog = allBacklog.filter((b) => b.collection === "appEdits" || b.collection === "appUploads");
+      if (appEditBacklog.length > 0) {
+        actions.appEditRetries = [];
+        for (const b of appEditBacklog) {
+          actions.appEditRetries.push(
+            await syncNeededRetryAppEdit(b.desk, b.collection, b.docId, dryRun).catch((err) => ({
+              desk: b.desk,
+              collection: b.collection,
+              docId: b.docId,
+              action: "error",
+              error: err.message,
+            }))
+          );
         }
       }
     }
