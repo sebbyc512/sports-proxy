@@ -1657,6 +1657,122 @@ async function syncNeededAppEditIncomplete(desk, docId, d) {
   return !(editCreated && targetUpdated >= editCreated);
 }
 
+// --- Deterministic mirror backfill (2026-11-05, Seb's request) -----------------------
+// An edit this engine already knows is deterministic -- no judgment call, no research, just
+// a fixed conversion from the edit's own fields -- never needs a Claude run to finish writing
+// the Supabase mirror. When syncNeededAppEditIncomplete finds one PCS marked "applied" but
+// never actually mirrored, this constructs and writes the exact same doc shape PCS itself
+// would have (ported from the real conventions observed in production data), instead of
+// re-waking PCS to redo work it already half-did. Returns {ok:false, reason} -- never
+// guesses -- for any action/shape this engine hasn't actually seen and verified; those fall
+// through to a DM instead (see syncNeededBackfillIncompleteAppEdit).
+async function syncNeededBackfillAppEditMirror(desk, docId, d) {
+  const action = d.action;
+  const target = String(d.target || "");
+
+  if (target === "pnlEntries/new") {
+    const v = d.value || {};
+    if (action === "withdrawal" || action === "deposit") {
+      const amount = Math.abs(bgN(bgPick(v, "amount", "value")));
+      if (!amount) return { ok: false, reason: `no amount on "${action}" edit` };
+      const mirrorId = `${action === "withdrawal" ? "wd" : "dep"}-app-${docId}`;
+      await upsertDoc(desk, "pnlEntries", mirrorId, {
+        type: action,
+        date: v.date || String(d.createdAt || "").slice(0, 10),
+        desc: v.desc || `${action === "withdrawal" ? "Withdrawal" : "Deposit"} requested in app by Seb`,
+        amount,
+        source: "app",
+        createdAt: d.createdAt || new Date().toISOString(),
+      });
+      return { ok: true, mirrorId };
+    }
+    if (action === "balanceUpdate") {
+      const setTo = bgN(bgPick(v, "setTo", "balance", "newBalance", "target", "value"));
+      if (!setTo) return { ok: false, reason: "no setTo on balanceUpdate edit" };
+      // "amount" on an adj- row is the delta from the balance walked BEFORE this row exists
+      // (verified against real adj- rows: amount === setTo - the prior computed balance) --
+      // compute it the same way, from everything already in the mirror except this new row.
+      const before = await computeDeskBalance(desk);
+      const amount = Math.round((setTo - before.balance) * 100) / 100;
+      const mirrorId = `adj-${docId.replace(/^ed-/, "")}`;
+      await upsertDoc(desk, "pnlEntries", mirrorId, {
+        type: "adjust",
+        date: v.date || String(d.createdAt || "").slice(0, 10),
+        desc: v.desc || `Balance update: set to $${setTo.toFixed(2)} to match DraftKings`,
+        setTo,
+        amount,
+        createdAt: d.createdAt || new Date().toISOString(),
+      });
+      return { ok: true, mirrorId };
+    }
+    return { ok: false, reason: `no known "pnlEntries/new" convention for action "${action}"` };
+  }
+
+  const m = target.match(/^pnlEntries\/(.+)$/);
+  if (!m) return { ok: false, reason: `unrecognized target "${target}"` };
+  const targetId = m[1];
+  const current = await getDoc(desk, "pnlEntries", targetId);
+  if (!current) return { ok: false, reason: `target doc ${targetId} doesn't exist in the mirror at all -- can't patch it` };
+  const cd = current.data || {};
+
+  // Ticket-level settle actions: same ret math settlePnlRet already uses everywhere else in
+  // this engine (grader, self-heal, balance-guard) -- never a separate formula.
+  if (action === "won" || action === "lost" || action === "push") {
+    const ret = settlePnlRet(action, cd);
+    if (ret === undefined) return { ok: false, reason: `settlePnlRet gave no ret for "${action}"` };
+    await upsertDoc(desk, "pnlEntries", targetId, { ...cd, status: action, ret, settledAt: cd.settledAt || new Date().toISOString() });
+    return { ok: true, mirrorId: targetId };
+  }
+  // Simple field-set edits -- the app's own field names match these action names exactly
+  // (confirmed against data.js's pick(x,'bonus','bonusBet',...) / pick(x,'matt','isMatt')
+  // style field normalization), so the edit's `value` IS the new field value.
+  if (["stake", "bonus", "private", "live", "keepOut"].includes(action)) {
+    if (d.value === undefined) return { ok: false, reason: `edit has no value to apply for action "${action}"` };
+    await upsertDoc(desk, "pnlEntries", targetId, { ...cd, [action]: d.value });
+    return { ok: true, mirrorId: targetId };
+  }
+  return { ok: false, reason: `no known field-patch convention for action "${action}"` };
+}
+
+function syncNeededMirrorBackfillFailedText(desk) {
+  return desk === "main"
+    ? "An app edit finished on the app but the engine couldn't mirror it automatically — check it"
+    : "An app edit on Steve's desk finished on the app but the engine couldn't mirror it automatically — check it";
+}
+
+// Handles ONE "applied but incomplete" appEdit: re-verifies against a fresh read (the earlier
+// scan can be stale), attempts the deterministic backfill above, and DMs Seb -- once, never
+// every tick -- only when that backfill itself can't be done. Never re-wakes PCS: that would
+// just repeat whatever already-partial write happened the first time.
+async function syncNeededBackfillIncompleteAppEdit(desk, docId, dryRun) {
+  const fresh = await getDoc(desk, "appEdits", docId);
+  const d = fresh?.data || {};
+  if (d.status !== "applied") return { desk, docId, action: "skip-not-applied" };
+  if (d.mirrorBackfillDmSent) return { desk, docId, action: "skip-already-dmed" };
+  const stillIncomplete = await syncNeededAppEditIncomplete(desk, docId, d).catch(() => false);
+  if (!stillIncomplete) return { desk, docId, action: "skip-already-complete" };
+
+  if (dryRun) return { desk, docId, action: "would-backfill" };
+
+  const result = await syncNeededBackfillAppEditMirror(desk, docId, d).catch((err) => ({ ok: false, reason: err.message }));
+  if (result.ok) {
+    await upsertDoc(desk, "selfHealLog", `sn-backfill-${Date.now()}`, {
+      source: "sync-needed-backfill",
+      docId,
+      mirrorId: result.mirrorId,
+      action: d.action,
+      at: new Date().toISOString(),
+    });
+    return { desk, docId, action: "backfilled", mirrorId: result.mirrorId };
+  }
+
+  await mergeUpsertDoc(desk, "appEdits", docId, { mirrorBackfillDmSent: true });
+  await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text: syncNeededMirrorBackfillFailedText(desk) }).catch(
+    (err) => console.error("sync-needed: mirror-backfill-failed DM failed:", err.message)
+  );
+  return { desk, docId, action: "backfill-failed-dmed", reason: result.reason };
+}
+
 async function syncNeededCheckDesk(desk) {
   const now = Date.now();
   const backlog = [];
@@ -1700,7 +1816,29 @@ app.get("/internal/jobs/sync-needed", async (req, res) => {
     }
 
     const actions = {};
-    if (allBacklog.length > 0) {
+    // An "incomplete" entry (appEdits marked "applied" whose mirror write never landed) needs
+    // a direct deterministic backfill, NOT another PCS wake -- re-waking PCS just repeats
+    // whatever already-partial write happened the first time. Keep it entirely out of the
+    // generic backlog handling below (fastWake / per-doc retry-wake bookkeeping), which stays
+    // for the genuinely-stuck-before-PCS-ever-claimed-it case.
+    const incompleteAppEdits = allBacklog.filter((b) => b.incomplete === true);
+    const otherBacklog = allBacklog.filter((b) => b.incomplete !== true);
+
+    if (incompleteAppEdits.length > 0) {
+      actions.mirrorBackfills = [];
+      for (const b of incompleteAppEdits) {
+        actions.mirrorBackfills.push(
+          await syncNeededBackfillIncompleteAppEdit(b.desk, b.docId, dryRun).catch((err) => ({
+            desk: b.desk,
+            docId: b.docId,
+            action: "error",
+            error: err.message,
+          }))
+        );
+      }
+    }
+
+    if (otherBacklog.length > 0) {
       if (!dryRun) {
         actions.fastWake = await triggerSyncWake().catch((err) => ({ ok: false, error: err.message }));
       } else {
@@ -1712,7 +1850,7 @@ app.get("/internal/jobs/sync-needed", async (req, res) => {
       // cooldown) and only fire that desk's builder directly if at least one request on
       // that desk actually clears them.
       const requestBacklogByDesk = {};
-      for (const b of allBacklog) {
+      for (const b of otherBacklog) {
         if (b.collection !== "requests") continue;
         (requestBacklogByDesk[b.desk] = requestBacklogByDesk[b.desk] || []).push(b.docId);
       }
@@ -1746,7 +1884,7 @@ app.get("/internal/jobs/sync-needed", async (req, res) => {
       // appEdits/appUploads backlog -- no desk-specific builder to fire (the blanket
       // fastWake above is the retry action itself), just the per-doc retry-count/cooldown/
       // giveup bookkeeping.
-      const appEditBacklog = allBacklog.filter((b) => b.collection === "appEdits" || b.collection === "appUploads");
+      const appEditBacklog = otherBacklog.filter((b) => b.collection === "appEdits" || b.collection === "appUploads");
       if (appEditBacklog.length > 0) {
         actions.appEditRetries = [];
         for (const b of appEditBacklog) {
