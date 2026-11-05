@@ -774,9 +774,27 @@ async function triggerFullSyncWake() {
   return { ok: true, fired: true };
 }
 
+// (2026-11-05, Seb's request, after a request sat stuck for ~10min despite the instant-wake
+// trigger firing correctly) -- the DB trigger below now also passes desk/collection/docId in
+// its body. When collection is "requests", this handler fires that desk's own builder directly
+// via the SAME relay/cooldown sync-needed already uses (triggerBuilderFire), in ADDITION to the
+// existing PCS fast-path wake -- so the builder itself (which now also checks the Supabase
+// mirror for app-sourced queued/sent requests PCS hasn't copied up yet, see its own prompt) gets
+// a chance to pick the row up immediately, without waiting on PCS's own copy-up step at all.
+// Unknown/missing desk, or collection other than "requests", is a no-op for this part -- the
+// PCS fast-path wake below still always fires regardless. The 10-min sync-needed cron + its
+// retry cap stays as the backstop for whichever of these two instant paths misses.
 app.post("/internal/jobs/wake-sync", async (req, res) => {
   try {
-    res.json(await triggerSyncWake());
+    const result = await triggerSyncWake();
+    const { desk, collection, docId } = req.body || {};
+    if (collection === "requests" && BUILDER_FIRE[desk]) {
+      result.builderFire = await triggerBuilderFire(
+        desk,
+        `APP_INSERT_WAKE: new request ${docId || ""} -- check Supabase for it and build it now if Post-Cutover Sync hasn't copied it up yet.`
+      ).catch((err) => ({ ok: false, error: err.message }));
+    }
+    res.json(result);
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
