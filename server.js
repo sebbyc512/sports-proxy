@@ -5725,6 +5725,18 @@ app.get("/internal/test/api-football-diag", async (req, res) => {
   res.json(out);
 });
 
+// One-off verification helper (2026-11-05): forces a fresh fixturesToday fetch (bypassing
+// the once-a-day cache) so eloEdge/odds integration can be checked without waiting for the
+// ET calendar date to roll over. Same diagnostic-route pattern as soccer-source-swap below.
+app.get("/internal/test/soccer-fixtures-refresh", async (req, res) => {
+  try {
+    const fixtures = await fetchSoccerCandidateFixturesFresh();
+    res.json({ ok: true, count: fixtures.length, fixtures });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/internal/test/soccer-source-swap", async (req, res) => {
   if (!API_FOOTBALL_KEY) return res.status(400).json({ error: "API_FOOTBALL_KEY not set" });
   const calls = [];
