@@ -1394,7 +1394,7 @@ async function balanceGuardCheckDesk(desk, dryRun) {
         checkedAt: new Date().toISOString(),
       });
     }
-    return { desk, action: "baseline-set", balance: current.balance };
+    return { desk, action: "baseline-set", balance: current.balance, anchored: current.anchored, anchorDate: current.anchorDate };
   }
 
   const prevBalance = Number(prevState.data.balance) || 0;
@@ -1405,7 +1405,7 @@ async function balanceGuardCheckDesk(desk, dryRun) {
   // qualifying events, past the threshold, is unexplained.
   const unexplained = events.length > 0 ? 0 : rawDelta;
 
-  const result = { desk, rawDelta, unexplained, events, balance: current.balance };
+  const result = { desk, rawDelta, unexplained, events, balance: current.balance, anchored: current.anchored, anchorDate: current.anchorDate };
 
   if (Math.abs(unexplained) <= BALANCE_GUARD_THRESHOLD) {
     result.action = "no-op";
