@@ -116,6 +116,13 @@ const TOTAL_PATTERNS = [
   new RegExp(`^(?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\s*:?\\s*(?<dir>Over|Under) (?<num>\\d+\\.?\\d*) Total (?:Goals|Points|Runs)$`, "iu"),
   // "Over 44.5 (Total Alternate)" / "Over 45.5 Total Alternate" — no matchup; use ticket context.
   new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*)\\s*(?:\\(Total\\s*\\)|Total)?$`, "iu"),
+  // "Over 6.5 Total (SEA vs CGY)" — has the bare "Total" keyword but no stat noun after it
+  // (no "Goals"/"Points"/"Runs"), straight into the matchup parens. Every "Total "-prefixed
+  // pattern above requires that stat word, so this real slip-upload shape (found 2026-11-05,
+  // a stuck NHL ticket) fell through all the way to "unsupported" despite "Total" being right
+  // there in the text -- must come before the maximally-bare no-"Total"-at-all pattern below,
+  // which would otherwise never get reached (this text contains "Total", so it fails that one).
+  new RegExp(`^(?<dir>Over|Under) (?<num>\\d+\\.?\\d*) Total\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)\\s*([+-]\\d+)?$`, "iu"),
   // "Over 4.5 (CGY vs SEA)" — no stat word at ALL (no "Goals"/"Points"/"Runs"/"Total"), just
   // the number and the matchup. scoreLeg's "total" category only ever sums the two teams'
   // scores against direction+line -- it never actually reads a stat name -- so accepting this
