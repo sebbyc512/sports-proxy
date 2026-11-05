@@ -3523,6 +3523,21 @@ async function refreshSoccerElo() {
     } catch (err) {
       trendErrors.push(err.message);
     }
+  } else {
+    // Didn't re-fetch history tonight (within the weekly gate) -- carry the last computed
+    // last5Trend forward from the existing doc instead of silently dropping it. Without
+    // this, every nightly run between weekly history pulls would overwrite `clubs` (a
+    // mergeUpsertDoc shallow-merges at the top level, not per-club) with trend-less data,
+    // found live on 2026-11-05 when two manual runs back-to-back wiped trend on the second.
+    try {
+      const existing = await getDoc("main", "soccer", "elo");
+      const existingClubs = existing?.data?.clubs || {};
+      for (const slug of Object.keys(clubsBySlug)) {
+        if (existingClubs[slug]?.last5Trend != null) clubsBySlug[slug].last5Trend = existingClubs[slug].last5Trend;
+      }
+    } catch (err) {
+      trendErrors.push(`trend-carryover: ${err.message}`);
+    }
   }
 
   const tracked = await supabaseFetch(`/docs?desk_id=eq.main&collection=eq.soccerTeams&select=doc_id,data`);
