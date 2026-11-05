@@ -998,6 +998,28 @@ app.get("/internal/jobs/send-steve-weekly-report-20261102", async (req, res) => 
 const SELF_HEAL_BALANCE_EPSILON = 0.01;
 const SELF_HEAL_WAKE_COOLDOWN_MS = 60 * 60 * 1000; // at most one wake per hour, per Seb's ask
 
+// Winnings for a bonus-bet WIN (2026-11-05 correction -- "ret-stake" can undercount a
+// bonus win: a DraftKings bonus-bet slip's displayed payout usually excludes the stake
+// already, since there was no real stake to return. Compute winnings directly from odds
+// when they're known -- stake * (decimal odds - 1), boost applied to the profit portion
+// only, same shape as toWinAmount's profit term -- and ignore the recorded ret/potential
+// entirely in that case. Only when `odds` is missing/unusable fall back to the recorded
+// payout, and only subtract stake from THAT when the payout is actually bigger than the
+// stake (a real stake+profit number); a payout no bigger than the stake must already be
+// winnings-only.
+function bonusWinAmount(d) {
+  const stake = Number(d.stake) || 0;
+  const odds = Number(d.odds);
+  if (Number.isFinite(odds) && odds !== 0) {
+    let profit = odds > 0 ? stake * (odds / 100) : stake * (100 / Math.abs(odds));
+    const b = Number(d.boost) || 0;
+    if (b) profit *= 1 + b / 100;
+    return Math.round(profit * 100) / 100;
+  }
+  const payout = Number(d.ret) || 0;
+  return payout > stake ? Math.round((payout - stake) * 100) / 100 : payout;
+}
+
 function pnlDelta(d) {
   if (d.protected === true) {
     // A locked Early Exit still has a real, final ret -- same math as a normal win, just
@@ -1005,15 +1027,21 @@ function pnlDelta(d) {
     if (d.status === "won") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
     return 0;
   }
+  if (d.status === "won") {
+    // Bonus bet (bonus:true, 2026-11-05): use bonusWinAmount instead of the normal
+    // ret-minus-stake math -- see that function's own comment for why.
+    if (d.bonus === true) return bonusWinAmount(d);
+    return (Number(d.ret) || 0) - (Number(d.stake) || 0);
+  }
   // "cashout" is also a real, final payout (what Seb actually got paid, manually entered --
   // never derivable from legs/odds) -- same ret-minus-stake math as a win. Missing this
   // case silently understated the computed balance by every cashout's net on both sides of
   // self-heal's comparison. Found 2026-11-02 alongside the same gap in the live grader.
-  if (d.status === "won" || d.status === "cashout") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
+  // Never bonus-adjusted: a cashout amount is always a real, manually-entered dollar figure.
+  if (d.status === "cashout") return (Number(d.ret) || 0) - (Number(d.stake) || 0);
   // A bonus/free bet (bonus:true, 2026-11-05) that loses costs nothing real -- `stake` on
   // that doc is a face amount for ret math only, never actual money at risk, so don't
-  // subtract it. Won/cashout above already nets to winnings-only/stake-returned for a
-  // bonus doc too (ret-stake=profit regardless of bonus), so no change needed there.
+  // subtract it.
   if (d.status === "lost") return d.bonus === true ? 0 : -(Number(d.stake) || 0);
   return 0; // push/open/pending never move the balance
 }
