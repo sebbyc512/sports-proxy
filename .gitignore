@@ -21,3 +21,6 @@ sql/cbb-daily-snapshot-cron-run-me.sql
 sql/news-check-cron-run-me.sql
 sql/soccer-lineup-check-cron-run-me.sql
 sql/understat-weekly-check-cron-run-me.sql
+sql/new-token-run-me.txt
+sql/token-rotation-2-run-me.sql
+sql/pg-net-timeout-30s-run-me.sql

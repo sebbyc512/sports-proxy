@@ -1165,6 +1165,87 @@ app.get("/internal/jobs/self-heal", async (req, res) => {
 const SYNC_NEEDED_PENDING_STALE_MS = 5 * 60 * 1000;
 const SYNC_NEEDED_STUCK_CLAIM_MS = 20 * 60 * 1000;
 const SYNC_NEEDED_COLLECTIONS = ["requests", "appUploads", "appEdits"];
+// "requests" goes through an extra hold PCS itself creates -- "sent" means PCS already
+// copied the app's queued row onto the real desk (status "new" there) and attempted to
+// fire that desk's builder, but never saw it come back "answered". A "sent" row stuck
+// past the stale window almost always means the builder-fire attempt itself failed (e.g.
+// a stale/misconfigured *_BUILDER_FIRE_URL/TOKEN -- see the 2026-11-04 Friends builder
+// incident), not that PCS never ran -- so it needs a direct per-desk builder retry below,
+// not just another generic PCS wake. appUploads/appEdits have no such intermediate hold
+// (PCS claims and finishes them in one pass), so they stay on "queued"/"pending" only.
+const SYNC_NEEDED_STALE_STATUSES = {
+  requests: ["queued", "pending", "sent"],
+  appUploads: ["queued", "pending"],
+  appEdits: ["queued", "pending"],
+};
+
+// --- "requests" retry guards (2026-11-04, Seb's request, after the Friends builder-fire-
+// URL incident) --- A stale "sent" request means PCS already copied it to the real desk
+// and tried to fire that desk's builder, but the fire attempt itself may have failed. Three
+// guards before ever retrying: (1) re-check fresh, right before firing, that it isn't
+// already answered/working, or that a parlay doc already exists for it (data.requestId ===
+// this doc's id -- confirmed live on 2026-11-04's own steve-nba-...-3u parlay) -- covers the
+// race where the real build succeeded but PCS's own round-trip just hasn't caught up yet;
+// (2) at most 2 retries per request, tracked as retryCount/lastRetryAt/retryGaveUp on the
+// request doc itself via a full read-merge-write (mergeUpsertDoc, never a blind overwrite --
+// this doc gets written by the app/PCS too); (3) never more than one retry per 10 minutes
+// per request. After 2 retries with no answer, stop retrying and DM Seb once -- plain
+// English only, no $ and no technical detail, same as the group-post-no-dollars rule applied
+// to this private DM too.
+const SYNC_NEEDED_RETRY_MAX = 2;
+const SYNC_NEEDED_RETRY_COOLDOWN_MS = 10 * 60 * 1000;
+
+function syncNeededGaveUpText(desk) {
+  return desk === "main" ? "Your pick request didn't start — check it" : "Steve's pick request didn't start — check it";
+}
+
+// True if the real build already landed, even if the Supabase "requests" row hasn't been
+// round-tripped to "answered" yet (PCS's job, not this one's).
+async function syncNeededRequestAlreadyBuilt(desk, docId) {
+  const parlaysRes = await supabaseFetch(
+    `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.parlays&select=data`
+  );
+  const parlays = await parlaysRes.json();
+  return parlays.some((p) => p.data?.requestId === docId);
+}
+
+// Decides what to do with ONE stale "requests" doc, applying all three guards against a
+// fresh read (never the earlier backlog scan, which can be stale by the time this runs).
+// dryRun skips every write (mergeUpsertDoc, Telegram) and just reports the decision.
+async function syncNeededRetryRequest(desk, docId, dryRun) {
+  const fresh = await getDoc(desk, "requests", docId);
+  const d = fresh?.data || {};
+
+  if (d.status === "answered" || d.status === "working") {
+    return { desk, docId, action: "skip-already-handled", status: d.status };
+  }
+  if (d.retryGaveUp) {
+    return { desk, docId, action: "skip-gave-up" };
+  }
+  if (await syncNeededRequestAlreadyBuilt(desk, docId)) {
+    return { desk, docId, action: "skip-parlay-exists" };
+  }
+
+  const retryCount = Number(d.retryCount) || 0;
+  const lastRetryAt = d.lastRetryAt ? new Date(d.lastRetryAt).getTime() : 0;
+  if (Date.now() - lastRetryAt < SYNC_NEEDED_RETRY_COOLDOWN_MS) {
+    return { desk, docId, action: "skip-cooldown", retryCount, lastRetryAt: d.lastRetryAt };
+  }
+  if (retryCount >= SYNC_NEEDED_RETRY_MAX) {
+    if (!dryRun) {
+      await mergeUpsertDoc(desk, "requests", docId, { retryGaveUp: true });
+      await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text: syncNeededGaveUpText(desk) }).catch(
+        (err) => console.error("sync-needed: give-up DM failed:", err.message)
+      );
+    }
+    return { desk, docId, action: dryRun ? "would-give-up" : "gave-up", retryCount };
+  }
+
+  if (!dryRun) {
+    await mergeUpsertDoc(desk, "requests", docId, { retryCount: retryCount + 1, lastRetryAt: new Date().toISOString() });
+  }
+  return { desk, docId, action: dryRun ? "would-retry" : "retrying", retryCount: retryCount + 1 };
+}
 
 async function syncNeededCheckDesk(desk) {
   const now = Date.now();
@@ -1175,9 +1256,10 @@ async function syncNeededCheckDesk(desk) {
       `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.${collection}&select=doc_id,data,updated_at`
     );
     const docs = await listRes.json();
+    const staleStatuses = SYNC_NEEDED_STALE_STATUSES[collection] || ["queued", "pending"];
     for (const doc of docs) {
       const d = doc.data || {};
-      if (["queued", "pending"].includes(d.status)) {
+      if (staleStatuses.includes(d.status)) {
         const ref = d.createdAt || doc.updated_at;
         if (ref && now - new Date(ref).getTime() > SYNC_NEEDED_PENDING_STALE_MS) {
           backlog.push({ desk, collection, docId: doc.doc_id });
@@ -1194,21 +1276,68 @@ async function syncNeededCheckDesk(desk) {
 }
 
 app.get("/internal/jobs/sync-needed", async (req, res) => {
+  const dryRun = req.query.dryRun === "true";
   try {
     const results = await Promise.all(["main", "steve"].map(syncNeededCheckDesk));
     const allBacklog = results.flatMap((r) => r.backlog);
     const allStuck = results.flatMap((r) => r.stuck);
 
     if (allBacklog.length === 0 && allStuck.length === 0) {
-      return res.json({ ok: true, action: "none" });
+      return res.json({ ok: true, action: "none", dryRun });
     }
 
     const actions = {};
     if (allBacklog.length > 0) {
-      actions.fastWake = await triggerSyncWake().catch((err) => ({ ok: false, error: err.message }));
+      if (!dryRun) {
+        actions.fastWake = await triggerSyncWake().catch((err) => ({ ok: false, error: err.message }));
+      } else {
+        actions.fastWake = { ok: true, wouldFire: true };
+      }
+
+      // A stale "requests" row means a specific desk's pick request is stuck -- run it
+      // through the three retry guards (already-built check, max 2 retries, 10-min
+      // cooldown) and only fire that desk's builder directly if at least one request on
+      // that desk actually clears them.
+      const requestBacklogByDesk = {};
+      for (const b of allBacklog) {
+        if (b.collection !== "requests") continue;
+        (requestBacklogByDesk[b.desk] = requestBacklogByDesk[b.desk] || []).push(b.docId);
+      }
+      if (Object.keys(requestBacklogByDesk).length > 0) {
+        actions.requestRetries = {};
+        for (const [desk, docIds] of Object.entries(requestBacklogByDesk)) {
+          const perDoc = [];
+          for (const docId of docIds) {
+            perDoc.push(
+              await syncNeededRetryRequest(desk, docId, dryRun).catch((err) => ({
+                desk,
+                docId,
+                action: "error",
+                error: err.message,
+              }))
+            );
+          }
+          const eligibleAction = dryRun ? "would-retry" : "retrying";
+          const eligible = perDoc.some((r) => r.action === eligibleAction);
+          const entry = { perDoc, fired: false };
+          if (eligible) {
+            entry.fired = !dryRun;
+            entry.fire = dryRun
+              ? { ok: true, wouldFire: true }
+              : await triggerBuilderFire(desk, "SYNC_NEEDED_WAKE").catch((err) => ({ ok: false, error: err.message }));
+          }
+          actions.requestRetries[desk] = entry;
+        }
+      }
     }
     if (allStuck.length > 0) {
-      actions.fullWake = await triggerFullSyncWake().catch((err) => ({ ok: false, error: err.message }));
+      actions.fullWake = dryRun
+        ? { ok: true, wouldFire: true }
+        : await triggerFullSyncWake().catch((err) => ({ ok: false, error: err.message }));
+    }
+
+    if (dryRun) {
+      return res.json({ ok: true, action: "would-handle", dryRun, backlog: allBacklog, stuck: allStuck, actions });
     }
 
     await upsertDoc("main", "selfHealLog", `sn-${Date.now()}`, {
