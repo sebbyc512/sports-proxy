@@ -23,6 +23,13 @@ const NOISE_RES = [
   /^LIVE:\s*/gi, // "LIVE: Player N+ Stat (...)" prefix on a bet placed mid-game
   [/;[^()]*\)/g, ")"], // trailing in-game commentary inside the matchup parens -> just ")"
   /\s*\*\(I am 55% or less sure on this leg, add at your own risk\)\s*$/gi, // low-confidence 3-unit leg marker
+  // Goalie-disclosure markers (nhl-model-spec) trailing after the kickoff-time paren, e.g.
+  // "Colorado Avalanche -1.5 vs Flames (10:10 PM ET) *(goalie unconfirmed)" -- left two whole
+  // NHL legs on a real lotto ticket stuck needs_review forever (found 2026-11-05) because
+  // nothing stripped this before the spread/ml patterns ran. "(backup goalie)" is the new
+  // 2026-11-05 companion marker (nhl-model-spec's 3-state goalie rule) -- stripped here too
+  // so it never breaks the same way once builders start using it.
+  /\s*\*?\(\s*(?:goalie unconfirmed|backup goalie)\s*\)\s*$/gi,
   /,\s*alt\b/gi, // "Over 45.5 total points, alt (Low)" -> "Over 45.5 total points (Low)"
   // Trailing kickoff/tip time, e.g. "(7:00 PM ET)" or "(90 min, 12:30 PM ET)" -- "ET" is
   // OPTIONAL: a real class of slip-upload legs renders this as bare "(8:10 PM)" with no
