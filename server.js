@@ -1694,10 +1694,14 @@ const STUCK_RESOLVER_FIRE_TOKEN = process.env.STUCK_RESOLVER_FIRE_TOKEN;
 
 // Pulls the two team names out of a bet's own text, e.g. "...(CHI @ SEA)" -> {away:"CHI", home:"SEA"}.
 // Every bet doc on this desk carries the matchup in that exact "(A @ B)" shape in desc and/or leg text.
+// SEPARATOR (fixed 2026-11-05): only matched "@" -- every soccer slip-upload leg writes its
+// matchup as "(A vs B)", not "(A @ B)", so this returned null for any soccer bet, pushing the
+// stuck-bet gate's kickoff estimate to the much-later createdAt+6h fallback instead of the
+// real kickoff time. Same separator set as grader.js's own SEP pattern.
 function extractMatchupFromBetText(data) {
   const texts = [data.desc, ...((Array.isArray(data.legs) ? data.legs : []).map((l) => l.text))].filter(Boolean);
   for (const t of texts) {
-    const m = t.match(/\(([A-Za-z.' ]+?)\s*@\s*([A-Za-z.' ]+?)\)/);
+    const m = t.match(/\(([A-Za-z.' ]+?)\s+(?:vs\.?|v\.?|@|at)\s+([A-Za-z.' ]+?)\)/i);
     if (m) return { away: m[1].trim(), home: m[2].trim() };
   }
   return null;
