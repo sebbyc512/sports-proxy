@@ -6,7 +6,7 @@
 
 import express from "express";
 import { parseLeg } from "./grader.js";
-import { teamMatches, findGame } from "./matcher.js";
+import { norm, teamMatches, findGame } from "./matcher.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -3409,11 +3409,230 @@ async function refreshSoccerTeams() {
   return result;
 }
 
+// --- beyondELO soccer ratings ingestion (2026-11-05, Seb's request) ---
+// Official open data (CC BY 4.0, https://beyondelo.com). CSV endpoints only -- never
+// scrapes beyondELO's website pages. No API key required. Piggybacked entirely on this
+// nightly job (no separate cron): one club-ratings.csv call every night, plus a
+// weekly-gated club-elo-history call for the current-season last-5 trend.
+const BEYONDELO_BASE = "https://public-api.beyondelo.com/v1/datasets";
+const BEYONDELO_SEASON = "2026-2027";
+
+function parseCsv(text) {
+  const lines = text.split("\n").filter((l) => l.trim().length);
+  if (!lines.length) return [];
+  const headers = lines[0].split(",");
+  return lines.slice(1).map((line) => {
+    const cells = line.split(","); // beyondELO's own fields never contain embedded commas
+    const row = {};
+    headers.forEach((h, i) => (row[h] = cells[i]));
+    return row;
+  });
+}
+
+async function fetchBeyondEloCsv(path) {
+  const res = await fetch(`${BEYONDELO_BASE}/${path}`, { headers: { "User-Agent": "sports-proxy/0.1" } });
+  if (!res.ok) throw new Error(`beyondELO ${path} -> HTTP ${res.status}`);
+  return parseCsv(await res.text());
+}
+
+// Normalizes a club display name the way ESPN/API-Football spell it, for matching against
+// beyondELO's own `name` (and, via BEYONDELO_ALIASES below, its `slug`). Strips the common
+// suffix/prefix tokens that differ by source ("AC Milan" vs "Milan", "AS Roma" vs "Roma").
+function normClubName(name) {
+  return norm(name || "")
+    .replace(/\b(fc|cf|afc|sc|ac|as|club|calcio|cd|ud|sd|if|bk|fk|us)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Hand-checked aliases for cases plain normalization can't bridge (nicknames, desk
+// shorthand, or beyondELO naming a club differently than ESPN/API-Football do). Extend
+// this list as new unmatched names turn up in main/soccer/elo.unmatched.
+const BEYONDELO_ALIASES = {
+  "man city": "manchester-city", "man utd": "manchester-united", "man united": "manchester-united",
+  "inter milan": "inter", "bayern munchen": "bayern-munich", "bayern munich": "bayern-munich",
+  "vfb stuttgart": "vfb-stuttgart", "stuttgart": "vfb-stuttgart", "psg": "paris-saint-germain",
+  "paris st germain": "paris-saint-germain", "sporting lisbon": "sporting-cp", "sporting": "sporting-cp",
+  "dortmund": "borussia-dortmund", "monza brianza": "monza", "lecce": "us-lecce",
+  "deportivo": "deportivo-la-coruna", "shakhtar": "shakhtar-donetsk", "elversberg": "sv-elversberg",
+};
+
+function resolveBeyondEloSlug(teamName, clubsByName) {
+  const key = normClubName(teamName);
+  if (!key) return null;
+  if (BEYONDELO_ALIASES[key]) return BEYONDELO_ALIASES[key];
+  if (clubsByName.has(key)) return clubsByName.get(key);
+  for (const [nameKey, slug] of clubsByName) {
+    if (key.length > 3 && (nameKey.includes(key) || key.includes(nameKey))) return slug;
+  }
+  return null;
+}
+
+function americanToProb(price) {
+  const p = Number(price);
+  if (!Number.isFinite(p)) return null;
+  return p > 0 ? 100 / (p + 100) : -p / (-p + 100);
+}
+
+// Writes main/soccer/elo as ONE full doc (not one doc per club) -- elo/rd/hfa/rank/
+// last5Trend per club, plus attribution + as_of, as Seb asked. Also reports which of our
+// OWN tracked teams (soccerTeams) didn't resolve to a beyondELO club, so gaps are visible
+// instead of silently missing an ELO number.
+async function refreshSoccerElo() {
+  const clubRows = await fetchBeyondEloCsv("club-ratings.csv");
+  const clubsBySlug = {};
+  const clubsByName = new Map();
+  for (const r of clubRows) {
+    if (!r.slug || !r.elo) continue;
+    clubsBySlug[r.slug] = {
+      slug: r.slug,
+      name: r.name,
+      countryCode: r.country_code,
+      elo: Number(r.elo),
+      rd: Number(r.rd),
+      hfa: Number(r.hfa),
+      rank: r.rank ? Number(r.rank) : null,
+      asOf: r.as_of,
+    };
+    clubsByName.set(normClubName(r.name), r.slug);
+  }
+
+  // Weekly-gated history pull -> last-5-recorded-points trend per club. Same
+  // once-per-cadence guard pattern as apiFootballGuardedCall/getSoccerCandidateFixtures.
+  const historyState = await getDoc("main", "taskConfig", "beyondEloHistoryFetch");
+  const todayStr = etDateDaysAgo(0);
+  const lastFetched = historyState?.data?.lastFetchedAt;
+  const needsHistory = !lastFetched || new Date(todayStr) - new Date(lastFetched) >= 7 * 24 * 60 * 60 * 1000;
+  const trendErrors = [];
+  if (needsHistory) {
+    try {
+      const histRows = await fetchBeyondEloCsv(`club-elo-history/${BEYONDELO_SEASON}.csv`);
+      const bySlugHistory = {};
+      for (const r of histRows) {
+        if (!r.club || !r.elo) continue;
+        (bySlugHistory[r.club] = bySlugHistory[r.club] || []).push({ date: r.date, elo: Number(r.elo) });
+      }
+      for (const slug of Object.keys(bySlugHistory)) {
+        const recs = bySlugHistory[slug].sort((a, b) => (a.date < b.date ? -1 : 1));
+        if (recs.length >= 2 && clubsBySlug[slug]) {
+          const prior = recs[Math.max(0, recs.length - 5)];
+          clubsBySlug[slug].last5Trend = Math.round((clubsBySlug[slug].elo - prior.elo) * 10) / 10;
+        }
+      }
+      await upsertDoc("main", "taskConfig", "beyondEloHistoryFetch", { lastFetchedAt: new Date().toISOString(), season: BEYONDELO_SEASON });
+    } catch (err) {
+      trendErrors.push(err.message);
+    }
+  }
+
+  const tracked = await supabaseFetch(`/docs?desk_id=eq.main&collection=eq.soccerTeams&select=doc_id,data`);
+  const trackedRows = await tracked.json();
+  const unmatched = [];
+  for (const row of trackedRows) {
+    const teamName = row.data?.teamName;
+    if (!teamName) continue;
+    const slug = resolveBeyondEloSlug(teamName, clubsByName);
+    if (!slug || !clubsBySlug[slug]) unmatched.push(teamName);
+  }
+
+  await mergeUpsertDoc("main", "soccer", "elo", {
+    clubs: clubsBySlug,
+    unmatched,
+    attribution: "beyondELO (https://beyondelo.com), CC BY 4.0",
+    asOf: clubRows[0]?.as_of || todayStr,
+    lastUpdated: new Date().toISOString(),
+    trendErrors,
+  });
+  return { clubCount: Object.keys(clubsBySlug).length, unmatchedCount: unmatched.length, historyRefreshed: needsHistory };
+}
+
+// --- soccer eloEdge fade-filter: log-only -> auto-activate (2026-11-05, Seb's request) ---
+// Evaluates real, live-tagged results (not the backtest) exactly once after the rule doc's
+// autoEvaluateAfter date: if negative-eloEdge legs are still hitting below their own average
+// implied probability, flips rules/soccer-elo-fade-filter to a hard drop filter on both
+// desks automatically. Either way Seb gets a Telegram DM -- no manual follow-up needed, and
+// no Monday-recap routine prompt edit required.
+async function evaluateSoccerEloFadeFilter() {
+  const stateDoc = await getDoc("main", "rules", "soccer-elo-fade-filter");
+  const state = stateDoc?.data;
+  if (!state || state.mode !== "log_only") return { skipped: true, reason: "not in log_only mode" };
+  const today = etDateDaysAgo(0);
+  if (today < state.autoEvaluateAfter) return { skipped: true, reason: "before autoEvaluateAfter", today };
+  if (state.lastEvaluation && state.lastEvaluation.decision !== "insufficient_sample") {
+    return { skipped: true, reason: "already evaluated", prior: state.lastEvaluation };
+  }
+
+  const legs = [];
+  for (const desk of ["main", "steve"]) {
+    for (const collection of ["parlays", "pnlEntries"]) {
+      const r = await supabaseFetch(`/docs?desk_id=eq.${desk}&collection=eq.${collection}&select=data`);
+      const rows = await r.json();
+      for (const row of rows) {
+        for (const leg of row.data?.legs || []) {
+          const league = leg.league || row.data?.league;
+          if (league !== "SOCCER") continue;
+          if (typeof leg.eloEdge !== "number") continue;
+          if (!["hit", "miss"].includes(leg.status)) continue;
+          if (leg.eloAsOf && leg.eloAsOf < state.logOnlySince) continue;
+          legs.push(leg);
+        }
+      }
+    }
+  }
+
+  const negative = legs.filter((l) => l.eloEdge < -0.02);
+  const result = { n: negative.length, evaluatedAt: new Date().toISOString() };
+  if (negative.length < 5) {
+    result.decision = "insufficient_sample";
+  } else {
+    const hitRate = negative.filter((l) => l.status === "hit").length / negative.length;
+    const implieds = negative.map((l) => americanToProb(l.price)).filter((v) => v != null);
+    const avgImplied = implieds.length ? implieds.reduce((s, v) => s + v, 0) / implieds.length : null;
+    result.hitRate = hitRate;
+    result.avgImplied = avgImplied;
+    result.decision = avgImplied != null && hitRate < avgImplied ? "activate" : "stay_log_only";
+  }
+
+  const newState = { ...state, lastEvaluation: result };
+  if (result.decision === "activate") {
+    newState.mode = "hard_filter";
+    newState.on = true;
+  }
+  await mergeUpsertDoc("main", "rules", "soccer-elo-fade-filter", newState);
+  await mergeUpsertDoc("steve", "rules", "soccer-elo-fade-filter", newState);
+
+  if (TELEGRAM_SEB_CHAT_ID) {
+    // Plain language only, Seb's private DM, no $ amounts or technical terms (percentages,
+    // "eloEdge", "ROI", sample sizes) -- just what changed and why in a sentence or two.
+    const message =
+      result.decision === "activate"
+        ? "Soccer picks: I turned on the ELO-based fade filter. Picks where the team-strength model disagreed with the posted odds have been losing more than they should, so those will now get dropped unless there's another strong reason to keep them."
+        : result.decision === "insufficient_sample"
+        ? "Soccer picks: checked the new ELO fade idea against real results, but there haven't been enough matching picks yet to decide. Leaving it as information-only for now and will check again soon."
+        : "Soccer picks: checked the new ELO fade idea against real results. Those picks aren't actually underperforming yet, so I'm leaving it as information-only rather than turning it into a hard filter.";
+    await sendTelegramRaw(TELEGRAM_SEB_CHAT_ID, `⚽ ${message}`).catch(() => {});
+  }
+
+  return result;
+}
+
 // Pulled nightly by a Supabase pg_cron job (see sql/soccer-tracker-cron.sql).
 app.get("/internal/jobs/soccer-nightly-tracker", async (req, res) => {
   try {
     const result = await refreshSoccerTeams();
-    res.json({ ok: true, ...result });
+    let eloResult = null;
+    try {
+      eloResult = await refreshSoccerElo();
+    } catch (err) {
+      result.errors.push({ step: "beyondElo", error: err.message });
+    }
+    let fadeFilterEval = null;
+    try {
+      fadeFilterEval = await evaluateSoccerEloFadeFilter();
+    } catch (err) {
+      result.errors.push({ step: "eloFadeFilterEval", error: err.message });
+    }
+    res.json({ ok: true, ...result, elo: eloResult, fadeFilterEval });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -5649,6 +5868,101 @@ function isMilanFixture(home, away) {
   return home === "Inter" || away === "Inter" || home === "AC Milan" || away === "AC Milan";
 }
 
+// --- eloEdge on fixturesToday (2026-11-05, Seb's request) ---
+// the-odds-api sport_keys for the same 7 leagues API_FOOTBALL_LEAGUE_IDS already covers.
+const ODDS_API_SOCCER_SPORT_KEYS = {
+  EPL: "soccer_epl",
+  LA_LIGA: "soccer_spain_la_liga",
+  SERIE_A: "soccer_italy_serie_a",
+  BUNDESLIGA: "soccer_germany_bundesliga",
+  LIGUE_1: "soccer_france_ligue_one",
+  UCL: "soccer_uefa_champs_league",
+  MLS: "soccer_usa_mls",
+};
+
+// One the-odds-api call per league per day (7 calls total), through the existing
+// quota-tracked getOddsJson wrapper -- recordOddsUsage() picks it up automatically, same as
+// every other odds call on this server. Guarded so a given calendar day only ever fetches
+// once, same pattern as apiFootballGuardedCall.
+async function getDkSoccerMoneylinesToday() {
+  const today = etDateDaysAgo(0);
+  const cached = await getDoc("main", "taskConfig", "soccerOddsFetch");
+  if (cached?.data?.date === today && Array.isArray(cached.data.games)) return cached.data.games;
+
+  const games = [];
+  for (const sportKey of Object.values(ODDS_API_SOCCER_SPORT_KEYS)) {
+    try {
+      const url = new URL(`${ODDS_BASE}/sports/${sportKey}/odds/`);
+      url.searchParams.set("apiKey", ODDS_API_KEY);
+      url.searchParams.set("regions", "us");
+      url.searchParams.set("markets", "h2h");
+      url.searchParams.set("oddsFormat", "american");
+      url.searchParams.set("bookmakers", "draftkings");
+      const data = await getOddsJson(url.toString());
+      for (const g of data) {
+        const dk = (g.bookmakers || []).find((b) => b.key === "draftkings");
+        const h2h = dk?.markets?.find((m) => m.key === "h2h");
+        if (!h2h) continue;
+        const homePrice = h2h.outcomes?.find((o) => o.name === g.home_team)?.price;
+        const awayPrice = h2h.outcomes?.find((o) => o.name === g.away_team)?.price;
+        games.push({ homeTeam: g.home_team, awayTeam: g.away_team, commenceTime: g.commence_time, homePrice, awayPrice });
+      }
+    } catch (err) {
+      console.error(`soccer odds fetch failed for ${sportKey}: ${err.message}`);
+    }
+  }
+  await upsertDoc("main", "taskConfig", "soccerOddsFetch", { date: today, fetchedAt: new Date().toISOString(), games });
+  return games;
+}
+
+// Adds homeElo/awayElo/eloWinProbHome/dk*/eloEdge* to each fixture in place. ELO has no
+// draw model (noted to Seb and in the full-matchup-read soccer addendum) -- eloWinProbHome
+// is a pure two-outcome win probability, compared against DK's own (3-way, vig-included)
+// moneyline implied probability, so eloEdge is a directional signal, not a perfectly
+// apples-to-apples one.
+async function attachSoccerEloAndOdds(fixtures) {
+  const eloDoc = await getDoc("main", "soccer", "elo");
+  const clubsBySlug = eloDoc?.data?.clubs || {};
+  const eloAsOf = eloDoc?.data?.asOf || null;
+  const clubsByName = new Map();
+  for (const slug of Object.keys(clubsBySlug)) clubsByName.set(normClubName(clubsBySlug[slug].name), slug);
+
+  let games = [];
+  try {
+    games = await getDkSoccerMoneylinesToday();
+  } catch (err) {
+    console.error(`getDkSoccerMoneylinesToday failed: ${err.message}`);
+  }
+
+  for (const fixture of fixtures) {
+    const homeSlug = resolveBeyondEloSlug(fixture.home, clubsByName);
+    const awaySlug = resolveBeyondEloSlug(fixture.away, clubsByName);
+    const homeClub = homeSlug ? clubsBySlug[homeSlug] : null;
+    const awayClub = awaySlug ? clubsBySlug[awaySlug] : null;
+    if (homeClub && awayClub) {
+      fixture.homeElo = homeClub.elo;
+      fixture.awayElo = awayClub.elo;
+      fixture.eloAsOf = eloAsOf;
+      const diff = homeClub.elo + (homeClub.hfa || 0) - awayClub.elo;
+      fixture.eloWinProbHome = Math.round((1 / (1 + Math.pow(10, -diff / 400))) * 1000) / 1000;
+    }
+    const game = games.find(
+      (g) => teamMatches(fixture.home, { displayName: g.homeTeam }) && teamMatches(fixture.away, { displayName: g.awayTeam })
+    );
+    if (game) {
+      fixture.dkImpliedHome = americanToProb(game.homePrice);
+      fixture.dkImpliedAway = americanToProb(game.awayPrice);
+      if (fixture.eloWinProbHome != null && fixture.dkImpliedHome != null) {
+        fixture.eloEdgeHome = Math.round((fixture.eloWinProbHome - fixture.dkImpliedHome) * 1000) / 1000;
+      }
+      if (fixture.eloWinProbHome != null && fixture.dkImpliedAway != null) {
+        fixture.eloEdgeAway = Math.round((1 - fixture.eloWinProbHome - fixture.dkImpliedAway) * 1000) / 1000;
+      }
+    }
+  }
+  return fixtures;
+}
+
 // The actual API-Football fetch (2 calls, today ET + tomorrow ET) -- ONLY called once per
 // calendar day, never per-tick. Reduces each fixture to just the fields anything downstream
 // needs, so the cached-from-Supabase path and the freshly-fetched path return the exact
@@ -5676,6 +5990,11 @@ async function fetchSoccerCandidateFixturesFresh() {
     }
   }
   const fixtures = [...byId.values()];
+  try {
+    await attachSoccerEloAndOdds(fixtures);
+  } catch (err) {
+    console.error(`attachSoccerEloAndOdds failed: ${err.message}`);
+  }
   await upsertDoc("main", "soccer", "fixturesToday", { date: etDateDaysAgo(0), updatedAt: new Date().toISOString(), fixtures });
   return fixtures;
 }
