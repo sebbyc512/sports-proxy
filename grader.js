@@ -54,8 +54,14 @@ function normalize(text) {
 }
 
 const ML_PATTERNS = [
-  // "Arsenal Moneyline (Arsenal vs Lille) -475" / "... (A @ B)" / "... (A v B)"
-  new RegExp(`^(?<team>${TEAM}) Moneyline\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)\\s*([+-]\\d+)?$`, "iu"),
+  // "Arsenal Moneyline (Arsenal vs Lille) -475" / "... (A @ B)" / "... (A v B)" /
+  // "Real Madrid ML (AEK Athens vs Real Madrid)" -- the "ML" abbreviation in this same
+  // A-vs-B-in-parens shape is a real slip-upload format too (soccer legs especially), not
+  // just the bare/single-opponent "ML" shapes further below -- found 2026-11-05: without
+  // this, every soccer ML leg written this way fell through to "unsupported" and, since
+  // stillAwaitingResult() also depends on a successful team-name match, never even flipped
+  // to needs_review once the game went final -- it just sat "pending" indefinitely.
+  new RegExp(`^(?<team>${TEAM}) (?:Moneyline|ML)\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)\\s*([+-]\\d+)?$`, "iu"),
   // "Real Madrid Moneyline -425 (Real Madrid vs RB Leipzig)"
   new RegExp(`^(?<team>${TEAM}) Moneyline\\s*[+-]\\d+\\s*\\((?<a>${TEAM}) ${SEP} (?<b>${TEAM})\\)$`, "iu"),
   // "Como Moneyline (+120) - Feyenoord vs Como" — price in parens, then " - A vs B".
