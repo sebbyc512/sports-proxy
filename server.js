@@ -906,6 +906,7 @@ const PRIVATE_CAPTIONS = {
   failure: "🚨 {task} failed\n{reason}",
   usageReport: "{text}",
   test: "✅ Test DM from sports-proxy — private-chat routing is working.",
+  balanceApproval: "💰 {desk} balance change needs your OK\n{summary}",
 };
 
 function buildPrivateText({ kind, desk, task, summary, reason, text }) {
@@ -928,7 +929,7 @@ app.post("/internal/jobs/telegram-private", async (req, res) => {
     if (!TELEGRAM_SEB_CHAT_ID) return res.status(500).json({ error: "TELEGRAM_SEB_CHAT_ID not configured on the server." });
     const { kind, desk, task, summary, reason, text, requestId, dryRun = true } = req.body || {};
     if (!PRIVATE_CAPTIONS[kind]) {
-      return res.status(400).json({ error: `Unknown kind "${kind}" -- expected newRequest/backupRun/failure/usageReport/test.` });
+      return res.status(400).json({ error: `Unknown kind "${kind}" -- expected newRequest/backupRun/failure/usageReport/test/balanceApproval.` });
     }
     const body = buildPrivateText({ kind, desk, task, summary, reason, text });
     let reply_markup;
@@ -938,6 +939,18 @@ app.post("/internal/jobs/telegram-private", async (req, res) => {
         inline_keyboard: [[
           { text: "✅ Approve", callback_data: `approve:${desk}:${requestId}` },
           { text: "⏭ Skip", callback_data: `skip:${desk}:${requestId}` },
+        ]],
+      };
+    }
+    // Balance-change approval gate (2026-11-05, Seb's request): requestId here is the
+    // appEdits doc_id proposing the change -- Approve/Reject writes to "balanceApprovals",
+    // checked by Post-Cutover Sync's own prompt before it ever writes an adj- entry.
+    if (kind === "balanceApproval") {
+      if (!desk || !requestId) return res.status(400).json({ error: 'desk and requestId are required for kind "balanceApproval".' });
+      reply_markup = {
+        inline_keyboard: [[
+          { text: "✅ Approve", callback_data: `balok:${desk}:${requestId}` },
+          { text: "❌ Reject", callback_data: `balno:${desk}:${requestId}` },
         ]],
       };
     }
@@ -1195,6 +1208,194 @@ app.get("/internal/jobs/self-heal", async (req, res) => {
     }
 
     res.json({ ok: true, action: "mismatch-handled", actions, ...summary });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Balance guard (2026-11-05, Seb's request) ---
+// Pure engine code, no Claude involved at all -- watches each desk's real account balance
+// (start + deposits/withdrawals/DK-match adjustments + settled-bet net, the exact same
+// formula Post-Cutover Sync's own balanceUpdate math uses) and DMs Seb immediately, in plain
+// language, the moment it moves by more than $50 in a way that ISN'T explained by a bet
+// settling, a deposit/withdrawal, or a DraftKings-match adjustment. This is a tripwire, not a
+// fixer -- it never writes anything to pnlEntries itself, only reads and alerts.
+const BALANCE_GUARD_THRESHOLD = 50;
+const BALANCE_GUARD_EXPLAIN_TOLERANCE = 2; // rounding/odds-math slack before calling a delta "unexplained"
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// Same inPnl() gate Post-Cutover Sync's balanceUpdate math uses: a history-only row (stats
+// tracking, never money) or one dated before the desk's own balance-start floor never counts.
+function inPnlGuard(d, settingsDate) {
+  if (d.history) return false;
+  if (!settingsDate) return true;
+  return (d.date || todayIso()) >= settingsDate;
+}
+
+// One lightweight fingerprint per pnlEntries doc -- just enough fields to tell, on the NEXT
+// run, whether this exact doc is new or changed in a way that would move the balance. Never
+// stores leg text/analysis/etc -- this state doc is a monitoring checkpoint, not a mirror.
+function balanceGuardFingerprint(d) {
+  return {
+    type: d.type || "bet",
+    status: d.status ?? null,
+    amount: Number(d.amount) || 0,
+    stake: Number(d.stake) || 0,
+    ret: d.ret === null || d.ret === undefined ? null : Number(d.ret),
+    bonus: d.bonus === true,
+    odds: d.odds ?? null,
+    boost: Number(d.boost) || 0,
+    history: !!d.history,
+    protected: !!d.protected,
+  };
+}
+
+// The amount a single pnlEntries doc should contribute to the running balance, same shape as
+// PCS's 0b balanceUpdate `bal` computation: deposit/adjust add `amount`, withdrawal subtracts
+// it, a bet's net is pnlDelta() (already nets stake against payout, bonus-aware).
+function balanceGuardContribution(fp) {
+  if (fp.type === "deposit" || fp.type === "adjust") return fp.amount;
+  if (fp.type === "withdrawal") return -fp.amount;
+  if (fp.type === "bet") return pnlDelta(fp);
+  return 0;
+}
+
+async function computeDeskBalance(desk) {
+  const [settingsDoc, entriesRes] = await Promise.all([
+    getDoc(desk, "pnl", "settings"),
+    supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data`),
+  ]);
+  const start = Number(settingsDoc?.data?.start) || 0;
+  const settingsDate = settingsDoc?.data?.date || null;
+  const entries = await entriesRes.json();
+
+  const fingerprints = {};
+  let balance = start;
+  for (const row of entries) {
+    const d = row.data || {};
+    if (!inPnlGuard(d, settingsDate)) continue;
+    const fp = balanceGuardFingerprint(d);
+    fingerprints[row.doc_id] = fp;
+    balance += balanceGuardContribution(fp);
+  }
+  return { balance: Math.round(balance * 100) / 100, fingerprints, start, settingsDate };
+}
+
+// Compares the previous run's fingerprints to this run's, and sums up the balance change that
+// every doc explained by a qualifying event (new or changed deposit/withdrawal/adjust, or a
+// bet whose status just left "pending") should have produced. Whatever balance movement is
+// LEFT OVER after subtracting that is the unexplained part this guard actually alerts on.
+function balanceGuardExplainedDelta(prevFingerprints, currFingerprints) {
+  let explained = 0;
+  const events = [];
+  for (const [docId, fp] of Object.entries(currFingerprints)) {
+    const prev = prevFingerprints[docId];
+    if (!prev) {
+      // Brand-new doc since last check.
+      if (fp.type === "deposit" || fp.type === "adjust" || fp.type === "withdrawal") {
+        explained += balanceGuardContribution(fp);
+        events.push({ docId, type: fp.type, why: "new deposit/withdrawal/adjust" });
+      } else if (fp.type === "bet" && fp.status && fp.status !== "pending" && fp.status !== "needs_review") {
+        explained += balanceGuardContribution(fp);
+        events.push({ docId, type: "bet", why: `new bet already ${fp.status}` });
+      }
+      continue;
+    }
+    if (fp.type !== prev.type) continue; // a type change is itself unexplained -- never paper over it
+    if (fp.type === "bet") {
+      const wasOpen = !prev.status || prev.status === "pending" || prev.status === "needs_review";
+      const nowSettled = fp.status && fp.status !== "pending" && fp.status !== "needs_review";
+      if (wasOpen && nowSettled) {
+        explained += balanceGuardContribution(fp);
+        events.push({ docId, type: "bet", why: `bet settled (${fp.status})` });
+      }
+    } else if (fp.type === "deposit" || fp.type === "adjust" || fp.type === "withdrawal") {
+      if (fp.amount !== prev.amount) {
+        explained += balanceGuardContribution(fp) - balanceGuardContribution(prev);
+        events.push({ docId, type: fp.type, why: "deposit/withdrawal/adjust amount changed" });
+      }
+    }
+  }
+  return { explained: Math.round(explained * 100) / 100, events };
+}
+
+async function balanceGuardCheckDesk(desk, dryRun) {
+  const current = await computeDeskBalance(desk);
+  const prevState = await getDoc(desk, "balanceGuardState", "status");
+
+  if (!prevState) {
+    if (!dryRun) {
+      await upsertDoc(desk, "balanceGuardState", "status", {
+        balance: current.balance,
+        fingerprints: current.fingerprints,
+        checkedAt: new Date().toISOString(),
+      });
+    }
+    return { desk, action: "baseline-set", balance: current.balance };
+  }
+
+  const prevBalance = Number(prevState.data.balance) || 0;
+  const rawDelta = Math.round((current.balance - prevBalance) * 100) / 100;
+  const { explained, events } = balanceGuardExplainedDelta(prevState.data.fingerprints || {}, current.fingerprints);
+  const unexplained = Math.round((rawDelta - explained) * 100) / 100;
+
+  const result = { desk, rawDelta, explained, unexplained, events, balance: current.balance };
+
+  if (Math.abs(unexplained) <= BALANCE_GUARD_THRESHOLD + BALANCE_GUARD_EXPLAIN_TOLERANCE) {
+    result.action = "no-op";
+    if (!dryRun) {
+      await upsertDoc(desk, "balanceGuardState", "status", {
+        balance: current.balance,
+        fingerprints: current.fingerprints,
+        checkedAt: new Date().toISOString(),
+      });
+    }
+    return result;
+  }
+
+  // Unexplained move past the threshold -- DM Seb right away, plain language, no field names
+  // or dollar-math jargon, just what changed. Moves the checkpoint forward either way (dryRun
+  // aside) so this is a one-time notice per occurrence, never a repeat every run until fixed.
+  const who = desk === "main" ? "Your" : "Steve's";
+  const direction = unexplained > 0 ? "went up" : "went down";
+  const reason = `${who} balance ${direction} by $${Math.abs(unexplained).toFixed(2)} and I can't explain it -- it's not a bet settling, a deposit or withdrawal, or a DraftKings match. Worth checking the app.`;
+  result.action = dryRun ? "would-alert" : "alerted";
+  result.message = reason;
+
+  if (!dryRun) {
+    await telegramApi("sendMessage", {
+      chat_id: TELEGRAM_SEB_CHAT_ID,
+      text: buildPrivateText({ kind: "failure", task: "Balance guard", reason }),
+      parse_mode: "HTML",
+    }).catch((err) => console.error("balance-guard: DM failed:", err.message));
+    await upsertDoc(desk, "balanceGuardLog", `bg-${Date.now()}`, {
+      desk,
+      foundAt: new Date().toISOString(),
+      rawDelta,
+      explained,
+      unexplained,
+      events,
+    });
+    await upsertDoc(desk, "balanceGuardState", "status", {
+      balance: current.balance,
+      fingerprints: current.fingerprints,
+      checkedAt: new Date().toISOString(),
+    });
+  }
+  return result;
+}
+
+app.get("/internal/jobs/balance-guard", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
+  for (const d of desks) if (!["main", "steve"].includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  const dryRun = req.query.dryRun === "true";
+  try {
+    const results = [];
+    for (const desk of desks) results.push(await balanceGuardCheckDesk(desk, dryRun));
+    res.json({ ok: true, dryRun, results });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -1566,6 +1767,22 @@ app.post("/telegram/webhook", async (req, res) => {
           chat_id: cq.message.chat.id,
           message_id: cq.message.message_id,
           text: `${cq.message.text}\n\n${action === "approve" ? "✅ Approved" : "⏭ Skipped"}`,
+        });
+      } else if ((action === "balok" || action === "balno") && desk && requestId) {
+        // Balance-change approval gate (2026-11-05, Seb's request): no automated process may
+        // write an adj-/balance pnlEntries doc without this. requestId here is the appEdits
+        // doc_id that proposed the change -- Post-Cutover Sync's own prompt checks this same
+        // "balanceApprovals" collection before it ever writes the adj- entry.
+        await upsertDoc(desk, "balanceApprovals", requestId, {
+          approval: action === "balok" ? "approved" : "rejected",
+          decidedAt: new Date().toISOString(),
+          decidedBy: "seb-telegram",
+        });
+        await telegramApi("answerCallbackQuery", { callback_query_id: cq.id, text: action === "balok" ? "Approved" : "Rejected" });
+        await telegramApi("editMessageText", {
+          chat_id: cq.message.chat.id,
+          message_id: cq.message.message_id,
+          text: `${cq.message.text}\n\n${action === "balok" ? "✅ Approved" : "❌ Rejected"}`,
         });
       } else {
         await telegramApi("answerCallbackQuery", { callback_query_id: cq.id });

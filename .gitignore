@@ -25,3 +25,4 @@ sql/new-token-run-me.txt
 sql/token-rotation-2-run-me.sql
 sql/pg-net-timeout-30s-run-me.sql
 sql/app-wake-sync-pass-context-run-me.sql
+sql/balance-guard-cron-run-me.sql
