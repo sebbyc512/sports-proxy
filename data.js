@@ -339,6 +339,7 @@ export async function loadPicksExtra(desk) {
     return { id: r.doc_id, date: x.date || x.createdAt || '', createdAt: x.createdAt || '', answeredAt: x.answeredAt || x.answered_at || '', league: x.league || '', slot: x.slot || '', game: x.game || '', risk: x.risk || x.units || '',
       status: x.status || (t ? 'answered' : 'working'), question: x.question || x.note || x.other || '',
       prime: x.form === 'prime' || x.kind === 'prime' || x.prime === true,
+      fantasy: x.form === 'fantasy', ask: x.ask || '', rosterFiles: x.rosterFiles || [],
       ticket: t ? mapT(t) : null, tickets: all.map(mapT), answer: x.answer || x.reason || '' }
   }).sort(newestFirst)
   return { requests, ftd, fbm, ftdRecord, fbmRecord }
@@ -406,6 +407,21 @@ export async function submitRequest(desk, profile, form, kind = 'pick') {
   const doc = { status: 'queued', source: 'app', requested_by: who(profile), form: kind, ...form, createdAt: nowIso() }
   if (DEMO_MODE) return { ok: true, demo: true, doc }
   return insertDoc(desk, 'requests', `req-${Date.now()}`, doc)
+}
+
+// Fantasy roster screenshots: stored like slips, but attached to a fantasy request (never read as bets)
+export async function uploadFantasyFiles(desk, files) {
+  if (DEMO_MODE) return []
+  const stamp = Date.now(); const paths = []
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i]
+    const ext = ((f.name || '').split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg'
+    const path = `${desk}/fantasy-${stamp}-${i + 1}.${ext}`
+    const { error } = await supabase.storage.from('slips').upload(path, f, { contentType: f.type || 'image/jpeg', upsert: false })
+    if (error) throw new Error(`Upload failed: ${error.message}`)
+    paths.push(path)
+  }
+  return paths
 }
 
 export async function uploadSlips(desk, profile, files, meta) {

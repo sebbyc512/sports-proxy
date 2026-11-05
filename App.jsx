@@ -5,6 +5,8 @@ import { DEMO_USERS } from './demo.js'
 const SPORTS = ['ALL', 'NFL', 'NBA', 'NHL', 'CFB', 'CBB', 'MLB', 'SOC']
 const money = (v) => `${v < 0 ? '-' : ''}$${Math.abs(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0)
+// Old sources no longer shown as PNL cards (their results still count in the totals)
+const HIDDEN_SOURCE = (k) => /^(other|others|gavin|self|me|app)$/i.test(String(k)) || /steve.?s? ?plays?/i.test(String(k)) || (String(k).toLowerCase().includes('steve') && /play/i.test(String(k)))
 const SRC = { claude: "Claude's picks", seb: "Seb's bets", gavin: "Gavin's plays", matt: "Matt's bets", steve: "Steve's bets", lela: "Lela's bets", uli: "Uli's bets", gabe: "Gabe's bets", ftd: 'First TD options', fbm: 'First Basket', others: 'Others', other: 'Others', self: 'My bets', app: 'My bets' }
 const ago = (iso) => { if (!iso) return ''; const d = new Date(/^\d{4}-\d{2}-\d{2}$/.test(iso) ? iso + 'T12:00:00' : iso); return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }
 // Date + time in Eastern, e.g. "Oct 28 · 5:03 PM ET". Date-only values just show the date.
@@ -152,6 +154,8 @@ function Home({ d, s, sport, desk, profile, canEdit }) {
   const [view, setView] = useState('pnl')
   const [showWd, setShowWd] = useState(false)
   const [showMatt, setShowMatt] = useState(false)
+  const [pick, setPick] = useState(null); const [allSettled, setAllSettled] = useState(false)
+  const tap = (id) => () => { setPick(pick === id ? null : id); setAllSettled(false) }
   const [matt, setMatt] = useState(null); const [mattAmt, setMattAmt] = useState(''); const [mattNote, setMattNote] = useState(''); const [mattMsg, setMattMsg] = useState('')
   useEffect(() => { loadMatt(desk).then(setMatt).catch(() => {}) }, [desk])
   // Matt's bets = ticked "This is a Matt bet" on upload (or source matt)
@@ -184,15 +188,15 @@ function Home({ d, s, sport, desk, profile, canEdit }) {
       <div className="grid">
         <Card k="DraftKings balance" v={money(balance)} neg={balance < 0} sub={d.synced ? `matched to DraftKings${d.anchorDate ? ` ${ago(d.anchorDate)}` : ''} + results since` : 'start + results − withdrawals'} />
         <Card k={`Goal ${money(d.goal)}`} v={`${pct(balance, d.goal)}%`} sub={`${money(toGoal)} to go${d.goalDate ? ` by ${ago(d.goalDate)}` : ''}`} bar={pct(balance, d.goal)} />
-        <Card k="Net profit / loss" v={money(s.pnl)} neg={s.pnl < 0} pos={s.pnl > 0} sub={`settled bets`} />
+        <Card k="Net profit / loss" v={money(s.pnl)} neg={s.pnl < 0} pos={s.pnl > 0} sub={`settled bets`} onClick={tap('all')} on={pick === 'all'} />
         <button className="card wd-card" onClick={() => setShowWd(!showWd)}>
           <div className="card-k">Withdrawals</div>
           <div className="card-v pos">{money(d.withdrawn || 0)}</div>
           <div className="card-sub">{(d.withdrawals || []).length} withdrawal{(d.withdrawals || []).length === 1 ? '' : 's'} · tap to {showWd ? 'hide' : 'see'}</div>
         </button>
-        <Card k="In play" v={money(s.open.reduce((t, b) => t + b.stake, 0))} sub={`${s.open.length} open bets`} />
-        <Card k="Bets settled" v={`${s.won}-${s.lost}-${s.push}`} sub="all-time" />
-        {Object.entries(s.bySource).filter(([k]) => k !== 'matt').map(([k, v]) => <Card key={k} k={`From ${SRC[k] || k}`} v={`${v.pnl >= 0 ? '+' : ''}${money(v.pnl)}`} neg={v.pnl < 0} pos={v.pnl > 0} sub={`${v.n} settled · all-time ${v.w}-${v.l}`} />)}
+        <Card k="In play" v={money(s.open.reduce((t, b) => t + b.stake, 0))} sub={`${s.open.length} open bets`} onClick={tap('open')} on={pick === 'open'} />
+        <Card k="Bets settled" v={`${s.won}-${s.lost}-${s.push}`} sub="all-time" onClick={tap('all')} on={pick === 'all'} />
+        {Object.entries(s.bySource).filter(([k]) => k !== 'matt' && !HIDDEN_SOURCE(k)).sort((x, y) => y[1].pnl - x[1].pnl).map(([k, v]) => <Card key={k} k={`From ${SRC[k] || k}`} v={`${v.pnl >= 0 ? '+' : ''}${money(v.pnl)}`} neg={v.pnl < 0} pos={v.pnl > 0} sub={`${v.n} settled · all-time ${v.w}-${v.l}`} onClick={tap('src:' + k)} on={pick === 'src:' + k} />)}
         {(mattBets.length > 0 || matt) && (() => { const v = s.bySource.matt || { pnl: 0, n: 0, w: 0, l: 0 }; const openN = mattBets.filter((b) => b.status === 'open').length
           return <button className="card wd-card" onClick={() => setShowMatt(!showMatt)}>
             <div className="card-k">{matt ? "Matt's money" : `From ${SRC.matt}`}</div>
@@ -201,6 +205,22 @@ function Home({ d, s, sport, desk, profile, canEdit }) {
             <div className="card-sub">{matt ? `updated ${stamp(matt.createdAt)} · ` : ''}{v.n} settled · {v.w}-{v.l}{openN ? ` · ${openN} open` : ''} · tap to {showMatt ? 'hide' : 'see/edit'}</div>
           </button> })()}
       </div>
+      {pick && (() => {
+        const srcKey = (b) => (b.matt ? 'matt' : (b.source || 'other'))
+        const isOpen = pick === 'open'
+        const pool = isOpen ? s.open : d.bets.filter((b) => ['won', 'lost', 'push', 'cashout'].includes(b.status) && (pick === 'all' || srcKey(b) === pick.slice(4)))
+        const hits = (b) => b.status === 'won' || (b.status === 'cashout' && b.ret > b.stake)
+        const list = [...(isOpen || allSettled ? pool : pool.filter(hits))].sort(newestFirst)
+        const name = isOpen ? 'Open bets' : pick === 'all' ? 'All bets' : `From ${SRC[pick.slice(4)] || pick.slice(4)}`
+        return <div className="card wd-list">
+          <div className="card-k">{name}{isOpen ? '' : allSettled ? ' — every settled bet' : ' — bets that hit'}</div>
+          {!isOpen && <div className="toggle" style={{ margin: '6px 0' }}>
+            <button className={`tog ${!allSettled ? 'on' : ''}`} onClick={() => setAllSettled(false)}>Hits ({pool.filter(hits).length})</button>
+            <button className={`tog ${allSettled ? 'on' : ''}`} onClick={() => setAllSettled(true)}>All settled ({pool.length})</button></div>}
+          {list.length === 0 ? <p className="muted small">Nothing here yet.</p> : list.slice(0, 60).map((b) => <BetRow key={b.id} b={b} />)}
+          {list.length > 60 && <p className="muted small">Showing the newest 60 of {list.length}.</p>}
+        </div>
+      })()}
       {showMatt && <div className="card wd-list">
         <div className="card-k">Matt's money</div>
         <div className="muted small" style={{ margin: '4px 0' }}>{matt ? <>Now <b>{money(matt.amount)}</b> · set {stamp(matt.createdAt)}{matt.note ? ` · ${matt.note}` : ''}</> : 'Not set yet.'} This is just Matt's tally — it never changes your balance or PNL.</div>
@@ -286,7 +306,8 @@ function BalanceChart({ d }) {
   </div>)
 }
 
-function Card({ k, v, sub, neg, pos, bar }) {
+function Card({ k, v, sub, neg, pos, bar, onClick, on }) {
+  if (onClick) return <button className={`card wd-card ${on ? 'card-on' : ''}`} onClick={onClick} style={on ? { outline: '2px solid #F5C518' } : undefined}><div className="card-k">{k}</div><div className={`card-v ${neg ? 'neg' : ''} ${pos ? 'pos' : ''}`}>{v}</div><div className="card-sub">{sub}{` · tap to ${on ? 'hide' : 'see'}`}</div></button>
   return <div className="card"><div className="card-k">{k}</div><div className={`card-v ${neg ? 'neg' : ''} ${pos ? 'pos' : ''}`}>{v}</div>{bar !== undefined && <div className="bar"><i style={{ width: `${Math.min(100, bar)}%` }} /></div>}<div className="card-sub">{sub}</div></div>
 }
 
@@ -495,7 +516,7 @@ function Picks({ d, desk, profile, canEdit }) {
   const tabs = [['claude', "Claude's picks"], ['request', 'Request a pick'], ['prime', 'Prime time NFL'], ['ftd', 'First TD'], ['fbm', 'FBM']]
   return (<>
     <div className="subtabs scroll">{tabs.map(([k, l]) => <button key={k} className={`subtab ${sub === k ? 'on' : ''}`} onClick={() => setSub(k)}>{l}</button>)}</div>
-    {sub === 'request' && <RequestPick requests={(x?.requests || []).filter((r) => !r.prime)} desk={desk} profile={profile} canEdit={canEdit} />}
+    {sub === 'request' && <RequestPick requests={(x?.requests || []).filter((r) => !r.prime && !r.fantasy)} desk={desk} profile={profile} canEdit={canEdit} />}
     {sub === 'prime' && <PrimeTime requests={(x?.requests || []).filter((r) => r.prime)} desk={desk} profile={profile} canEdit={canEdit} />}
     {sub === 'ftd' && <Candidates title="First TD options" kind="FTD" list={x?.ftd} record={x?.ftdRecord} loading={!x} empty="No First TD options for this week yet. They land Thursday morning (TNF) and Sunday morning (Sunday slate)." />}
     {sub === 'fbm' && <Candidates title="First Basket (FBM)" kind="FBM" list={x?.fbm} record={x?.fbmRecord} loading={!x} empty="No First Basket picks yet. The FBM refresh runs daily at 4 PM ET." />}
