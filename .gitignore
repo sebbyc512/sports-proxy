@@ -29,3 +29,8 @@ sql/balance-guard-cron-run-me.sql
 sql/nhl-goalie-tracker-cron-run-me.sql
 sql/ledger-audit-run-me.sql
 sql/clv-capture-cron-run-me.sql
+sql/nba-player-logs-cron-run-me.sql
+sql/schedule-context-cron-run-me.sql
+sql/nhl-player-logs-cron-run-me.sql
+sql/soccer-form-cron-run-me.sql
+sql/cbb-daily-form-cron-run-me.sql
