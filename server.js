@@ -11,6 +11,7 @@ import { runTicketGate } from "./ticket-gate.js";
 import { trackNbaPlayerLogsForDate } from "./jobs/nba-player-logs.js";
 import { buildScheduleContextForLeague } from "./jobs/schedule-context.js";
 import { trackNhlPlayerLogsForDate } from "./jobs/nhl-player-logs.js";
+import { runNflverseJob } from "./jobs/nflverse.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4771,6 +4772,46 @@ app.get("/internal/jobs/nhl-player-logs", async (req, res) => {
           headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
           body: JSON.stringify(rows.map((r) => ({ ...r, updated_at: new Date().toISOString() }))),
         });
+      },
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Item 9 of the 2026-11-06 daily-data batch (Seb's explicit ask): nflverse NFL data --
+// injuries, snap counts, team EPA (the three Seb prioritized before Sunday's games).
+// ONLY these three published release files -- schedules-with-lines, weekly player stats,
+// and depth_charts are deliberately deferred (depth_charts_2026.csv alone is 68MB; see
+// jobs/nflverse.js's header comment -- same OOM risk class as item 8's crash). Pure
+// parsing/mapping in jobs/nflverse.js (unit-tested there, incl. an end-to-end smoke test
+// against the real files). Each of the three downloads here is well under 4MB raw.
+const NFLVERSE_TABLES = {
+  injuries: { table: "nfl_nflverse_injuries", conflict: "season,week,team,gsis_id" },
+  snapCounts: { table: "nfl_nflverse_snap_counts", conflict: "game_id,team,player_name" },
+  teamEpa: { table: "nfl_nflverse_team_epa", conflict: "game_id,team" },
+};
+
+app.get("/internal/jobs/nflverse", async (req, res) => {
+  try {
+    const result = await runNflverseJob({
+      fetchText: async (url) => {
+        const r = await fetch(url, { headers: { "User-Agent": "sports-proxy/0.1" } });
+        if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
+        return r.text();
+      },
+      upsertRows: async (entityType, rows) => {
+        const { table, conflict } = NFLVERSE_TABLES[entityType];
+        const stamped = rows.map((r) => ({ ...r, updated_at: new Date().toISOString() }));
+        const BATCH = 200;
+        for (let i = 0; i < stamped.length; i += BATCH) {
+          await supabaseFetch(`/${table}?on_conflict=${conflict}`, {
+            method: "POST",
+            headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+            body: JSON.stringify(stamped.slice(i, i + BATCH)),
+          });
+        }
       },
     });
     res.json(result);
