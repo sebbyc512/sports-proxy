@@ -1210,6 +1210,11 @@ app.get("/internal/jobs/sgp-calibration", async (req, res) => {
 });
 
 app.get("/internal/jobs/self-heal", async (req, res) => {
+  // Approve-to-fix job-health tracking (2026-11-06) -- fires after the response is already
+  // sent, purely bookkeeping (see recordJobOutcome's own comment); never changes this
+  // handler's behavior or response.
+  let jobErr = null;
+  res.on("finish", () => { recordJobOutcome("self-heal", res.statusCode < 400, jobErr).catch(() => {}); });
   const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
   for (const d of desks) if (!["main", "steve"].includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
   const dryRun = req.query.dryRun === "true";
@@ -1312,6 +1317,7 @@ app.get("/internal/jobs/self-heal", async (req, res) => {
 
     res.json({ ok: true, action: "mismatch-handled", actions, ...summary });
   } catch (err) {
+    jobErr = err.message;
     res.status(502).json({ error: err.message });
   }
 });
@@ -1614,6 +1620,21 @@ async function balanceGuardCheckDesk(desk, dryRun) {
         chat_id: TELEGRAM_SEB_CHAT_ID,
         text: ledgerSuspiciousDmText(desk, diffResult.suspicious),
       }).catch((err) => console.error("balance-guard: ledger-diff DM failed:", err.message));
+
+      // Approve-to-fix (2026-11-06): on top of the report-only DM above, also offer the
+      // one-tap repair -- restores ONLY the items ledgerDiffDesk itself already labeled
+      // SUSPICIOUS against the last good snapshot. proposeApproveFixOnce (defined further
+      // down, hoisted) is a no-op if one's already pending for this desk.
+      if (diffResult.suspicious?.length > 0) {
+        await proposeApproveFixOnce({
+          desk,
+          kind: "balanceDrift",
+          actionKey: "balanceDrift",
+          actionParams: {},
+          plainWhat: `${desk === "main" ? "Your" : "Steve's"} balance moved in a way the engine can't explain, and the ledger check found entries that don't look normal.`,
+          plainFix: "Restore just those entries back to the last known-good snapshot.",
+        });
+      }
     } else {
       console.error("balance-guard: ledger-diff auto-run failed:", diffResult.error);
     }
@@ -1622,6 +1643,8 @@ async function balanceGuardCheckDesk(desk, dryRun) {
 }
 
 app.get("/internal/jobs/balance-guard", async (req, res) => {
+  let jobErr = null;
+  res.on("finish", () => { recordJobOutcome("balance-guard", res.statusCode < 400, jobErr).catch(() => {}); });
   const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
   for (const d of desks) if (!["main", "steve"].includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
   const dryRun = req.query.dryRun === "true";
@@ -1630,6 +1653,7 @@ app.get("/internal/jobs/balance-guard", async (req, res) => {
     for (const desk of desks) results.push(await balanceGuardCheckDesk(desk, dryRun));
     res.json({ ok: true, dryRun, results });
   } catch (err) {
+    jobErr = err.message;
     res.status(502).json({ error: err.message });
   }
 });
@@ -1905,6 +1929,8 @@ app.post("/internal/jobs/ledger-snapshot", async (req, res) => {
 });
 
 app.get("/internal/jobs/ledger-diff", async (req, res) => {
+  let jobErr = null;
+  res.on("finish", () => { recordJobOutcome("ledger-diff", res.statusCode < 400, jobErr).catch(() => {}); });
   const desks = req.query.desk ? [req.query.desk] : LEDGER_DESKS;
   for (const d of desks) if (!LEDGER_DESKS.includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
   const repair = req.query.repair === "true";
@@ -1913,6 +1939,7 @@ app.get("/internal/jobs/ledger-diff", async (req, res) => {
     for (const desk of desks) results.push(await ledgerDiffDesk(desk, { repair }));
     res.json({ ok: true, repair, results });
   } catch (err) {
+    jobErr = err.message;
     res.status(502).json({ error: err.message });
   }
 });
@@ -2081,6 +2108,15 @@ async function syncNeededRetryRequest(desk, docId, dryRun) {
           (err) => console.error("sync-needed: requester give-up DM failed:", err.message)
         );
       }
+      // Approve-to-fix (2026-11-06): offer the one-tap re-fire alongside the give-up DM.
+      await proposeApproveFixOnce({
+        desk,
+        kind: "requestStuck",
+        actionKey: "refireBuilder",
+        actionParams: { docId },
+        plainWhat: `${desk === "main" ? "A pick request" : "One of Steve's pick requests"} has been stuck for a while and the engine stopped retrying it on its own.`,
+        plainFix: "Give that desk's builder another push.",
+      });
     }
     return { desk, docId, action: dryRun ? "would-give-up" : "gave-up", retryCount };
   }
@@ -2127,6 +2163,18 @@ async function syncNeededRetryAppEdit(desk, collection, docId, dryRun) {
       await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text: syncNeededAppEditGaveUpText(desk) }).catch(
         (err) => console.error("sync-needed: appEdit give-up DM failed:", err.message)
       );
+      // Approve-to-fix (2026-11-06): offer the one-tap retry (bypasses the normal retry-count
+      // cap on an explicit tap) alongside the give-up DM.
+      await proposeApproveFixOnce({
+        desk,
+        kind: "appDocStuck",
+        actionKey: "retryAppDoc",
+        actionParams: { collection, docId },
+        plainWhat: desk === "main"
+          ? "An app edit (withdrawal/deposit/bet correction) hasn't gone through and the engine stopped retrying it on its own."
+          : "An app edit on Steve's desk hasn't gone through and the engine stopped retrying it on its own.",
+        plainFix: "Retry it now.",
+      });
     }
     return { desk, collection, docId, action: dryRun ? "would-give-up" : "gave-up", retryCount };
   }
@@ -2530,6 +2578,8 @@ async function syncNeededCheckDesk(desk) {
 }
 
 app.get("/internal/jobs/sync-needed", async (req, res) => {
+  let jobErr = null;
+  res.on("finish", () => { recordJobOutcome("sync-needed", res.statusCode < 400, jobErr).catch(() => {}); });
   const dryRun = req.query.dryRun === "true";
   try {
     // Retire-the-sync Phase 1-2 -- OFF unless the "retireSync" flag doc says enabled:true
@@ -2546,6 +2596,23 @@ app.get("/internal/jobs/sync-needed", async (req, res) => {
         wakeSlipReaderV2IfPending(["main", "steve"], dryRun),
       ]);
       phase1 = { appEdits: { main: mainEdits, steve: steveEdits }, slipReaderV2Wake: uploadWake };
+
+      // Approve-to-fix (2026-11-06): Phase 1 errors -> offer turning retireSync back OFF.
+      // PCS stays the backup/safety net either way (see this phase's own top comment) --
+      // this only stops the engine's fast-path from keeping trying something that's erroring.
+      if (!dryRun) {
+        const phase1Errors = [...mainEdits, ...steveEdits].filter((e) => e.action === "error" || e.action === "reverted-readback-failed");
+        if (phase1Errors.length > 0) {
+          await proposeApproveFixOnce({
+            desk: "main",
+            kind: "phase1Errors",
+            actionKey: "retireSyncOff",
+            actionParams: {},
+            plainWhat: "The fast-path that applies app edits directly is hitting errors.",
+            plainFix: "Turn that fast path off -- the backup process keeps handling everything normally either way.",
+          });
+        }
+      }
     }
 
     const results = await Promise.all(["main", "steve"].map(syncNeededCheckDesk));
@@ -2662,6 +2729,7 @@ app.get("/internal/jobs/sync-needed", async (req, res) => {
 
     res.json({ ok: true, action: "handled", phase1, backlog: allBacklog, stuck: allStuck, actions });
   } catch (err) {
+    jobErr = err.message;
     res.status(502).json({ error: err.message });
   }
 });
@@ -2792,6 +2860,8 @@ async function fireStuckResolver(items) {
 }
 
 app.get("/internal/jobs/stuck-bet-gate", async (req, res) => {
+  let jobErr = null;
+  res.on("finish", () => { recordJobOutcome("stuck-bet-gate", res.statusCode < 400, jobErr).catch(() => {}); });
   const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
   for (const d of desks) if (!["main", "steve"].includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
   const dryRun = req.query.dryRun === "true";
@@ -2803,6 +2873,22 @@ app.get("/internal/jobs/stuck-bet-gate", async (req, res) => {
 
     if (dryRun) return res.json({ ok: true, action: "would-fire", stuck: found });
 
+    // Approve-to-fix (2026-11-06): alongside the automatic resolver-routine escalation
+    // below (unchanged), also offer the quicker one-tap deterministic grade pass for each
+    // affected desk -- harmless to tap even when the research resolver ends up being what
+    // actually settles it, since gradeFromFinalScores only ever grades what it can already
+    // confidently match.
+    for (const desk of [...new Set(found.map((f) => f.desk))]) {
+      await proposeApproveFixOnce({
+        desk,
+        kind: "ungradedBet",
+        actionKey: "gradeFromFinalScores",
+        actionParams: {},
+        plainWhat: `${desk === "main" ? "You have" : "Steve has"} bet(s) that finished a while ago and still haven't been settled.`,
+        plainFix: "Run a settle pass now using the final scores.",
+      });
+    }
+
     const state = await getDoc("main", "stuckResolverState", "_global");
     const sinceLastWake = Date.now() - (state?.data?.lastWakeAt ? new Date(state.data.lastWakeAt).getTime() : 0);
     if (sinceLastWake < STUCK_BET_WAKE_COOLDOWN_MS) {
@@ -2813,6 +2899,7 @@ app.get("/internal/jobs/stuck-bet-gate", async (req, res) => {
     await upsertDoc("main", "stuckResolverState", "_global", { lastWakeAt: new Date().toISOString(), lastFired: found });
     res.json({ ok: true, action: "fired", stuck: found });
   } catch (err) {
+    jobErr = err.message;
     res.status(502).json({ error: err.message });
   }
 });
@@ -3088,6 +3175,72 @@ async function proposeApproveFix({ desk, kind, actionKey, actionParams, plainWha
   });
   await mergeUpsertDoc(desk, "approveFixIncidents", incidentId, { messageId: sent.message_id });
   return { dryRun: false, sent: true, incidentId };
+}
+
+// True when this desk already has a still-pending (not expired), same-kind incident whose
+// actionParams match on every key given in matchParams -- e.g. {docId} so two different
+// stuck appEdits each still get their own DM, but the SAME one doesn't get re-proposed every
+// time its detector job ticks. "Max one DM per incident" per Seb's ask (2026-11-06).
+async function approveFixAlreadyPending(desk, kind, matchParams = {}) {
+  const res = await supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.approveFixIncidents&select=data`);
+  const rows = await res.json();
+  const now = Date.now();
+  return rows.some((r) => {
+    const d = r.data || {};
+    if (d.kind !== kind || d.status !== "pending") return false;
+    if (new Date(d.expiresAt).getTime() <= now) return false;
+    return Object.entries(matchParams).every(([k, v]) => d.actionParams?.[k] === v);
+  });
+}
+
+// Wraps proposeApproveFix with the dedup check above -- this is what every detector hook
+// below calls, never proposeApproveFix directly, so none of them can spam a second DM for an
+// incident that's already awaiting a tap. Swallows its own errors (logs only) so a DM/dedup
+// failure never breaks the calling job's own logic.
+async function proposeApproveFixOnce({ desk, kind, actionKey, actionParams, plainWhat, plainFix }) {
+  try {
+    if (await approveFixAlreadyPending(desk, kind, actionParams || {})) {
+      return { skipped: "already-pending" };
+    }
+    return await proposeApproveFix({ desk, kind, actionKey, actionParams, plainWhat, plainFix, dryRun: false });
+  } catch (err) {
+    console.error(`approve-fix propose (${kind}, ${desk}) failed:`, err.message);
+    return { error: err.message };
+  }
+}
+
+const JOB_FAILURE_THRESHOLD = 3;
+
+// Generic "N times in a row" failure counter for a /internal/jobs/* cron handler, shared by
+// the small set of jobs wired below (2026-11-06) -- NOT every job in this file yet (the
+// broader daily-data ETL jobs aren't covered by this pass; flagged to Seb separately).
+// Persisted in Supabase (desk "main", collection "jobHealth", doc_id = jobName) so it
+// survives a Render restart. A success resets the streak to 0 -- only CONSECUTIVE failures
+// count. On the 3rd in a row, proposes (once, via proposeApproveFixOnce's own dedup)
+// disabling that job's flag. Swallows its own errors -- this must never be what breaks a job.
+async function recordJobOutcome(jobName, ok, errMessage) {
+  try {
+    const existing = await getDoc("main", "jobHealth", jobName);
+    const consecutiveFailures = ok ? 0 : (Number(existing?.data?.consecutiveFailures) || 0) + 1;
+    await upsertDoc("main", "jobHealth", jobName, {
+      consecutiveFailures,
+      lastOutcome: ok ? "ok" : "error",
+      lastError: ok ? null : String(errMessage || "").slice(0, 300),
+      lastCheckedAt: new Date().toISOString(),
+    });
+    if (!ok && consecutiveFailures >= JOB_FAILURE_THRESHOLD) {
+      await proposeApproveFixOnce({
+        desk: "main",
+        kind: "jobFailing",
+        actionKey: "disableJobFlag",
+        actionParams: { jobName },
+        plainWhat: `A background job ("${jobName}") has failed ${consecutiveFailures} times in a row.`,
+        plainFix: "Turn that job off until it's looked at.",
+      });
+    }
+  } catch (e) {
+    console.error(`recordJobOutcome(${jobName}) itself failed:`, e.message);
+  }
 }
 
 // kind is free-form (used only for logging/labeling); actionKey must be one of
