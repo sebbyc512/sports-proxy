@@ -72,14 +72,27 @@ alter table ledger_audit enable row level security;
 -- role key, so there is no per-caller identity to recover here beyond "service_role" (or
 -- "unknown" for a raw psql/SQL-editor edit). This still distinguishes an engine/app write
 -- from a direct manual database edit, which is the main case worth telling apart.
+-- The collection/desk filter has to live INSIDE the function body, not in a trigger WHEN
+-- clause: Postgres rejects "coalesce(new.x, old.x)" in a WHEN clause on a trigger that
+-- covers DELETE (42P17, "DELETE trigger's WHEN condition cannot reference NEW values"),
+-- because WHEN is evaluated before the per-operation row shape is settled. Inside the
+-- function body NEW/OLD are just ordinary (possibly-null) record variables, so the same
+-- coalesce works fine there -- this trigger fires on every docs row and filters itself.
 create or replace function ledger_audit_pnlentries() returns trigger as $$
+declare
+  v_desk text := coalesce(new.desk_id, old.desk_id);
+  v_collection text := coalesce(new.collection, old.collection);
+  v_doc_id text := coalesce(new.doc_id, old.doc_id);
 begin
+  if v_collection <> 'pnlEntries' or v_desk not in ('main', 'steve') then
+    return coalesce(new, old);
+  end if;
   begin
     insert into ledger_audit (desk_id, collection, doc_id, op, before, after, who)
     values (
-      coalesce(new.desk_id, old.desk_id),
-      coalesce(new.collection, old.collection),
-      coalesce(new.doc_id, old.doc_id),
+      v_desk,
+      v_collection,
+      v_doc_id,
       TG_OP,
       case when TG_OP = 'INSERT' then null else to_jsonb(old) end,
       case when TG_OP = 'DELETE' then null else to_jsonb(new) end,
@@ -87,7 +100,7 @@ begin
     );
   exception when others then
     -- NEVER let a logging failure block or roll back the real write.
-    raise warning 'ledger_audit_pnlentries: logging failed for %/%/% (%): %', coalesce(new.desk_id, old.desk_id), coalesce(new.collection, old.collection), coalesce(new.doc_id, old.doc_id), TG_OP, SQLERRM;
+    raise warning 'ledger_audit_pnlentries: logging failed for %/%/% (%): %', v_desk, v_collection, v_doc_id, TG_OP, SQLERRM;
   end;
   return coalesce(new, old);
 end;
@@ -97,10 +110,6 @@ drop trigger if exists trg_ledger_audit_pnlentries on public.docs;
 create trigger trg_ledger_audit_pnlentries
 after insert or update or delete on public.docs
 for each row
-when (
-  coalesce(new.collection, old.collection) = 'pnlEntries'
-  and coalesce(new.desk_id, old.desk_id) in ('main', 'steve')
-)
 execute function ledger_audit_pnlentries();
 
 -- Sanity checks:
