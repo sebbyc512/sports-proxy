@@ -1111,11 +1111,81 @@ function selfHealSignature(result) {
   return JSON.stringify({ ids, balanceDelta: result.balanceDelta });
 }
 
+// --- SGP price calibration (2026-11-06, Seb's self-healing ask) ---
+// A builder's ticket quotes an "odds" field for a same-game parlay; when Seb/Steve actually
+// places that bet and later uploads the slip, the resulting pnlEntries doc carries the
+// REAL DraftKings price (its own "odds" field) and a "ticketId" linking it back to the
+// built ticket. Comparing those two numbers is how the correlation-discount guess in rule
+// tight-real-prices gets calibrated against real data instead of staying a fixed 30-50%.
+// Idempotent (stamps sgpCalibrationCheckedAt) so each pnlEntry is only ever compared once.
+// Reuses americanToImplied(), defined once below (function declarations hoist).
+async function sgpCalibrationCheckDesk(desk) {
+  const pnlRes = await supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data`);
+  const pnlDocs = await pnlRes.json();
+  const candidates = pnlDocs.filter((d) => d.data?.ticketId && d.data?.odds != null && !d.data?.sgpCalibrationCheckedAt);
+  if (candidates.length === 0) return { desk, checked: 0, logged: 0 };
+
+  const ticketIds = [...new Set(candidates.map((d) => d.data.ticketId))];
+  const idList = ticketIds.map((id) => encodeURIComponent(id)).join(",");
+  const parlaysRes = await supabaseFetch(
+    `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.parlays&doc_id=in.(${idList})&select=doc_id,data`
+  );
+  const parlaysDocs = await parlaysRes.json();
+  const parlaysById = new Map(parlaysDocs.map((p) => [p.doc_id, p.data]));
+
+  let logged = 0;
+  for (const entry of candidates) {
+    const ticket = parlaysById.get(entry.data.ticketId);
+    // Stamp checked regardless of outcome -- a non-SGP or unmatched entry never needs
+    // re-checking every hour.
+    await mergeUpsertDoc(desk, "pnlEntries", entry.doc_id, { sgpCalibrationCheckedAt: new Date().toISOString() }).catch(() => {});
+    if (!ticket || ticket.betType !== "sgp" || ticket.odds == null) continue;
+    const ourImplied = americanToImplied(ticket.odds);
+    const realImplied = americanToImplied(entry.data.odds);
+    if (ourImplied == null || realImplied == null) continue;
+    // >1 means DraftKings' real price implies a HIGHER win probability (a shorter/worse
+    // price for the bettor) than what we quoted -- the correlation discount was too weak.
+    const gapRatio = Math.round((realImplied / ourImplied) * 1000) / 1000;
+    await upsertDoc(desk, "sgpCalibration", `sgp-${desk}-${entry.doc_id}`, {
+      desk,
+      pnlEntryId: entry.doc_id,
+      ticketId: entry.data.ticketId,
+      legCount: Array.isArray(ticket.legs) ? ticket.legs.length : null,
+      league: ticket.league || null,
+      ourOdds: ticket.odds,
+      realOdds: entry.data.odds,
+      ourImpliedProb: Math.round(ourImplied * 1000) / 1000,
+      realImpliedProb: Math.round(realImplied * 1000) / 1000,
+      gapRatio,
+      loggedAt: new Date().toISOString(),
+    });
+    logged++;
+  }
+  return { desk, checked: candidates.length, logged };
+}
+
+app.get("/internal/jobs/sgp-calibration", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
+  for (const d of desks) if (!["main", "steve"].includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  try {
+    const results = [];
+    for (const desk of desks) results.push(await sgpCalibrationCheckDesk(desk));
+    res.json({ ok: true, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/internal/jobs/self-heal", async (req, res) => {
   const desks = req.query.desk ? [req.query.desk] : ["main", "steve"];
   for (const d of desks) if (!["main", "steve"].includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
   const dryRun = req.query.dryRun === "true";
   try {
+    // Piggyback the SGP calibration sweep on self-heal's existing hourly cron -- no new
+    // Supabase cron job needed. Failures here never block the balance-drift check below.
+    if (!dryRun) {
+      for (const d of desks) await sgpCalibrationCheckDesk(d).catch((err) => console.error("sgp-calibration:", d, err.message));
+    }
     const summary = { dryRun, desks: {} };
     let anyMismatch = false;
     const mismatchedDesks = [];
