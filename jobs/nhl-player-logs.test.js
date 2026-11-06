@@ -19,22 +19,26 @@ const SAMPLE = [
   {
     team: { abbreviation: "OTT" },
     statistics: [
-      { name: "forwards", keys: KEYS, athletes: [] },
-      { name: "skaters", keys: KEYS, athletes: [athlete("1", "Michael Amadio", "RW", row({ toi: "14:32", goals: 1, assists: 2, shots: 4, hits: 3, blocked: 1, giveaways: 2, takeaways: 1 }))] },
+      { name: "forwards", keys: KEYS, athletes: [athlete("1", "Michael Amadio", "RW", row({ toi: "14:32", goals: 1, assists: 2, shots: 4, hits: 3, blocked: 1, giveaways: 2, takeaways: 1 }))] },
+      { name: "defenses", keys: KEYS, athletes: [athlete("3", "Jake Sanderson", "D", row({ toi: "22:10" }))] },
+      // ESPN's own "skaters" group is a real field but comes back EMPTY (confirmed live,
+      // 2026-11-06) -- must be ignored, not relied on, even though it's present here too.
+      { name: "skaters", keys: KEYS, athletes: [] },
       { name: "goalies", keys: [], athletes: [] },
     ],
   },
   {
     team: { abbreviation: "BUF" },
     statistics: [
-      { name: "skaters", keys: KEYS, athletes: [athlete("2", "Tage Thompson", "C", row({ toi: "19:05", goals: 0, assists: 1, shots: 6 }))] },
+      { name: "forwards", keys: KEYS, athletes: [athlete("2", "Tage Thompson", "C", row({ toi: "19:05", goals: 0, assists: 1, shots: 6 }))] },
+      { name: "defenses", keys: KEYS, athletes: [] },
     ],
   },
 ];
 
-test("extractNhlPlayerLogs: reads only the 'skaters' group (not forwards/goalies), computes points = goals+assists", () => {
+test("extractNhlPlayerLogs: combines forwards+defenses (ignores the empty 'skaters' group), computes points = goals+assists", () => {
   const rows = extractNhlPlayerLogs(SAMPLE, "BUF", "OTT");
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   const amadio = rows.find((r) => r.player_id === "1");
   assert.equal(amadio.team, "OTT");
   assert.equal(amadio.opponent, "BUF");
@@ -47,7 +51,7 @@ test("extractNhlPlayerLogs: reads only the 'skaters' group (not forwards/goalies
 
 test("extractNhlPlayerLogs: unparseable TOI yields null, not a crash", () => {
   const rows = extractNhlPlayerLogs(
-    [{ team: { abbreviation: "X" }, statistics: [{ name: "skaters", keys: KEYS, athletes: [athlete("9", "Nobody", "D", row({ toi: "" }))] }] }],
+    [{ team: { abbreviation: "X" }, statistics: [{ name: "forwards", keys: KEYS, athletes: [athlete("9", "Nobody", "D", row({ toi: "" }))] }] }],
     "X",
     "Y"
   );
@@ -56,7 +60,7 @@ test("extractNhlPlayerLogs: unparseable TOI yields null, not a crash", () => {
 
 test("buildNhlPlayerLogRows: tags game_id/date/season", () => {
   const rows = buildNhlPlayerLogRows("401892644", "20261104", SAMPLE, "BUF", "OTT");
-  assert.equal(rows.length, 2);
+  assert.equal(rows.length, 3);
   for (const r of rows) {
     assert.equal(r.game_id, "401892644");
     assert.equal(r.date, "2026-11-04");
@@ -78,7 +82,7 @@ test("trackNhlPlayerLogsForDate: records final games, skips others, survives per
       if (url.includes("event=1")) return { boxscore: { players: SAMPLE } };
       throw new Error("unexpected " + url);
     },
-    upsertRows: async (rows) => { upserts++; assert.equal(rows.length, 2); },
+    upsertRows: async (rows) => { upserts++; assert.equal(rows.length, 3); },
   };
   const result = await trackNhlPlayerLogsForDate("20261104", deps);
   assert.equal(result.gamesFound, 1);

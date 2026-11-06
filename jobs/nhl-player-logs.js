@@ -21,9 +21,13 @@ export function extractNhlPlayerLogs(boxscorePlayers, awayAbbr, homeAbbr) {
     if (!abbr) continue;
     const opponent = abbr === awayAbbr ? homeAbbr : abbr === homeAbbr ? awayAbbr : null;
     const homeAway = abbr === homeAbbr ? "home" : abbr === awayAbbr ? "away" : null;
-    const skaters = (teamBlock.statistics || []).find((s) => s.name === "skaters");
-    if (!skaters) continue;
-    const keys = skaters.keys || [];
+    // ESPN's own "skaters" group comes back with an empty athletes array (seen live,
+    // 2026-11-06) -- the real per-player rows live under "forwards" and "defenses"
+    // separately (same key set as "skaters" would have), so combine those two instead.
+    const groups = (teamBlock.statistics || []).filter((s) => s.name === "forwards" || s.name === "defenses");
+    if (!groups.length) continue;
+    const keys = groups[0].keys || [];
+    const athletes = groups.flatMap((g) => g.athletes || []);
     const idxOf = (k) => keys.indexOf(k);
     const toiIdx = idxOf("timeOnIce");
     const goalsIdx = idxOf("goals");
@@ -34,7 +38,7 @@ export function extractNhlPlayerLogs(boxscorePlayers, awayAbbr, homeAbbr) {
     const giveawaysIdx = idxOf("giveaways");
     const takeawaysIdx = idxOf("takeaways");
 
-    for (const a of skaters.athletes || []) {
+    for (const a of athletes) {
       if (!a.athlete?.id) continue;
       const s = a.stats || [];
       const goals = goalsIdx >= 0 ? Number(s[goalsIdx]) || 0 : 0;
