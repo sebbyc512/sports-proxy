@@ -1368,10 +1368,12 @@ async function computeDeskBalance(desk) {
     }
     if (d.type && d.type !== "bet") {
       cashRows.push({
+        docId: row.doc_id,
         type: /withdraw/i.test(d.type) || /^wd-/i.test(row.doc_id) ? "withdrawal" : /deposit/i.test(d.type) || /^dep-/i.test(row.doc_id) ? "deposit" : "other",
         amount: Math.abs(bgN(bgPick(d, "amount", "value", "stake"))),
         date: bgPick(d, "date", "createdAt", "settledAt") || "",
         exact: bgTs(d.createdAt),
+        appEditId: bgPick(d, "appEditId", "editId") || null,
       });
       continue;
     }
@@ -1417,7 +1419,35 @@ async function computeDeskBalance(desk) {
 
   const synced = anchored || bgN(bgPick(settings, "balance", "dkBalance", "syncedBalance"));
   const balance = synced || start + deposited - withdrawn + pnlAll;
-  return { balance: Math.round(balance * 100) / 100, fingerprints, anchored: !!anchor, anchorDate, start };
+  const duplicates = findDuplicateCashRows(cashRows);
+  return { balance: Math.round(balance * 100) / 100, fingerprints, anchored: !!anchor, anchorDate, start, duplicates };
+}
+
+// --- Duplicate cash-entry detector (2026-11-05, Seb's request, after a false "-$400 balance"
+// scare that turned out to have no actual duplicate) -- a withdrawal/deposit counts as
+// "explained" by balanceGuardFindEvents the instant it exists, so a genuine DUPLICATE
+// withdrawal (two real pnlEntries docs for the same real-world cash movement) would sail
+// through that check as two separate "explained" events and never get flagged on its own.
+// This runs independently of the unexplained-delta check and fires even when every event is
+// individually explained. Two cash rows are a duplicate pair when they share type+appEditId
+// (the same app edit literally produced two docs -- should be structurally impossible, but
+// cheap to check), or share type+amount and landed within 24h of each other (two docs for
+// what was almost certainly the same real withdrawal/deposit).
+const DUPLICATE_CASH_WINDOW_MS = 24 * 60 * 60 * 1000;
+function findDuplicateCashRows(cashRows) {
+  const pairs = [];
+  for (let i = 0; i < cashRows.length; i++) {
+    for (let j = i + 1; j < cashRows.length; j++) {
+      const a = cashRows[i], b = cashRows[j];
+      if (a.type !== b.type || a.type === "other") continue;
+      const sameAppEdit = a.appEditId && b.appEditId && a.appEditId === b.appEditId;
+      const sameAmountRecent = a.amount === b.amount && a.amount > 0 && Math.abs(a.exact - b.exact) <= DUPLICATE_CASH_WINDOW_MS;
+      if (sameAppEdit || sameAmountRecent) {
+        pairs.push({ docIds: [a.docId, b.docId], type: a.type, amount: a.amount, reason: sameAppEdit ? "same appEditId" : "same amount within 24h" });
+      }
+    }
+  }
+  return pairs;
 }
 
 // Finds every qualifying event since the last check: a new or re-valued DK-match anchor, a
@@ -1455,6 +1485,28 @@ function balanceGuardFindEvents(prevFingerprints, currFingerprints) {
 
 async function balanceGuardCheckDesk(desk, dryRun) {
   const current = await computeDeskBalance(desk);
+
+  // Duplicate cash entries are flagged immediately, independent of the explained/unexplained
+  // delta logic below and regardless of baseline state -- a duplicate is never "explained" by
+  // the fact that both copies exist (see findDuplicateCashRows' comment).
+  if (current.duplicates.length > 0) {
+    const prevDupState = dryRun ? null : await getDoc(desk, "balanceGuardDupState", "status");
+    const dupSignature = JSON.stringify(current.duplicates.map((d) => d.docIds.slice().sort()).sort());
+    if (!prevDupState || prevDupState.data?.signature !== dupSignature) {
+      const who = desk === "main" ? "Your" : "Steve's";
+      const lines = current.duplicates.map((d) => `${d.type} $${d.amount.toFixed(2)} (${d.docIds.join(" / ")}) -- ${d.reason}`).join("; ");
+      const reason = `${who} desk has what looks like a DUPLICATE cash entry: ${lines}. Check before trusting the balance.`;
+      if (!dryRun) {
+        await telegramApi("sendMessage", {
+          chat_id: TELEGRAM_SEB_CHAT_ID,
+          text: buildPrivateText({ kind: "failure", task: "Balance guard: duplicate cash entry", reason }),
+          parse_mode: "HTML",
+        }).catch((err) => console.error("balance-guard: duplicate DM failed:", err.message));
+        await upsertDoc(desk, "balanceGuardDupState", "status", { signature: dupSignature, checkedAt: new Date().toISOString() });
+      }
+    }
+  }
+
   const prevState = await getDoc(desk, "balanceGuardState", "status");
 
   if (!prevState) {
@@ -1465,7 +1517,7 @@ async function balanceGuardCheckDesk(desk, dryRun) {
         checkedAt: new Date().toISOString(),
       });
     }
-    return { desk, action: "baseline-set", balance: current.balance, anchored: current.anchored, anchorDate: current.anchorDate };
+    return { desk, action: "baseline-set", balance: current.balance, anchored: current.anchored, anchorDate: current.anchorDate, duplicates: current.duplicates };
   }
 
   const prevBalance = Number(prevState.data.balance) || 0;
@@ -1476,7 +1528,7 @@ async function balanceGuardCheckDesk(desk, dryRun) {
   // qualifying events, past the threshold, is unexplained.
   const unexplained = events.length > 0 ? 0 : rawDelta;
 
-  const result = { desk, rawDelta, unexplained, events, balance: current.balance, anchored: current.anchored, anchorDate: current.anchorDate };
+  const result = { desk, rawDelta, unexplained, events, balance: current.balance, anchored: current.anchored, anchorDate: current.anchorDate, duplicates: current.duplicates };
 
   if (Math.abs(unexplained) <= BALANCE_GUARD_THRESHOLD) {
     result.action = "no-op";
