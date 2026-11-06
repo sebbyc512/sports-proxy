@@ -2694,6 +2694,10 @@ async function fetchGamesForDate(date) {
           abbreviation: c.team?.abbreviation,
           location: c.team?.location,
           name: c.team?.name,
+          // Carried through (2026-11-06, CLV capture) so a matched leg's team can be
+          // resolved to home/away without a second fetch -- nothing read this field before,
+          // so this is purely additive.
+          homeAway: c.homeAway || null,
           // Half scores (NCAAB 1H/2H grading only, 2026-11-02) -- ESPN's scoreboard
           // competitor already carries these as {value, displayValue, period}, period 1 =
           // first half, period 2 = second half (an OT period, if any, is period 3+ and
@@ -3341,6 +3345,225 @@ app.get("/internal/jobs/grader", async (req, res) => {
       results.push({ ticketId: doc.doc_id, newStatus: newTicketStatus, legStatuses: newLegs.map((l) => l.status) });
     }
     res.json({ ok: true, collection, ticketsChecked: docs.length, ticketsUpdated: results.length, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- CLV (closing-line value) capture (2026-11-06, Seb's request, item 1 of the learning-
+// data batch) --- Engine code only, no Claude run. For every GRADED leg (hit/miss/push) on a
+// Claude-built "parlays" ticket (main + steve, bet or paper), writes one row to the dedicated
+// `clv_legs` table (never onto the parlays doc itself -- v2, Seb's ask, so Post-Cutover
+// Sync's cross-desk mirror sync can never wipe this and the real ticket docs stay untouched)
+// recording the closing number against the price/line already on the leg at build time and a
+// signed `clv` (positive = beat the close). Reuses extractCbbClosingLine's free ESPN-
+// pickcenter proxy (no paid historical-odds call, same reasoning as the 2026-11-02 CBB/CFB
+// closing-line work) -- works for any sport ESPN carries pickcenter for, not just basketball
+// despite the function's name (see its own comment). ml/spread/total only: props, FTD,
+// anytime-scorer and single-stat legs have no free closing-price source, same as half-line
+// (1H/2H) legs (pickcenter's line is full-game only) and a leg whose game can't be re-matched
+// -- all three still get a row (clv null, clv_type explaining why) so the capture job never
+// retries the same dead end on every run. Never touches the parlays doc's status/price/text/
+// anything the grader or Post-Cutover Sync owns, and never touches pnlEntries at all.
+function teamIsHome(teamQuery, competitors) {
+  const home = competitors.find((c) => c.homeAway === "home");
+  const away = competitors.find((c) => c.homeAway === "away");
+  if (home && teamMatches(teamQuery, home)) return true;
+  if (away && teamMatches(teamQuery, away)) return false;
+  return null; // couldn't confirm either side -- never guess
+}
+
+async function computeLegClv(leg, game) {
+  const parsed = parseLeg(leg.text, leg.type);
+  if (!["ml", "spread", "total"].includes(parsed.category)) {
+    return { betType: "unsupported", clvType: "unsupported" };
+  }
+  if (parsed.period && parsed.period !== "full") {
+    return { betType: parsed.category, clvType: "unsupported" }; // pickcenter's line is full-game only
+  }
+
+  const { closing } = await fetchClosingLineInfo(game); // cached per game id -- see fetchClosingLineInfo
+  if (!closing.provider) return { betType: parsed.category, clvType: "no-closing-data" };
+
+  if (parsed.category === "total") {
+    if (closing.total == null || parsed.line == null) return { betType: "total", clvType: "no-closing-data" };
+    const clv = parsed.direction === "over" ? closing.total - parsed.line : parsed.line - closing.total;
+    return { betType: "total", closingLine: closing.total, clv: Number(clv.toFixed(1)), clvType: "points" };
+  }
+
+  const isHome = teamIsHome(parsed.team, game.competitors);
+  if (isHome == null) return { betType: parsed.category, clvType: "no-match" };
+
+  if (parsed.category === "ml") {
+    const closingPrice = isHome ? closing.homeMoneyline : closing.awayMoneyline;
+    if (closingPrice == null || leg.price == null) return { betType: "ml", clvType: "no-closing-data" };
+    const buildImplied = americanToImplied(leg.price);
+    const closeImplied = americanToImplied(closingPrice);
+    if (buildImplied == null || closeImplied == null) return { betType: "ml", clvType: "no-closing-data" };
+    return {
+      betType: "ml",
+      closingPrice,
+      clv: Number(((closeImplied - buildImplied) * 100).toFixed(2)),
+      clvType: "implied % pts",
+    };
+  }
+
+  // spread -- homeSpread is already home-signed (see extractCbbClosingLine's own comment);
+  // flip it to be signed for parsed.team the same way parsed.line already is.
+  if (closing.homeSpread == null || parsed.line == null) return { betType: "spread", clvType: "no-closing-data" };
+  const closingSideLine = isHome ? closing.homeSpread : -closing.homeSpread;
+  return {
+    betType: "spread",
+    closingLine: Number(closingSideLine.toFixed(1)),
+    clv: Number((parsed.line - closingSideLine).toFixed(1)),
+    clvType: "points",
+  };
+}
+
+// Builds the same {sport,league,id,competitors,state} game shape gradeOneLeg's matching
+// already uses, scanning the ticket's own date +/-1 day -- CLV only ever runs on legs the
+// grader already resolved to a terminal status, so the same matching window is always enough.
+// `dateCache` is a plain object the caller owns for the lifetime of one clv-capture run, so the
+// same date's scoreboard slate is fetched once total across every leg/ticket that needs it
+// (not once per leg) -- the actual odds/pickcenter fetch is deduped separately, per game id,
+// by fetchClosingLineInfo's own module-level cache.
+async function findGameForLeg(leg, ticketDate, dateCache) {
+  const base = ticketDate ? new Date(ticketDate + "T12:00:00Z") : new Date();
+  const dates = [-1, 0, 1].map((delta) => {
+    const dd = new Date(base);
+    dd.setUTCDate(dd.getUTCDate() + delta);
+    return dd.toISOString().slice(0, 10);
+  });
+  const gameLists = await Promise.all(
+    dates.map(async (d) => {
+      if (!dateCache.has(d)) dateCache.set(d, await fetchGamesForDate(d));
+      return dateCache.get(d);
+    })
+  );
+  const games = gameLists.flat();
+  // Mirrors gradeOneLeg's own non-ftd/non-stat team/opponent derivation exactly (server.js,
+  // the plain ml/spread/total fallthrough at the end of gradeOneLeg) so CLV matches against
+  // the SAME game the grader already matched.
+  const parsed = parseLeg(leg.text, leg.type);
+  if (parsed.category === "total") {
+    return findGame(games, parsed.rawA || "", parsed.rawB || "", ticketDate);
+  }
+  const teamQuery = parsed.team || parsed.rawA;
+  const oppQuery = parsed.opponent || parsed.rawB;
+  return findGame(games, teamQuery || "", oppQuery || "", ticketDate);
+}
+
+async function fetchCapturedClvKeys() {
+  const res = await supabaseFetch(`/clv_legs?select=desk_id,ticket_id,leg_index`);
+  const rows = await res.json();
+  return new Set(rows.map((r) => `${r.desk_id}:${r.ticket_id}:${r.leg_index}`));
+}
+
+async function insertClvRows(rows) {
+  if (!rows.length) return;
+  const BATCH = 200;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    await supabaseFetch(`/clv_legs?on_conflict=desk_id,ticket_id,leg_index`, {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(rows.slice(i, i + BATCH)),
+    });
+  }
+}
+
+app.get("/internal/jobs/clv-capture", async (req, res) => {
+  try {
+    const dryRun = req.query.dryRun === "true";
+    const already = await fetchCapturedClvKeys();
+    const dateCache = new Map();
+    const newRows = [];
+    const perDesk = {};
+
+    for (const desk of ["main", "steve"]) {
+      perDesk[desk] = { ticketsScanned: 0, legsCaptured: 0 };
+      const listRes = await supabaseFetch(
+        `/docs?desk_id=eq.${desk}&collection=eq.parlays&select=doc_id,data`
+      );
+      const docs = await listRes.json();
+      for (const doc of docs) {
+        const data = doc.data || {};
+        const src = (data.source || "").toLowerCase();
+        if (!src.startsWith("claude")) continue; // Claude-built picks only
+        const legs = Array.isArray(data.legs) ? data.legs : [];
+        if (!legs.length) continue;
+        perDesk[desk].ticketsScanned++;
+        const sport = (data.league || "UNKNOWN").toUpperCase();
+        const paper = data.played !== true;
+
+        for (let i = 0; i < legs.length; i++) {
+          const leg = legs[i];
+          if (!["hit", "miss", "push"].includes(leg.status)) continue;
+          if (already.has(`${desk}:${doc.doc_id}:${i}`)) continue;
+
+          let clvInfo;
+          try {
+            const game = await findGameForLeg(leg, data.date, dateCache);
+            clvInfo = game ? await computeLegClv(leg, game) : { clvType: "no-match" };
+          } catch (err) {
+            clvInfo = { clvType: "no-match" }; // don't half-process -- mark it processed, move on
+          }
+
+          newRows.push({
+            desk_id: desk,
+            ticket_id: doc.doc_id,
+            leg_index: i,
+            sport,
+            bet_type: clvInfo.betType || null,
+            paper,
+            build_price: leg.price ?? null,
+            closing_price: clvInfo.closingPrice ?? null,
+            closing_line: clvInfo.closingLine ?? null,
+            clv: clvInfo.clv ?? null,
+            clv_type: clvInfo.clvType,
+          });
+          perDesk[desk].legsCaptured++;
+        }
+      }
+    }
+
+    if (!dryRun) await insertClvRows(newRows);
+    res.json({ ok: true, dryRun, perDesk, legsCaptured: newRows.length, sample: newRows.slice(0, 20) });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// CLV%-by-sport-and-bet-type rollup for the Monday recap routine to WebFetch (no Claude-run
+// cost on this engine's side) -- see handbooks/phase2-log.md for why this is a stat endpoint
+// rather than Seb editing the recap routine's prompt in-place. "beatClosePct" = share of
+// clv-tagged legs with clv > 0 (push-the-number-around ties, clv === 0, count as neither).
+// Reads straight from clv_legs -- real-money/paper split comes along for free via its own
+// `paper` column, ready for a future "bet vs paper CLV" cut if Seb wants one later.
+app.get("/internal/jobs/clv-summary", async (req, res) => {
+  try {
+    const days = req.query.days ? Number(req.query.days) : 7; // Monday recap's own window
+    const dateFloor = new Date(etDateDaysAgo(days) + "T00:00:00Z").toISOString();
+    const listRes = await supabaseFetch(
+      `/clv_legs?select=sport,bet_type,clv,captured_at&captured_at=gte.${dateFloor}&clv=not.is.null`
+    );
+    const rows = await listRes.json();
+    const buckets = {}; // "SPORT:TYPE" -> { legs, beat, clvSum }
+    for (const r of rows) {
+      const key = `${r.sport}:${r.bet_type}`;
+      buckets[key] = buckets[key] || { legs: 0, beat: 0, clvSum: 0 };
+      buckets[key].legs++;
+      if (r.clv > 0) buckets[key].beat++;
+      buckets[key].clvSum += Number(r.clv);
+    }
+    const out = {};
+    for (const [key, b] of Object.entries(buckets)) {
+      out[key] = {
+        legs: b.legs,
+        beatClosePct: Number(((b.beat / b.legs) * 100).toFixed(1)),
+        avgClv: Number((b.clvSum / b.legs).toFixed(2)),
+      };
+    }
+    res.json({ ok: true, days, buckets: out });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -5762,6 +5985,19 @@ function extractCbbClosingLine(summary) {
     homeMoneyline: Number.isFinite(best.homeTeamOdds?.moneyLine) ? best.homeTeamOdds.moneyLine : null,
     awayMoneyline: Number.isFinite(best.awayTeamOdds?.moneyLine) ? best.awayTeamOdds.moneyLine : null,
   };
+}
+
+// Cached per game (CLV capture, 2026-11-06) -- same lifetime/key pattern as boxScoreCache
+// and scoringPlaysCache above, so a ticket with several legs on the same game only fetches
+// its summary once per process lifetime.
+const closingLineCache = new Map();
+async function fetchClosingLineInfo(game) {
+  const key = `${game.sport}/${game.league}/${game.id}`;
+  if (closingLineCache.has(key)) return closingLineCache.get(key);
+  const data = await getJson(`${ESPN_BASE}/${game.sport}/${game.league}/summary?event=${game.id}`);
+  const info = { closing: extractCbbClosingLine(data) };
+  closingLineCache.set(key, info);
+  return info;
 }
 
 function cbbHalfScores(competitor) {
