@@ -22,6 +22,7 @@ import {
 } from "./jobs/projection-engine-sides-totals.js";
 import { joinProjectionsWithOutcomes, calibrationBuckets, simpleRoiIfAlwaysBetEdgeSide } from "./jobs/backtest-sides-totals.js";
 import { projectPlayerStat, buildPropShadowRow, STAT_KEYS } from "./jobs/projection-engine-props.js";
+import { pullHistoricalPropsForDate } from "./jobs/nba-props-historical-pull.js";
 import { matchOddsEvent } from "./jobs/team-aliases.js";
 
 const app = express();
@@ -9057,6 +9058,66 @@ app.get("/internal/jobs/understat-weekly-check", async (req, res) => {
       await sendTelegramRaw(TELEGRAM_SEB_CHAT_ID, "⚽ Understat is back up -- xG data could be added to the soccer build now.").catch(() => {});
     }
     res.json({ ok: true, isUp, wasUp, notifiedSeb: isUp && !wasUp });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Historical NBA player-props puller (2026-11-06+, Seb's explicit approval: points/
+// rebounds/assists, US region, one closing snapshot per game, ~4,500 credits estimated,
+// stay above 8,000 remaining for the month). Processes ONE DATE per call -- Seb/the parent
+// session loops over dates manually, checking the response's creditsRemainingAfter between
+// calls. NOT on any cron. Uses The Odds API's historical endpoint (10x the regular
+// per-market-per-region cost, confirmed in the credit estimate before this was approved) --
+// real money/quota, never fired automatically. jobs/nba-props-historical-pull.js enforces
+// its own hard stop below MIN_CREDITS_FLOOR mid-batch; this route just supplies the real
+// HTTP calls it takes as injected deps.
+app.get("/internal/jobs/nba-props-historical-pull", async (req, res) => {
+  try {
+    const ymd = req.query.date;
+    if (!ymd) return res.status(400).json({ error: "date is required, e.g. ?date=20261022" });
+    const PROPS_MARKETS_PARAM = "player_points,player_rebounds,player_assists";
+    const result = await pullHistoricalPropsForDate(ymd, {
+      getEspnJson: getJson,
+      getOddsEvents: async (dateIso) => {
+        const url = new URL(`${ODDS_BASE}/historical/sports/basketball_nba/events`);
+        url.searchParams.set("apiKey", ODDS_API_KEY);
+        url.searchParams.set("date", `${dateIso}T12:00:00Z`);
+        const body = await getOddsJson(url.toString());
+        return body.data || [];
+      },
+      getHistoricalOdds: async (eventId, snapshotIso) => {
+        const url = new URL(`${ODDS_BASE}/historical/sports/basketball_nba/events/${eventId}/odds`);
+        url.searchParams.set("apiKey", ODDS_API_KEY);
+        url.searchParams.set("date", snapshotIso);
+        url.searchParams.set("regions", "us");
+        url.searchParams.set("markets", PROPS_MARKETS_PARAM);
+        url.searchParams.set("oddsFormat", "american");
+        url.searchParams.set("bookmakers", "draftkings");
+        const res2 = await fetch(url.toString(), { headers: { "User-Agent": "sports-proxy/0.1" } });
+        const usage = {
+          requestsUsed: res2.headers.get("x-requests-used"),
+          requestsRemaining: res2.headers.get("x-requests-remaining"),
+          requestsLast: res2.headers.get("x-requests-last"),
+        };
+        if (usage.requestsUsed != null) recordOddsUsage(usage).catch((err) => console.error("odds-usage record failed:", err.message));
+        if (!res2.ok) throw new Error(`${url} -> HTTP ${res2.status}`);
+        const body = await res2.json();
+        return {
+          data: body.data,
+          creditsUsedThisCall: usage.requestsLast != null ? Number(usage.requestsLast) : null,
+          requestsRemaining: usage.requestsRemaining != null ? Number(usage.requestsRemaining) : null,
+        };
+      },
+      upsertRows: async (rows) => {
+        await supabaseFetch(`/nba_prop_historical_lines?on_conflict=date,player,market`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(rows),
+        });
+      },
+    });
+    res.json(result);
   } catch (err) {
     res.status(502).json({ error: err.message });
   }

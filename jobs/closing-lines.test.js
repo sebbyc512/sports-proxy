@@ -69,6 +69,33 @@ test("pullClosingLinesForDate: fetches scoreboard then one summary per final gam
   assert.equal(deps.captured[0].home_spread, -4);
 });
 
+test("pullClosingLinesForDate: CBB scoreboard call carries groups=50&limit=400 (full D1 slate, not ESPN's default subset)", async () => {
+  let scoreboardUrl = null;
+  const deps = {
+    getJson: async (url) => {
+      if (url.includes("scoreboard")) { scoreboardUrl = url; return { events: [] }; }
+      return {};
+    },
+    upsertRows: async () => {},
+  };
+  await pullClosingLinesForDate("CBB", "20261105", deps);
+  assert.match(scoreboardUrl, /groups=50/);
+  assert.match(scoreboardUrl, /limit=400/);
+});
+
+test("pullClosingLinesForDate: NBA scoreboard call does NOT add CBB-only groups/limit params", async () => {
+  let scoreboardUrl = null;
+  const deps = {
+    getJson: async (url) => {
+      if (url.includes("scoreboard")) { scoreboardUrl = url; return { events: [] }; }
+      return {};
+    },
+    upsertRows: async () => {},
+  };
+  await pullClosingLinesForDate("NBA", "20261105", deps);
+  assert.doesNotMatch(scoreboardUrl, /groups=/);
+});
+
 test("pullClosingLinesForDate: one bad scoreboard fetch is recorded, not thrown", async () => {
   const deps = { getJson: async () => { throw new Error("ESPN down"); }, upsertRows: async () => {} };
   const result = await pullClosingLinesForDate("CBB", "20261106", deps);

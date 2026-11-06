@@ -14,6 +14,10 @@ import { yyyymmddToIso, addDaysYyyymmdd } from "./util.js";
 
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports";
 const LEAGUE_PATHS = { NBA: "basketball/nba", CBB: "basketball/mens-college-basketball" };
+// CBB's scoreboard defaults to a small subset of games (confirmed: 8 of 65 on a sample date)
+// unless scoped to D1 (groups=50) with a limit above ESPN's default page size. NBA needs
+// neither -- its default scope is already the full (much smaller) slate.
+const LEAGUE_SCOREBOARD_PARAMS = { NBA: "", CBB: "&groups=50&limit=400" };
 
 export function extractClosingLineFromSummary(summary) {
   const books = summary?.pickcenter || [];
@@ -55,7 +59,9 @@ export async function pullClosingLinesForDate(league, yyyymmdd, deps) {
 
   let scoreboard;
   try {
-    scoreboard = await deps.getJson(`${ESPN_BASE}/${path}/scoreboard?dates=${yyyymmdd}`);
+    scoreboard = await deps.getJson(
+      `${ESPN_BASE}/${path}/scoreboard?dates=${yyyymmdd}${LEAGUE_SCOREBOARD_PARAMS[league] || ""}`
+    );
   } catch (err) {
     result.error = err.message;
     return result;
