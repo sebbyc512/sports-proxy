@@ -1569,6 +1569,22 @@ async function balanceGuardCheckDesk(desk, dryRun) {
       fingerprints: current.fingerprints,
       checkedAt: new Date().toISOString(),
     });
+
+    // 2026-11-06, Seb's request: the moment the balance guard itself flags an unexplained
+    // move, automatically run the ledger-diff (report-only, never repair=true here -- that
+    // stays a manual decision) and DM Seb the plain-language list of what looks suspicious.
+    // ledgerDiffDesk is defined further down in this file (function declarations are
+    // hoisted, so the forward reference is fine); it no-ops safely (caught below) if no
+    // good snapshot has been taken yet for this desk.
+    const diffResult = await ledgerDiffDesk(desk, { repair: false }).catch((err) => ({ error: err.message }));
+    if (!diffResult.error) {
+      await telegramApi("sendMessage", {
+        chat_id: TELEGRAM_SEB_CHAT_ID,
+        text: ledgerSuspiciousDmText(desk, diffResult.suspicious),
+      }).catch((err) => console.error("balance-guard: ledger-diff DM failed:", err.message));
+    } else {
+      console.error("balance-guard: ledger-diff auto-run failed:", diffResult.error);
+    }
   }
   return result;
 }
@@ -1581,6 +1597,301 @@ app.get("/internal/jobs/balance-guard", async (req, res) => {
     const results = [];
     for (const desk of desks) results.push(await balanceGuardCheckDesk(desk, dryRun));
     res.json({ ok: true, dryRun, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Ledger baseline + change log (2026-11-06, Seb's request) -------------------------
+// Three independent, LOGGING-ONLY layers. None of this ever blocks, delays, or fails a
+// real write to the `docs` table -- see sql/ledger-audit-run-me.sql for the trigger's own
+// exception guard.
+//   1. ledger_snapshots / ledger_snapshot_runs (Supabase tables) -- a labeled, point-in-time
+//      copy of every main/steve pnlEntries doc + the pnl/settings doc, plus that moment's
+//      computed balance (computeDeskBalance, same formula as balance-guard -- never a
+//      second formula). Immutable history; a label is never overwritten.
+//   2. ledger_audit (Supabase table + a Postgres trigger on public.docs) -- fires on every
+//      insert/update/delete to a main/steve pnlEntries row and records desk/doc/before/
+//      after/when, best-effort "who". Lives entirely in SQL (see the run-me file) so it
+//      catches writes from ANY path (this server, a manual Supabase edit, a future script),
+//      not just ones that go through upsertDoc here.
+//   3. /internal/jobs/ledger-diff -- compares the live desk against its latest "good"
+//      snapshot, labels every change NORMAL or SUSPICIOUS, and (only with &repair=true)
+//      restores just the SUSPICIOUS ones from that snapshot.
+// Nightly (sql/ledger-audit-run-me.sql's cron, 4 AM ET), /internal/jobs/ledger-nightly-
+// snapshot takes a fresh "good" snapshot per desk IF that desk's balance guard shows no
+// unexplained move or duplicate right now, and keeps only the last 14 per desk.
+const LEDGER_DESKS = ["main", "steve"];
+
+// Classification is necessarily heuristic -- this engine has no ground truth beyond what's
+// already in Supabase -- so it's written to err toward flagging anything it can't positively
+// explain as SUSPICIOUS rather than assuming it's fine. Report-only by default; a human
+// (Seb) decides whether to repair.
+function ledgerLooksLikeOtherDesk(desk, docId) {
+  const otherDeskPrefix = desk === "main" ? /^steve[-_]/i : /^(main|seb)[-_]/i;
+  return otherDeskPrefix.test(String(docId));
+}
+
+function ledgerClassifyChange(desk, docId, beforeData, afterData, appEditIds) {
+  if (beforeData && !afterData) return { label: "SUSPICIOUS", why: "doc deleted since the last good snapshot" };
+  if (ledgerLooksLikeOtherDesk(desk, docId)) {
+    return { label: "SUSPICIOUS", why: `doc id looks like it belongs to the other desk ("${docId}")` };
+  }
+
+  const d = afterData || {};
+  const isAdj = bgIsAdjRow(docId, d);
+  const isCash = !isAdj && d.type && d.type !== "bet";
+
+  if (!beforeData) {
+    // Added since the last good snapshot.
+    if (isAdj) {
+      const desc = String(d.desc || d.note || "");
+      const looksLikeRealDkMatch = /set to \$?[\d,.]+ to match draftkings/i.test(desc);
+      return looksLikeRealDkMatch
+        ? { label: "NORMAL", why: "new DK-match balance anchor" }
+        : {
+            label: "SUSPICIOUS",
+            why: "new balance anchor with no 'set to $X to match DraftKings' description -- looks like a computed anchor, not a real DK reading",
+          };
+    }
+    if (isCash) {
+      const linked = d.appEditId && appEditIds.has(String(d.appEditId));
+      return linked
+        ? { label: "NORMAL", why: `${d.type} tied to appEdit ${d.appEditId} on this desk` }
+        : { label: "SUSPICIOUS", why: `new ${d.type || "cash"} entry with no matching appEdit on this desk` };
+    }
+    return { label: "NORMAL", why: "new bet entry (slip upload or a pick placed)" };
+  }
+
+  // Changed since the last good snapshot.
+  if (isAdj) return { label: "SUSPICIOUS", why: "an existing balance anchor row was changed" };
+  if (isCash) {
+    const linked = d.appEditId && appEditIds.has(String(d.appEditId));
+    return linked
+      ? { label: "NORMAL", why: "cash entry edited, still tied to an appEdit on this desk" }
+      : { label: "SUSPICIOUS", why: "cash entry changed with no matching appEdit on this desk" };
+  }
+  const wasSettled = ["won", "lost", "push", "cashout"].includes(String(beforeData.status || "").toLowerCase());
+  const nowSettled = ["won", "lost", "push", "cashout"].includes(String(d.status || "").toLowerCase());
+  const stakeChanged = bgN(beforeData.stake) !== bgN(d.stake);
+  const retChanged = Number(beforeData.ret ?? NaN) !== Number(d.ret ?? NaN) && !(beforeData.ret == null && d.ret == null);
+  if (wasSettled && (stakeChanged || retChanged)) {
+    return { label: "SUSPICIOUS", why: "stake or payout changed on an already-settled bet" };
+  }
+  if (!wasSettled && nowSettled) return { label: "NORMAL", why: `bet settled (${d.status})` };
+  return { label: "NORMAL", why: "bet field edit before settling" };
+}
+
+async function ledgerSnapshotDesk(desk, label) {
+  const [entriesRes, settingsDoc] = await Promise.all([
+    supabaseFetch(
+      `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data,version`
+    ),
+    getDoc(desk, "pnl", "settings"),
+  ]);
+  const entries = await entriesRes.json();
+  const rows = entries.map((r) => ({ desk_id: desk, collection: "pnlEntries", doc_id: r.doc_id, data: r.data, version: r.version || 1 }));
+  rows.push({ desk_id: desk, collection: "pnl", doc_id: "settings", data: settingsDoc?.data || {}, version: settingsDoc?.version || 1 });
+
+  if (rows.length > 0) {
+    await supabaseFetch(`/ledger_snapshots`, {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify(rows.map((r) => ({ ...r, label }))),
+    });
+  }
+
+  const balance = await computeDeskBalance(desk);
+  await supabaseFetch(`/ledger_snapshot_runs?on_conflict=label,desk_id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([
+      {
+        label,
+        desk_id: desk,
+        doc_count: rows.length,
+        balance: balance.balance,
+        anchored: balance.anchored,
+        anchor_date: balance.anchorDate || null,
+        good: true,
+      },
+    ]),
+  });
+
+  return { desk, label, docCount: rows.length, balance: balance.balance, anchored: balance.anchored, anchorDate: balance.anchorDate };
+}
+
+async function ledgerLatestGoodSnapshot(desk) {
+  const res = await supabaseFetch(
+    `/ledger_snapshot_runs?desk_id=eq.${encodeURIComponent(desk)}&good=eq.true&order=created_at.desc&limit=1`
+  );
+  const rows = await res.json();
+  return rows[0] || null;
+}
+
+async function ledgerSnapshotDocsMap(label, desk, collection) {
+  const res = await supabaseFetch(
+    `/ledger_snapshots?label=eq.${encodeURIComponent(label)}&desk_id=eq.${encodeURIComponent(
+      desk
+    )}&collection=eq.${encodeURIComponent(collection)}&select=doc_id,data,version`
+  );
+  const rows = await res.json();
+  return new Map(rows.map((r) => [r.doc_id, r]));
+}
+
+async function ledgerPruneSnapshots(desk, keep) {
+  const res = await supabaseFetch(
+    `/ledger_snapshot_runs?desk_id=eq.${encodeURIComponent(desk)}&order=created_at.desc&select=label,created_at`
+  );
+  const rows = await res.json();
+  const stale = rows.slice(keep);
+  for (const r of stale) {
+    await supabaseFetch(
+      `/ledger_snapshots?desk_id=eq.${encodeURIComponent(desk)}&label=eq.${encodeURIComponent(r.label)}`,
+      { method: "DELETE" }
+    );
+    await supabaseFetch(
+      `/ledger_snapshot_runs?desk_id=eq.${encodeURIComponent(desk)}&label=eq.${encodeURIComponent(r.label)}`,
+      { method: "DELETE" }
+    );
+  }
+  return stale.map((r) => r.label);
+}
+
+async function ledgerDiffDesk(desk, { repair } = {}) {
+  const snap = await ledgerLatestGoodSnapshot(desk);
+  if (!snap) return { desk, error: "no good snapshot found for this desk yet -- run /internal/jobs/ledger-snapshot first" };
+
+  const [snapEntries, snapSettingsMap, liveEntriesRes, liveSettingsDoc, appEditsRes] = await Promise.all([
+    ledgerSnapshotDocsMap(snap.label, desk, "pnlEntries"),
+    ledgerSnapshotDocsMap(snap.label, desk, "pnl"),
+    supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data,version`),
+    getDoc(desk, "pnl", "settings"),
+    supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.appEdits&select=doc_id`),
+  ]);
+  const liveEntries = await liveEntriesRes.json();
+  const appEditIds = new Set((await appEditsRes.json()).map((r) => r.doc_id));
+  const liveMap = new Map(liveEntries.map((r) => [r.doc_id, r]));
+  const allIds = new Set([...snapEntries.keys(), ...liveMap.keys()]);
+
+  const changes = [];
+  for (const docId of allIds) {
+    const before = snapEntries.get(docId) || null;
+    const live = liveMap.get(docId) || null;
+    const beforeData = before?.data ?? null;
+    const afterData = live?.data ?? null;
+    if (JSON.stringify(beforeData) === JSON.stringify(afterData)) continue;
+
+    const op = !before ? "added" : !live ? "deleted" : "changed";
+    const cls = ledgerClassifyChange(desk, docId, beforeData, afterData, appEditIds);
+    changes.push({ docId, op, label: cls.label, why: cls.why, before: beforeData, after: afterData });
+  }
+
+  const snapSettingsRow = snapSettingsMap.get("settings") || null;
+  const liveSettingsData = liveSettingsDoc?.data ?? {};
+  if (JSON.stringify(snapSettingsRow?.data ?? {}) !== JSON.stringify(liveSettingsData)) {
+    changes.push({
+      docId: "pnl/settings",
+      op: "changed",
+      label: "SUSPICIOUS",
+      why: "pnl settings doc changed outside the normal balance-anchor flow",
+      before: snapSettingsRow?.data ?? null,
+      after: liveSettingsData,
+    });
+  }
+
+  const suspicious = changes.filter((c) => c.label === "SUSPICIOUS");
+  const normal = changes.filter((c) => c.label === "NORMAL");
+
+  const result = {
+    desk,
+    snapshotLabel: snap.label,
+    snapshotAt: snap.created_at,
+    suspicious: suspicious.map(({ before, after, ...rest }) => rest),
+    normal: normal.map(({ before, after, ...rest }) => rest),
+  };
+
+  if (repair && suspicious.length > 0) {
+    const repaired = [];
+    for (const c of suspicious) {
+      if (c.docId === "pnl/settings") {
+        await upsertDoc(desk, "pnl", "settings", snapSettingsRow?.data ?? {});
+      } else if (c.op === "added") {
+        await supabaseFetch(
+          `/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&doc_id=eq.${encodeURIComponent(c.docId)}`,
+          { method: "DELETE" }
+        );
+      } else {
+        await upsertDoc(desk, "pnlEntries", c.docId, c.before);
+      }
+      repaired.push(c.docId);
+    }
+    result.repaired = repaired;
+    result.balanceAfterRepair = (await computeDeskBalance(desk)).balance;
+  }
+
+  return result;
+}
+
+function ledgerSuspiciousDmText(desk, suspicious) {
+  const who = desk === "main" ? "Your" : "Steve's";
+  if (!suspicious || suspicious.length === 0) {
+    return `${who} ledger diff against the last good snapshot found nothing suspicious -- whatever moved the balance isn't something this check knows how to classify yet. Worth a manual look.`;
+  }
+  const lines = suspicious.map((c) => `- ${c.op} entry (${c.docId}): ${c.why}`).join("\n");
+  return `${who} ledger diff found ${suspicious.length} change(s) since the last good snapshot that don't look normal:\n${lines}\n\nReport-only -- nothing was changed. Say the word and I'll restore just these from the snapshot.`;
+}
+
+app.post("/internal/jobs/ledger-snapshot", async (req, res) => {
+  const label = String(req.query.label || "").trim();
+  if (!label) return res.status(400).json({ error: "label is required, e.g. ?label=baseline-2026-11-06" });
+  const desks = req.query.desk ? [req.query.desk] : LEDGER_DESKS;
+  for (const d of desks) if (!LEDGER_DESKS.includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  try {
+    const results = [];
+    for (const desk of desks) results.push(await ledgerSnapshotDesk(desk, label));
+    res.json({ ok: true, label, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+app.get("/internal/jobs/ledger-diff", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : LEDGER_DESKS;
+  for (const d of desks) if (!LEDGER_DESKS.includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  const repair = req.query.repair === "true";
+  try {
+    const results = [];
+    for (const desk of desks) results.push(await ledgerDiffDesk(desk, { repair }));
+    res.json({ ok: true, repair, results });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Nightly (4 AM ET, see sql/ledger-audit-run-me.sql): only saves a fresh "good" snapshot
+// for a desk when that desk's own balance guard shows a clean read right now (no
+// unexplained move, no duplicate cash rows) -- a snapshot taken on top of an already-bad
+// state would just become a new "good" baseline for a bad ledger. dryRun on the guard call
+// so this never itself sends the hourly alert DM or moves balance-guard's own checkpoint.
+app.get("/internal/jobs/ledger-nightly-snapshot", async (req, res) => {
+  const desks = req.query.desk ? [req.query.desk] : LEDGER_DESKS;
+  for (const d of desks) if (!LEDGER_DESKS.includes(d)) return res.status(404).json({ error: `unknown desk: ${d}` });
+  try {
+    const results = [];
+    for (const desk of desks) {
+      const guard = await balanceGuardCheckDesk(desk, true);
+      const clean = Math.abs(guard.unexplained || 0) <= BALANCE_GUARD_THRESHOLD && (guard.duplicates || []).length === 0;
+      if (!clean) {
+        results.push({ desk, skipped: true, reason: "balance guard shows an unexplained move or duplicate right now -- not saving a new good snapshot tonight" });
+        continue;
+      }
+      const label = `nightly-${new Date().toISOString().slice(0, 10)}`;
+      const snapshot = await ledgerSnapshotDesk(desk, label);
+      const prunedLabels = await ledgerPruneSnapshots(desk, 14);
+      results.push({ desk, skipped: false, snapshot, prunedLabels });
+    }
+    res.json({ ok: true, results });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
