@@ -7,6 +7,7 @@
 import express from "express";
 import { parseLeg } from "./grader.js";
 import { norm, teamMatches, findGame } from "./matcher.js";
+import { runTicketGate } from "./ticket-gate.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -6737,6 +6738,113 @@ app.get("/internal/jobs/news-check-fast", async (req, res) => {
     if (!imminent) return res.json({ ok: true, action: "none", imminent: false });
     const result = await runNewsCheck();
     res.json({ ok: true, imminent: true, ...result });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Ticket Gate (2026-11-05/06, Seb's request after the JAX@BAL sign-conversion bug and
+// the MIA@GSW out-of-band 3u SGP) ------------------------------------------------------
+// Code-level, deterministic validation of a single ticket -- see ticket-gate.js for the
+// check definitions. Called by a builder (via WebFetch, same pattern as /odds) right
+// after it writes a ticket and BEFORE it marks the request "answered": the builder reads
+// this endpoint's pass/fail JSON and, on failure with retriesUsed < 2, fixes that
+// specific ticket and calls this again (that retry loop lives in the builder's own
+// prompt, since fixing a ticket needs real research -- this endpoint only ever judges,
+// deterministically, never rewrites a ticket itself). After 2 real failures the builder
+// still answers the request, but writes gateWarning on the ticket itself so the desk UI
+// can flag it -- this endpoint doesn't need to do that write, it just tells the builder
+// retriesUsed has reached the cap in its response.
+//
+// mode=shadow (default): judges for real and logs to gate_results, but is purely
+// informational -- safe to call against live traffic while this is being proven out,
+// same shadow-mode discipline as /internal/jobs/grade-and-alert. mode=live: identical
+// judging and logging; the only difference is the response's `blocking` field, which a
+// wired-in builder prompt would treat as true to actually gate on. No live builder prompt
+// reads this endpoint yet (see the handoff note) -- mode=live does not change engine
+// behavior until that prompt wiring ships.
+//
+// Params: desk (main|steve), requestId (for logging/attempt-counting), ticketId
+// (required) OR a raw ticket body posted ad hoc for testing -- this route is GET-only
+// (WebFetch-callable) and always resolves the ticket by reading it from Supabase's own
+// "parlays" mirror, same source every other grading job already trusts.
+async function fetchTicketGateNews(leagues) {
+  const out = {};
+  for (const lg of leagues) {
+    const key = (lg || "").toLowerCase();
+    if (!key || out[key] !== undefined) continue;
+    out[key] = await getNewsDocForLeague(key).catch(() => null);
+  }
+  return out;
+}
+
+app.get("/internal/jobs/ticket-gate", async (req, res) => {
+  const desk = req.query.desk;
+  const requestId = req.query.requestId || null;
+  const ticketId = req.query.ticketId;
+  const mode = req.query.mode === "live" ? "live" : "shadow";
+  if (!DESKS.includes(desk)) return res.status(404).json({ error: `unknown desk: ${desk}` });
+  if (!ticketId) return res.status(400).json({ error: "ticketId is required" });
+  try {
+    const ticketDoc = await getDoc(desk, "parlays", ticketId);
+    if (!ticketDoc) {
+      return res.status(404).json({ error: `no parlays/${ticketId} found in Supabase for desk ${desk} yet -- the engine only gates what's already mirrored` });
+    }
+    const ticket = { id: ticketId, ...ticketDoc.data };
+
+    const newsByLeague = await fetchTicketGateNews([ticket.league]);
+
+    // desk-priority check: the OTHER desk's ticket(s) for the same game + date, if any.
+    const otherDesk = desk === "main" ? "steve" : desk === "steve" ? "main" : null;
+    let otherDeskTickets = [];
+    if (otherDesk && ticket.game && ticket.date) {
+      const r = await supabaseFetch(
+        `/docs?desk_id=eq.${otherDesk}&collection=eq.parlays&data->>game=eq.${encodeURIComponent(ticket.game)}&data->>date=eq.${encodeURIComponent(ticket.date)}&select=doc_id,data`
+      );
+      const rows = await r.json();
+      otherDeskTickets = rows.map((row) => ({ id: row.doc_id, ...row.data }));
+    }
+
+    // Attempt number: how many times this exact ticket has already been gated.
+    const priorRes = await supabaseFetch(
+      `/gate_results?desk=eq.${desk}&ticket_id=eq.${encodeURIComponent(ticketId)}&select=id`
+    ).catch(() => null);
+    const priorCount = priorRes ? (await priorRes.json()).length : 0;
+    const attempt = priorCount + 1;
+
+    const result = runTicketGate(ticket, { newsByLeague, matchLegToInjury, otherDeskTickets, now: Date.now() });
+
+    await supabaseFetch("/gate_results", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify([
+        {
+          desk,
+          request_id: requestId,
+          ticket_id: ticketId,
+          attempt,
+          mode,
+          passed: result.passed,
+          checks: result.checks,
+          failures: result.failures,
+        },
+      ]),
+    }).catch((err) => console.warn(`[ticket-gate] gate_results log failed: ${err.message}`));
+
+    res.json({
+      ok: true,
+      desk,
+      requestId,
+      ticketId,
+      mode,
+      attempt,
+      retriesUsed: attempt - 1,
+      retriesExhausted: attempt - 1 >= 2,
+      blocking: mode === "live",
+      passed: result.passed,
+      failures: result.failures,
+      checks: result.checks,
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
