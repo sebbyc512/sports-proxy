@@ -3453,10 +3453,26 @@ async function findGameForLeg(leg, ticketDate, dateCache) {
   return findGame(games, teamQuery || "", oppQuery || "", ticketDate);
 }
 
+// PostgREST caps an unpaged response at its project default (1000 on this project) -- found
+// 2026-11-06 testing against real data: past 1000 clv_legs rows, this silently returned only
+// the first page, so every leg past row 1000 looked "not yet captured" and got reprocessed
+// (harmlessly, since the insert below is itself idempotent -- but wastefully, forever,
+// growing every run) on every single tick. Paginates with Range until a page comes back
+// smaller than PAGE_SIZE.
 async function fetchCapturedClvKeys() {
-  const res = await supabaseFetch(`/clv_legs?select=desk_id,ticket_id,leg_index`);
-  const rows = await res.json();
-  return new Set(rows.map((r) => `${r.desk_id}:${r.ticket_id}:${r.leg_index}`));
+  const PAGE_SIZE = 1000;
+  const keys = new Set();
+  let offset = 0;
+  while (true) {
+    const res = await supabaseFetch(`/clv_legs?select=desk_id,ticket_id,leg_index`, {
+      headers: { Range: `${offset}-${offset + PAGE_SIZE - 1}` },
+    });
+    const rows = await res.json();
+    for (const r of rows) keys.add(`${r.desk_id}:${r.ticket_id}:${r.leg_index}`);
+    if (rows.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
+  }
+  return keys;
 }
 
 // leg.price is free text written by the builder, not always a clean number -- seen in real
