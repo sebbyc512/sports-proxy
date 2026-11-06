@@ -3459,6 +3459,16 @@ async function fetchCapturedClvKeys() {
   return new Set(rows.map((r) => `${r.desk_id}:${r.ticket_id}:${r.leg_index}`));
 }
 
+// leg.price is free text written by the builder, not always a clean number -- seen in real
+// data: "", "-450 (est.)", etc. clv_legs.build_price is a numeric column, so this strips
+// anything that isn't part of the number (same extraction americanToImplied already does)
+// and returns null rather than ever sending Postgres a string it can't cast.
+function toNumericPrice(price) {
+  if (price == null) return null;
+  const n = parseFloat(String(price).replace(/[^0-9.+-]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
 async function insertClvRows(rows) {
   if (!rows.length) return;
   const BATCH = 200;
@@ -3500,12 +3510,19 @@ app.get("/internal/jobs/clv-capture", async (req, res) => {
           if (!["hit", "miss", "push"].includes(leg.status)) continue;
           if (already.has(`${desk}:${doc.doc_id}:${i}`)) continue;
 
+          const safeCategory = () => {
+            try {
+              return parseLeg(leg.text, leg.type).category;
+            } catch {
+              return null;
+            }
+          };
           let clvInfo;
           try {
             const game = await findGameForLeg(leg, data.date, dateCache);
-            clvInfo = game ? await computeLegClv(leg, game) : { clvType: "no-match" };
+            clvInfo = game ? await computeLegClv(leg, game) : { betType: safeCategory(), clvType: "no-match" };
           } catch (err) {
-            clvInfo = { clvType: "no-match" }; // don't half-process -- mark it processed, move on
+            clvInfo = { betType: safeCategory(), clvType: "no-match" }; // don't half-process -- mark it processed, move on
           }
 
           newRows.push({
@@ -3515,7 +3532,7 @@ app.get("/internal/jobs/clv-capture", async (req, res) => {
             sport,
             bet_type: clvInfo.betType || null,
             paper,
-            build_price: leg.price ?? null,
+            build_price: toNumericPrice(leg.price),
             closing_price: clvInfo.closingPrice ?? null,
             closing_line: clvInfo.closingLine ?? null,
             clv: clvInfo.clv ?? null,
