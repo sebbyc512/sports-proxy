@@ -12,6 +12,10 @@ import { trackNbaPlayerLogsForDate } from "./jobs/nba-player-logs.js";
 import { buildScheduleContextForLeague } from "./jobs/schedule-context.js";
 import { trackNhlPlayerLogsForDate } from "./jobs/nhl-player-logs.js";
 import { runNflverseJob } from "./jobs/nflverse.js";
+import { pullClosingLinesForDate, pullClosingLinesForDateRange } from "./jobs/closing-lines.js";
+import { buildNbaTeamGameTotals, nbaTeamOffDefRating, buildSidesTotalsProjection } from "./jobs/projection-engine-sides-totals.js";
+import { joinProjectionsWithOutcomes, calibrationBuckets, simpleRoiIfAlwaysBetEdgeSide } from "./jobs/backtest-sides-totals.js";
+import { projectPlayerStat, buildPropShadowRow, STAT_KEYS } from "./jobs/projection-engine-props.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4780,6 +4784,47 @@ app.get("/internal/jobs/nhl-player-logs", async (req, res) => {
   }
 });
 
+// --- NBA/CBB analytics-only projection engine, phase 1 (2026-11-06+, Seb's request) ---
+// Everything below is ADDITIVE and INERT: no cron wires into any of these routes, nothing
+// here is called by ticket-gate.js, a rule JSON, or a builder prompt. Seb fires these
+// manually while reviewing Phase 1/2 of the plan; live wiring is a separate, later,
+// explicitly-approved step (Tuesday 2026-11-10 or after). Pure logic lives in
+// jobs/closing-lines.js, jobs/projection-engine-sides-totals.js,
+// jobs/backtest-sides-totals.js, and jobs/projection-engine-props.js -- this block only
+// supplies the real ESPN/Supabase/Odds-API calls those modules take as injected deps.
+
+const CLOSING_LINES_TABLE = { NBA: "nba_closing_lines", CBB: "cbb_closing_lines" };
+const PROJECTIONS_TABLE = { NBA: "nba_projections", CBB: "cbb_projections" };
+const TEAMS_COLLECTION = { NBA: "nbaTeams", CBB: "cbbTeams" };
+const ODDS_SPORT_KEY = { NBA: "basketball_nba", CBB: "basketball_ncaab" };
+
+// Season-wide closing lines (NBA or CBB), one date or an inclusive range. Separate from
+// clv_legs -- this pulls EVERY game, not just ones Seb bet on. See jobs/closing-lines.js.
+app.get("/internal/jobs/closing-lines", async (req, res) => {
+  try {
+    const league = req.query.league;
+    if (!CLOSING_LINES_TABLE[league]) return res.status(400).json({ error: 'league must be "NBA" or "CBB"' });
+    const table = CLOSING_LINES_TABLE[league];
+    const upsertRows = async (rows) => {
+      await supabaseFetch(`/${table}?on_conflict=game_id`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(rows),
+      });
+    };
+    if (req.query.start && req.query.end) {
+      const result = await pullClosingLinesForDateRange(league, req.query.start, req.query.end, { getJson, upsertRows });
+      return res.json(result);
+    }
+    const date =
+      req.query.date || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10).replace(/-/g, "");
+    const result = await pullClosingLinesForDate(league, date, { getJson, upsertRows });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // Item 9 of the 2026-11-06 daily-data batch (Seb's explicit ask): nflverse NFL data --
 // injuries, snap counts, team EPA (the three Seb prioritized before Sunday's games).
 // ONLY these three published release files -- schedules-with-lines, weekly player stats,
@@ -4815,6 +4860,315 @@ app.get("/internal/jobs/nflverse", async (req, res) => {
       },
     });
     res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Pulls today's (or ?date=YYYYMMDD's) NBA/CBB games, projects margin/total from each team's
+// existing nbaTeams/cbbTeams ptsFor/ptsAgainst (already maintained by refreshNbaTeams /
+// refreshCbbTeams -- NOT re-derived here) plus schedule_context rest/b2b/travel, compares
+// against DK's current spread/total/ML (one the-odds-api call per game -- counted and
+// returned so the real credit cost is visible), and stores the result. Nothing reads these
+// rows for picks yet.
+app.get("/internal/jobs/sides-totals-projection", async (req, res) => {
+  try {
+    const league = req.query.league;
+    if (!PROJECTIONS_TABLE[league]) return res.status(400).json({ error: 'league must be "NBA" or "CBB"' });
+    const ymd = req.query.date || new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const dateIso = `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+    const espnPath = league === "NBA" ? "basketball/nba" : "basketball/mens-college-basketball";
+
+    const scoreboard = await getJson(`${ESPN_BASE}/${espnPath}/scoreboard?dates=${ymd}`);
+    const games = [];
+    for (const ev of scoreboard.events || []) {
+      const comp = ev.competitions?.[0];
+      const away = comp?.competitors?.find((c) => c.homeAway === "away");
+      const home = comp?.competitors?.find((c) => c.homeAway === "home");
+      if (away?.team?.abbreviation && home?.team?.abbreviation) {
+        games.push({ id: String(ev.id), homeTeam: home.team.abbreviation, awayTeam: away.team.abbreviation });
+      }
+    }
+
+    let oddsApiCallsMade = 0;
+    const rows = [];
+    const skipped = [];
+    for (const g of games) {
+      try {
+        const [homeDoc, awayDoc, homeCtxRes, awayCtxRes] = await Promise.all([
+          getDoc("main", TEAMS_COLLECTION[league], g.homeTeam),
+          getDoc("main", TEAMS_COLLECTION[league], g.awayTeam),
+          supabaseFetch(`/schedule_context?league=eq.${league}&team=eq.${g.homeTeam}&date=eq.${dateIso}&select=*`),
+          supabaseFetch(`/schedule_context?league=eq.${league}&team=eq.${g.awayTeam}&date=eq.${dateIso}&select=*`),
+        ]);
+        const homeOffDef = { avgPointsScored: homeDoc?.data?.ptsFor ?? null, avgPointsAllowed: homeDoc?.data?.ptsAgainst ?? null };
+        const awayOffDef = { avgPointsScored: awayDoc?.data?.ptsFor ?? null, avgPointsAllowed: awayDoc?.data?.ptsAgainst ?? null };
+        const homeScheduleCtx = (await homeCtxRes.json())[0] || null;
+        const awayScheduleCtx = (await awayCtxRes.json())[0] || null;
+
+        let dk = {};
+        try {
+          const eventsUrl = new URL(`${ODDS_BASE}/sports/${ODDS_SPORT_KEY[league]}/events`);
+          eventsUrl.searchParams.set("apiKey", ODDS_API_KEY);
+          const events = await getOddsJson(eventsUrl.toString());
+          oddsApiCallsMade++;
+          const match = events.find(
+            (e) => e.home_team?.includes(g.homeTeam) || e.away_team?.includes(g.awayTeam) || true
+          ) && events[0]; // best-effort match; a real wiring pass would map ESPN abbr -> Odds API team names
+          if (match) {
+            const oddsUrl = new URL(`${ODDS_BASE}/sports/${ODDS_SPORT_KEY[league]}/events/${match.id}/odds`);
+            oddsUrl.searchParams.set("apiKey", ODDS_API_KEY);
+            oddsUrl.searchParams.set("regions", "us");
+            oddsUrl.searchParams.set("markets", "h2h,spreads,totals");
+            oddsUrl.searchParams.set("oddsFormat", "american");
+            oddsUrl.searchParams.set("bookmakers", "draftkings");
+            const data = await getOddsJson(oddsUrl.toString());
+            oddsApiCallsMade++;
+            const dkBook = (data.bookmakers || []).find((b) => /draftkings/i.test(b.key || b.title || ""));
+            const spreadsMkt = dkBook?.markets?.find((m) => m.key === "spreads");
+            const totalsMkt = dkBook?.markets?.find((m) => m.key === "totals");
+            const h2hMkt = dkBook?.markets?.find((m) => m.key === "h2h");
+            const homeOutcome = (name) => (mkt) => mkt?.outcomes?.find((o) => o.name === name);
+            dk = {
+              homeSpread: homeOutcome(data.home_team)(spreadsMkt)?.point ?? null,
+              spreadPriceHome: homeOutcome(data.home_team)(spreadsMkt)?.price ?? null,
+              spreadPriceAway: homeOutcome(data.away_team)(spreadsMkt)?.price ?? null,
+              total: totalsMkt?.outcomes?.[0]?.point ?? null,
+              totalOverPrice: totalsMkt?.outcomes?.find((o) => o.name === "Over")?.price ?? null,
+              totalUnderPrice: totalsMkt?.outcomes?.find((o) => o.name === "Under")?.price ?? null,
+              mlHome: homeOutcome(data.home_team)(h2hMkt)?.price ?? null,
+              mlAway: homeOutcome(data.away_team)(h2hMkt)?.price ?? null,
+            };
+          }
+        } catch (oddsErr) {
+          // No DK line available for this game yet (too far out, or Odds API hiccup) --
+          // still write the projection with null dk_* fields rather than skip the game.
+        }
+
+        const row = buildSidesTotalsProjection({
+          league, homeTeam: g.homeTeam, awayTeam: g.awayTeam, date: dateIso,
+          homeOffDef, awayOffDef, homeScheduleCtx, awayScheduleCtx, dk,
+        });
+        row.game_id = g.id;
+        rows.push(row);
+      } catch (err) {
+        skipped.push({ id: g.id, reason: err.message });
+      }
+    }
+
+    if (rows.length) {
+      await supabaseFetch(`/${PROJECTIONS_TABLE[league]}`, {
+        method: "POST",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify(rows),
+      });
+    }
+    res.json({ league, date: dateIso, gamesFound: games.length, rowsWritten: rows.length, oddsApiCallsMade, skipped });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Backtest report over a stored date range: joins nba_projections/cbb_projections against
+// the season-wide closing lines and actual final scores, reports calibration + a simple
+// flat-stake ROI per market. Only meaningful once sides-totals-projection and closing-lines
+// have actually been backfilled for the range requested -- see jobs/backtest-sides-totals.js's
+// header comment. Final scores: NBA from nba_player_logs (summed per team per game -- no
+// separate team-score table exists), CBB from cbb_game_logs (already has home_score/away_score).
+app.get("/internal/jobs/backtest-sides-totals", async (req, res) => {
+  try {
+    const league = req.query.league;
+    const { start, end } = req.query;
+    if (!PROJECTIONS_TABLE[league]) return res.status(400).json({ error: 'league must be "NBA" or "CBB"' });
+    if (!start || !end) return res.status(400).json({ error: "start and end (YYYY-MM-DD) are required" });
+
+    const projRes = await supabaseFetch(`/${PROJECTIONS_TABLE[league]}?date=gte.${start}&date=lte.${end}&select=*`);
+    const projections = await projRes.json();
+    const closingRes = await supabaseFetch(`/${CLOSING_LINES_TABLE[league]}?date=gte.${start}&date=lte.${end}&select=*`);
+    const closingLines = await closingRes.json();
+
+    let finalScores;
+    if (league === "CBB") {
+      const scoreRes = await supabaseFetch(
+        `/cbb_game_logs?date=gte.${start}&date=lte.${end}&select=date,home_team,away_team,home_score,away_score`
+      );
+      finalScores = await scoreRes.json();
+    } else {
+      const logsRes = await supabaseFetch(
+        `/nba_player_logs?date=gte.${start}&date=lte.${end}&select=game_id,team,opponent,home_away,date,points`
+      );
+      const logs = await logsRes.json();
+      const totals = buildNbaTeamGameTotals(logs);
+      const byGame = new Map();
+      for (const t of totals) {
+        const g = byGame.get(t.game_id) || { date: t.date };
+        if (t.home_away === "home") { g.home_team = t.team; g.home_score = t.points; }
+        else { g.away_team = t.team; g.away_score = t.points; }
+        byGame.set(t.game_id, g);
+      }
+      finalScores = [...byGame.values()].filter((g) => g.home_team && g.away_team);
+    }
+
+    const joined = joinProjectionsWithOutcomes(projections, closingLines, finalScores);
+    const report = {
+      league, start, end,
+      gamesJoined: joined.length,
+      calibration: calibrationBuckets(joined),
+      roi: {
+        ml: simpleRoiIfAlwaysBetEdgeSide(joined, "ml"),
+        spread: simpleRoiIfAlwaysBetEdgeSide(joined, "spread"),
+        total: simpleRoiIfAlwaysBetEdgeSide(joined, "total"),
+      },
+    };
+    res.json(report);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// NBA player-prop SHADOW MODE -- log-only, never invoked automatically (no cron), never
+// read by a builder. Fires for one date's games: computes a weighted L5/L10/season
+// projection per player per market from nba_player_logs, adjusted for rest/b2b
+// (schedule_context), opponent-defense-vs-position (derived from nba_player_logs itself --
+// see jobs/projection-engine-props.js's header for why this is a v1 approximation), and
+// compares to DK's CURRENT prop line via the-odds-api's player-props market -- ONE call per
+// game (not per player), counted and returned, since each call spends real, metered Odds
+// API quota (2k/20k used this month as of 2026-11-06). Seb reviews that count before firing
+// this again.
+app.get("/internal/jobs/nba-props-shadow", async (req, res) => {
+  try {
+    const ymd = req.query.date || new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const dateIso = `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6, 8)}`;
+    const scoreboard = await getJson(`${ESPN_BASE}/basketball/nba/scoreboard?dates=${ymd}`);
+    const games = [];
+    for (const ev of scoreboard.events || []) {
+      const comp = ev.competitions?.[0];
+      const away = comp?.competitors?.find((c) => c.homeAway === "away");
+      const home = comp?.competitors?.find((c) => c.homeAway === "home");
+      if (away?.team?.abbreviation && home?.team?.abbreviation) {
+        games.push({ homeTeam: nbaAbbr(home.team.abbreviation), awayTeam: nbaAbbr(away.team.abbreviation) });
+      }
+    }
+
+    // League-average points/rebounds/assists allowed per position, for the defense
+    // multiplier's denominator -- one query per stat, reused across every game this call
+    // processes (not per player).
+    const leagueAvgAtPosition = {};
+    for (const statKey of STAT_KEYS) {
+      const r = await supabaseFetch(`/nba_player_logs?select=${statKey},position&limit=3000&order=date.desc`);
+      const rows = await r.json();
+      const byPos = {};
+      for (const row of rows) {
+        if (!row.position) continue;
+        (byPos[row.position] ||= []).push(row[statKey] || 0);
+      }
+      leagueAvgAtPosition[statKey] = {};
+      for (const pos of Object.keys(byPos)) {
+        leagueAvgAtPosition[statKey][pos] = byPos[pos].reduce((a, b) => a + b, 0) / byPos[pos].length;
+      }
+    }
+
+    let oddsApiCallsMade = 0;
+    const logRows = [];
+    const skipped = [];
+    for (const g of games) {
+      try {
+        const [homeRowsRes, awayRowsRes, homeCtxRes, awayCtxRes] = await Promise.all([
+          supabaseFetch(`/nba_player_logs?team=eq.${g.homeTeam}&order=date.desc&limit=400&select=*`),
+          supabaseFetch(`/nba_player_logs?team=eq.${g.awayTeam}&order=date.desc&limit=400&select=*`),
+          supabaseFetch(`/schedule_context?league=eq.NBA&team=eq.${g.homeTeam}&date=eq.${dateIso}&select=*`),
+          supabaseFetch(`/schedule_context?league=eq.NBA&team=eq.${g.awayTeam}&date=eq.${dateIso}&select=*`),
+        ]);
+        const homeRows = await homeRowsRes.json();
+        const awayRows = await awayRowsRes.json();
+        const homeCtx = (await homeCtxRes.json())[0] || null;
+        const awayCtx = (await awayCtxRes.json())[0] || null;
+
+        let propsData = null;
+        try {
+          const eventsUrl = new URL(`${ODDS_BASE}/sports/basketball_nba/events`);
+          eventsUrl.searchParams.set("apiKey", ODDS_API_KEY);
+          const events = await getOddsJson(eventsUrl.toString());
+          oddsApiCallsMade++;
+          const match = events[0]; // best-effort; real wiring needs an ESPN<->Odds-API team-name map
+          if (match) {
+            const url = new URL(`${ODDS_BASE}/sports/basketball_nba/events/${match.id}/odds`);
+            url.searchParams.set("apiKey", ODDS_API_KEY);
+            url.searchParams.set("regions", "us");
+            url.searchParams.set("markets", "player_points,player_rebounds,player_assists");
+            url.searchParams.set("oddsFormat", "american");
+            url.searchParams.set("bookmakers", "draftkings");
+            propsData = await getOddsJson(url.toString());
+            oddsApiCallsMade++;
+          }
+        } catch (oddsErr) {
+          // No props posted yet for this game -- still log model-only rows below (dk fields
+          // stay null), since the projection itself is still useful to grade later.
+        }
+
+        const byPlayerMarket = new Map(); // "Player Name|points" -> { line, overPrice, underPrice }
+        const MARKET_TO_STAT = { player_points: "points", player_rebounds: "rebounds", player_assists: "assists" };
+        for (const book of propsData?.bookmakers || []) {
+          for (const mkt of book.markets || []) {
+            const statKey = MARKET_TO_STAT[mkt.key];
+            if (!statKey) continue;
+            for (const o of mkt.outcomes || []) {
+              const k = `${o.description}|${statKey}`;
+              const entry = byPlayerMarket.get(k) || { statKey, player: o.description, line: o.point };
+              if (o.name === "Over") entry.overPrice = o.price;
+              if (o.name === "Under") entry.underPrice = o.price;
+              byPlayerMarket.set(k, entry);
+            }
+          }
+        }
+
+        const teamRowsFor = (team) => (team === g.homeTeam ? homeRows : awayRows);
+        const oppRowsFor = (team) => (team === g.homeTeam ? awayRows : homeRows);
+        const ctxFor = (team) => (team === g.homeTeam ? homeCtx : awayCtx);
+
+        // If no DK props posted yet, still shadow-log every rotation player's season-weighted
+        // projection with null DK fields, so the backfill for the eventual grading pass isn't
+        // gated on DK posting lines first.
+        const allRows = [...homeRows, ...awayRows];
+        const playerIds = new Set(allRows.map((r) => r.player_id));
+        for (const playerId of playerIds) {
+          const playerRows = allRows.filter((r) => r.player_id === playerId).sort((a, b) => (a.date > b.date ? -1 : 1));
+          const first = playerRows[0];
+          if (!first || first.did_not_play) continue;
+          const team = first.team;
+          for (const statKey of STAT_KEYS) {
+            const entry = [...byPlayerMarket.values()].find((e) => e.statKey === statKey && e.player === first.player_name);
+            const projectionResult = projectPlayerStat({
+              statKey,
+              playerRowsMostRecentFirst: playerRows,
+              position: first.position,
+              opponentTeamRowsMostRecentFirst: oppRowsFor(team),
+              leagueAvgAtPosition: leagueAvgAtPosition[statKey]?.[first.position],
+              scheduleContextRow: ctxFor(team),
+            });
+            if (projectionResult.projection == null) continue;
+            logRows.push(
+              buildPropShadowRow({
+                date: dateIso, player: first.player_name, playerId, team, opponent: oppRowsFor(team)[0]?.team ?? null,
+                market: statKey, projectionResult,
+                dk: entry ? { line: entry.line, overPrice: entry.overPrice, underPrice: entry.underPrice } : {},
+              })
+            );
+          }
+        }
+      } catch (err) {
+        skipped.push({ game: `${g.awayTeam}@${g.homeTeam}`, reason: err.message });
+      }
+    }
+
+    if (logRows.length) {
+      await supabaseFetch(`/nba_prop_shadow_log?on_conflict=date,player_id,market`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(logRows),
+      });
+    }
+    res.json({ date: dateIso, gamesFound: games.length, rowsLogged: logRows.length, oddsApiCallsMade, skipped });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
