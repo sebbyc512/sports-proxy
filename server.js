@@ -13,6 +13,9 @@ import { buildScheduleContextForLeague } from "./jobs/schedule-context.js";
 import { trackNhlPlayerLogsForDate } from "./jobs/nhl-player-logs.js";
 import { runNflverseJob } from "./jobs/nflverse.js";
 import { pullClosingLinesForDate, pullClosingLinesForDateRange } from "./jobs/closing-lines.js";
+import { pullCbbdHistoricalLinesForSeason } from "./jobs/cbbd-historical-lines.js";
+import { pullCbbdTeamRatingsForSeason } from "./jobs/cbbd-team-ratings.js";
+import { pullCfbdGameLines } from "./jobs/cfbd-game-lines.js";
 import {
   buildNbaTeamGameTotals, nbaTeamOffDefRating, buildSidesTotalsProjection,
   teamMarginStdDev, buildCbbTeamGameMargins, combinedMatchupStdDev,
@@ -32,6 +35,10 @@ const PROXY_TOKEN_NEXT = process.env.PROXY_TOKEN_NEXT;
 const PROXY_TOKEN = PROXY_TOKEN_NEXT || process.env.PROXY_TOKEN;
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const API_FOOTBALL_KEY = process.env.API_FOOTBALL_KEY;
+// Added 2026-11-06+ for the CBBD/CFBD historical-lines + CBB-ratings jobs (isolated, see
+// jobs/cbbd-historical-lines.js / jobs/cbbd-team-ratings.js / jobs/cfbd-game-lines.js).
+// Same key authenticates both collegebasketballdata.com and collegefootballdata.com.
+const CFBD_API_KEY = process.env.CFBD_API_KEY;
 
 const ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports";
 const ODDS_BASE = "https://api.the-odds-api.com/v4";
@@ -61,6 +68,18 @@ app.use(express.json());
 
 async function getJson(url) {
   const res = await fetch(url, { headers: { "User-Agent": "sports-proxy/0.1" } });
+  if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
+  return res.json();
+}
+
+// Same as getJson, but for CollegeBasketballData/CollegeFootballData calls, which require
+// a Bearer token (unlike ESPN's unauthenticated endpoints) -- added 2026-11-06+ for
+// jobs/cbbd-historical-lines.js, jobs/cbbd-team-ratings.js, jobs/cfbd-game-lines.js.
+async function getCfbdJson(url) {
+  if (!CFBD_API_KEY) throw new Error("CFBD_API_KEY is not configured on the server.");
+  const res = await fetch(url, {
+    headers: { "User-Agent": "sports-proxy/0.1", Authorization: `Bearer ${CFBD_API_KEY}` },
+  });
   if (!res.ok) throw new Error(`${url} -> HTTP ${res.status}`);
   return res.json();
 }
@@ -4863,6 +4882,75 @@ app.get("/internal/jobs/nflverse", async (req, res) => {
         }
       },
     });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Multi-season CBB historical lines from CollegeBasketballData (2026-11-06+, Seb's request,
+// once CFBD_API_KEY was added on Render) -- backfills PAST seasons the free ESPN-pickcenter
+// closing-lines job above can't reach. Own table (cbbd_historical_lines, source:'cbbd'),
+// never merged with cbb_closing_lines. See jobs/cbbd-historical-lines.js for the "field
+// names are an assumption, not confirmed" caveat -- not wired into the backtest until a real
+// call confirms the response shape.
+app.get("/internal/jobs/cbbd-historical-lines", async (req, res) => {
+  try {
+    const season = req.query.season;
+    if (!season) return res.status(400).json({ error: "season is required, e.g. ?season=2025" });
+    const upsertRows = async (rows) => {
+      await supabaseFetch(`/cbbd_historical_lines?on_conflict=game_id`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(rows),
+      });
+    };
+    const result = await pullCbbdHistoricalLinesForSeason(season, { getJson: getCfbdJson, upsertRows });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// CBB adjusted efficiency/tempo ratings from CollegeBasketballData (2026-11-06+, Seb's
+// request). Own table (cbbd_team_ratings) -- deliberately NOT wired into
+// jobs/projection-engine-sides-totals.js yet; that model intentionally stays on the honest
+// points-average CBB fallback until this data is confirmed real. See
+// jobs/cbbd-team-ratings.js for the "field names are an assumption" caveat.
+app.get("/internal/jobs/cbbd-team-ratings", async (req, res) => {
+  try {
+    const season = req.query.season;
+    if (!season) return res.status(400).json({ error: "season is required, e.g. ?season=2025" });
+    const upsertRows = async (rows) => {
+      await supabaseFetch(`/cbbd_team_ratings?on_conflict=team,season`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(rows),
+      });
+    };
+    const result = await pullCbbdTeamRatingsForSeason(season, { getJson: getCfbdJson, upsertRows });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// CFB game-level betting lines from CollegeFootballData (2026-11-06+, Seb's explicit ask:
+// "plus CFB data, isolated in their own tables"). Data landing only -- no CFB projection
+// model, no wiring anywhere else. ?week is optional (omit for the whole season).
+app.get("/internal/jobs/cfbd-game-lines", async (req, res) => {
+  try {
+    const season = req.query.season;
+    if (!season) return res.status(400).json({ error: "season is required, e.g. ?season=2025" });
+    const week = req.query.week != null ? Number(req.query.week) : undefined;
+    const upsertRows = async (rows) => {
+      await supabaseFetch(`/cfbd_game_lines?on_conflict=game_id`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify(rows),
+      });
+    };
+    const result = await pullCfbdGameLines(season, week, { getJson: getCfbdJson, upsertRows });
     res.json(result);
   } catch (err) {
     res.status(502).json({ error: err.message });
