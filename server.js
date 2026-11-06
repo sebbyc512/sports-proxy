@@ -9,6 +9,7 @@ import { parseLeg } from "./grader.js";
 import { norm, teamMatches, findGame } from "./matcher.js";
 import { runTicketGate } from "./ticket-gate.js";
 import { trackNbaPlayerLogsForDate } from "./jobs/nba-player-logs.js";
+import { buildScheduleContextForLeague } from "./jobs/schedule-context.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4688,6 +4689,62 @@ app.get("/internal/jobs/nba-player-logs", async (req, res) => {
           method: "POST",
           headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
           body: JSON.stringify(rows.map((r) => ({ ...r, updated_at: new Date().toISOString() }))),
+        });
+      },
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Item 2 of the 2026-11-06 daily-data batch (Seb's request): rest & schedule context for
+// NBA/NHL/CBB -- days of rest, back-to-back, 3-in-4, road-trip length, travel miles (NBA/
+// NHL only -- see jobs/arenas.js) for every team playing today or tomorrow. Pure logic in
+// jobs/schedule-context.js (unit-tested there); this wires in the real ESPN calls and the
+// upsert into the "schedule_context" table. ?league=NBA|NHL|CBB required -- the cron fires
+// one call per league (sql/schedule-context-cron.sql) so a slow league never blocks another.
+function scheduleContextDatesToFetch(todayYmd) {
+  const toYmd = (d) => d.toISOString().slice(0, 10).replace(/-/g, "");
+  const today = new Date(`${todayYmd.slice(0, 4)}-${todayYmd.slice(4, 6)}-${todayYmd.slice(6, 8)}T00:00:00Z`);
+  const dates = [];
+  for (let offset = -10; offset <= 1; offset++) {
+    const d = new Date(today);
+    d.setUTCDate(d.getUTCDate() + offset);
+    dates.push(toYmd(d));
+  }
+  return dates;
+}
+
+app.get("/internal/jobs/schedule-context", async (req, res) => {
+  try {
+    const league = req.query.league;
+    if (!["NBA", "NHL", "CBB"].includes(league)) {
+      return res.status(400).json({ error: 'league must be one of "NBA", "NHL", "CBB"' });
+    }
+    const todayYmd = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const result = await buildScheduleContextForLeague(league, todayYmd, {
+      getJson,
+      datesToFetch: scheduleContextDatesToFetch,
+      upsertRows: async (rows) => {
+        await supabaseFetch(`/schedule_context?on_conflict=league,team,date`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(
+            rows.map((r) => ({
+              league: r.league,
+              team: r.team,
+              date: r.date,
+              opponent: r.opponent,
+              home_away: r.home_away,
+              days_of_rest: r.daysOfRest,
+              back_to_back: r.backToBack,
+              three_in_four: r.threeInFour,
+              road_trip_length: r.roadTripLength,
+              travel_miles: r.travelMiles,
+              updated_at: new Date().toISOString(),
+            }))
+          ),
         });
       },
     });
