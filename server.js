@@ -10,6 +10,7 @@ import { norm, teamMatches, findGame } from "./matcher.js";
 import { runTicketGate } from "./ticket-gate.js";
 import { trackNbaPlayerLogsForDate } from "./jobs/nba-player-logs.js";
 import { buildScheduleContextForLeague } from "./jobs/schedule-context.js";
+import { trackNhlPlayerLogsForDate } from "./jobs/nhl-player-logs.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4745,6 +4746,30 @@ app.get("/internal/jobs/schedule-context", async (req, res) => {
               updated_at: new Date().toISOString(),
             }))
           ),
+        });
+      },
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Item 3 of the 2026-11-06 daily-data batch (Seb's request): NHL skater game logs for
+// every final NHL game, upserted into nhl_player_logs. Pure logic in
+// jobs/nhl-player-logs.js (unit-tested there). No ?date -> defaults to "yesterday" (ET).
+app.get("/internal/jobs/nhl-player-logs", async (req, res) => {
+  try {
+    const date =
+      req.query.date ||
+      new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10).replace(/-/g, "");
+    const result = await trackNhlPlayerLogsForDate(date, {
+      getJson,
+      upsertRows: async (rows) => {
+        await supabaseFetch(`/nhl_player_logs?on_conflict=game_id,player_id`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(rows.map((r) => ({ ...r, updated_at: new Date().toISOString() }))),
         });
       },
     });
