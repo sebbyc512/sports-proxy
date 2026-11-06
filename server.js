@@ -8,6 +8,7 @@ import express from "express";
 import { parseLeg } from "./grader.js";
 import { norm, teamMatches, findGame } from "./matcher.js";
 import { runTicketGate } from "./ticket-gate.js";
+import { trackNbaPlayerLogsForDate } from "./jobs/nba-player-logs.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4665,6 +4666,32 @@ app.get("/internal/jobs/nba-blowout-tracker", async (req, res) => {
       gamesRecorded: results.reduce((s, r) => s + r.gamesRecorded, 0),
       results,
     });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Item 1 of the 2026-11-06 daily-data batch (Seb's request): per-player box-score logs for
+// every final NBA game, upserted into nba_player_logs. Pure extraction/aggregation lives
+// in jobs/nba-player-logs.js (unit-tested there); this wires in the real ESPN/Supabase
+// calls. No ?date -> defaults to "yesterday" (ET) -- pulled by both the nightly cron and
+// the 2 PM ET re-run (see sql/nba-player-logs-cron.sql); the upsert makes both idempotent.
+app.get("/internal/jobs/nba-player-logs", async (req, res) => {
+  try {
+    const date =
+      req.query.date ||
+      new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10).replace(/-/g, "");
+    const result = await trackNbaPlayerLogsForDate(date, {
+      getJson,
+      upsertRows: async (rows) => {
+        await supabaseFetch(`/nba_player_logs?on_conflict=game_id,player_id`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(rows.map((r) => ({ ...r, updated_at: new Date().toISOString() }))),
+        });
+      },
+    });
+    res.json(result);
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
