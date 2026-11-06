@@ -10,6 +10,7 @@ import { norm, teamMatches, findGame } from "./matcher.js";
 import { runTicketGate } from "./ticket-gate.js";
 import { trackNbaPlayerLogsForDate } from "./jobs/nba-player-logs.js";
 import { buildScheduleContextForLeague } from "./jobs/schedule-context.js";
+import { runMoneypuckJob } from "./jobs/moneypuck.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4745,6 +4746,41 @@ app.get("/internal/jobs/schedule-context", async (req, res) => {
               updated_at: new Date().toISOString(),
             }))
           ),
+        });
+      },
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Item 8 of the 2026-11-06 daily-data batch (Seb's explicit ask): MoneyPuck NHL data.
+// ONLY the four files listed on https://moneypuck.com/data.htm, one download per file per
+// night -- never scrape anything else on the site. Pure parsing/mapping lives in
+// jobs/moneypuck.js (unit-tested there, including an end-to-end smoke test against the
+// real files); this wires in the real fetch + upsert into the four nhl_moneypuck_* tables.
+const MONEYPUCK_TABLES = {
+  team: { table: "nhl_moneypuck_teams", conflict: "game_id,team" },
+  goalie: { table: "nhl_moneypuck_goalies", conflict: "game_id,player_id" },
+  skater: { table: "nhl_moneypuck_skaters", conflict: "game_id,player_id" },
+  shot: { table: "nhl_moneypuck_shots", conflict: "shot_id" },
+};
+
+app.get("/internal/jobs/nhl-moneypuck", async (req, res) => {
+  try {
+    const result = await runMoneypuckJob({
+      fetchBinary: async (url) => {
+        const r = await fetch(url, { headers: { "User-Agent": "sports-proxy/0.1" } });
+        if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
+        return Buffer.from(await r.arrayBuffer());
+      },
+      upsertRows: async (entityType, rows) => {
+        const { table, conflict } = MONEYPUCK_TABLES[entityType];
+        await supabaseFetch(`/${table}?on_conflict=${conflict}`, {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify(rows.map((r) => ({ ...r, updated_at: new Date().toISOString() }))),
         });
       },
     });
