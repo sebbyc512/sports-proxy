@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import {
   buildNbaTeamGameTotals,
   nbaTeamOffDefRating,
+  teamMarginStdDev,
+  buildCbbTeamGameMargins,
+  combinedMatchupStdDev,
   restAdjustmentPoints,
   projectGameMargin,
   homeWinProb,
@@ -51,6 +54,69 @@ test("projectGameMargin: evenly-matched teams at a neutral site project to a pic
   assert.ok(proj.projectedMargin > 0); // home court edge should favor the home team
   // home/away scores and the total are each rounded independently, so allow a 0.1 slack
   assert.ok(Math.abs(proj.projectedTotal - (proj.projectedHomeScore + proj.projectedAwayScore)) <= 0.1);
+});
+
+test("projectGameMargin: NBA paced branch uses pace-adjusted per-100 ratings, not raw points", () => {
+  // Same offRtg/defRtg for both teams but a much faster pace than the non-paced branch
+  // would ever see -- if pace is genuinely driving the score, the total should be well
+  // above a typical ~220 NBA total.
+  const proj = projectGameMargin({
+    homeOffDef: { offRtg: 115, defRtg: 110, pace: 105 },
+    awayOffDef: { offRtg: 112, defRtg: 108, pace: 105 },
+  });
+  assert.ok(proj.projectedTotal > 220);
+  assert.ok(proj.projectedMargin > 0); // home has the better net rating + home court
+});
+
+test("projectGameMargin: falls back to the points branch when pace is missing, even if offRtg/defRtg are present", () => {
+  const proj = projectGameMargin({
+    homeOffDef: { offRtg: 115, defRtg: 110 }, // no pace -> treated as points-branch inputs via the ?? fallback
+    awayOffDef: { avgPointsScored: 112, avgPointsAllowed: 108 },
+  });
+  assert.ok(proj.projectedMargin != null);
+  // Points branch treats offRtg/defRtg values as if they were raw points when pace is absent --
+  // home (115/110) vs away (112/108) should still favor home slightly plus home court.
+  assert.ok(proj.projectedMargin > 0);
+});
+
+test("teamMarginStdDev: needs at least 5 games, else returns null stdDev", () => {
+  const totals = [
+    { game_id: "1", team: "BOS", opponent: "LAL", date: "2026-11-01", points: 110 },
+    { game_id: "1", team: "LAL", opponent: "BOS", date: "2026-11-01", points: 100 },
+  ];
+  const r = teamMarginStdDev(totals, "BOS", 10);
+  assert.equal(r.stdDev, null);
+  assert.equal(r.gamesUsed, 1);
+});
+
+test("teamMarginStdDev: computes sample stdDev of a team's own scoring margin over recent games", () => {
+  const dates = ["2026-10-20", "2026-10-22", "2026-10-24", "2026-10-26", "2026-10-28"];
+  const margins = [10, -5, 20, 0, 15]; // BOS margin each game
+  const totals = [];
+  dates.forEach((date, i) => {
+    totals.push({ game_id: String(i), team: "BOS", opponent: "OPP", date, points: 110 + margins[i] });
+    totals.push({ game_id: String(i), team: "OPP", opponent: "BOS", date, points: 110 });
+  });
+  const r = teamMarginStdDev(totals, "BOS", 10);
+  assert.equal(r.gamesUsed, 5);
+  assert.ok(r.stdDev > 0);
+});
+
+test("buildCbbTeamGameMargins: splits each game log row into both teams' own margins", () => {
+  const rows = [{ date: "2026-11-01", home_team: "DUKE", away_team: "UNC", home_score: 80, away_score: 70 }];
+  const margins = buildCbbTeamGameMargins(rows);
+  assert.equal(margins.length, 2);
+  assert.equal(margins.find((m) => m.team === "DUKE").margin, 10);
+  assert.equal(margins.find((m) => m.team === "UNC").margin, -10);
+});
+
+test("combinedMatchupStdDev: falls back to the league constant when either side lacks enough games", () => {
+  assert.equal(combinedMatchupStdDev("NBA", { stdDev: null, gamesUsed: 2 }, { stdDev: 10, gamesUsed: 10 }), 12);
+});
+
+test("combinedMatchupStdDev: blends both teams' volatility and clamps to the sane band", () => {
+  const v = combinedMatchupStdDev("NBA", { stdDev: 20, gamesUsed: 10 }, { stdDev: 20, gamesUsed: 10 });
+  assert.ok(v <= 18 && v >= 8);
 });
 
 test("projectGameMargin: missing inputs return nulls instead of NaN", () => {

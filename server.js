@@ -13,9 +13,13 @@ import { buildScheduleContextForLeague } from "./jobs/schedule-context.js";
 import { trackNhlPlayerLogsForDate } from "./jobs/nhl-player-logs.js";
 import { runNflverseJob } from "./jobs/nflverse.js";
 import { pullClosingLinesForDate, pullClosingLinesForDateRange } from "./jobs/closing-lines.js";
-import { buildNbaTeamGameTotals, nbaTeamOffDefRating, buildSidesTotalsProjection } from "./jobs/projection-engine-sides-totals.js";
+import {
+  buildNbaTeamGameTotals, nbaTeamOffDefRating, buildSidesTotalsProjection,
+  teamMarginStdDev, buildCbbTeamGameMargins, combinedMatchupStdDev,
+} from "./jobs/projection-engine-sides-totals.js";
 import { joinProjectionsWithOutcomes, calibrationBuckets, simpleRoiIfAlwaysBetEdgeSide } from "./jobs/backtest-sides-totals.js";
 import { projectPlayerStat, buildPropShadowRow, STAT_KEYS } from "./jobs/projection-engine-props.js";
+import { matchOddsEvent } from "./jobs/team-aliases.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4886,7 +4890,13 @@ app.get("/internal/jobs/sides-totals-projection", async (req, res) => {
       const away = comp?.competitors?.find((c) => c.homeAway === "away");
       const home = comp?.competitors?.find((c) => c.homeAway === "home");
       if (away?.team?.abbreviation && home?.team?.abbreviation) {
-        games.push({ id: String(ev.id), homeTeam: home.team.abbreviation, awayTeam: away.team.abbreviation });
+        games.push({
+          id: String(ev.id),
+          homeTeam: home.team.abbreviation,
+          awayTeam: away.team.abbreviation,
+          homeDisplayName: home.team.displayName || home.team.name,
+          awayDisplayName: away.team.displayName || away.team.name,
+        });
       }
     }
 
@@ -4901,10 +4911,42 @@ app.get("/internal/jobs/sides-totals-projection", async (req, res) => {
           supabaseFetch(`/schedule_context?league=eq.${league}&team=eq.${g.homeTeam}&date=eq.${dateIso}&select=*`),
           supabaseFetch(`/schedule_context?league=eq.${league}&team=eq.${g.awayTeam}&date=eq.${dateIso}&select=*`),
         ]);
-        const homeOffDef = { avgPointsScored: homeDoc?.data?.ptsFor ?? null, avgPointsAllowed: homeDoc?.data?.ptsAgainst ?? null };
-        const awayOffDef = { avgPointsScored: awayDoc?.data?.ptsFor ?? null, avgPointsAllowed: awayDoc?.data?.ptsAgainst ?? null };
+        // NBA: use true pace-adjusted offRtg/defRtg/pace (refreshNbaTeams) when present;
+        // CBB has no possessions estimate (see jobs/projection-engine-sides-totals.js's
+        // header), so it stays on ptsFor/ptsAgainst -- same honest-approximation reasoning
+        // as before, just no longer silently applied to NBA too.
+        const homeOffDef =
+          league === "NBA" && homeDoc?.data?.offRtg != null && homeDoc?.data?.pace != null
+            ? { offRtg: homeDoc.data.offRtg, defRtg: homeDoc.data.defRtg, pace: homeDoc.data.pace }
+            : { avgPointsScored: homeDoc?.data?.ptsFor ?? null, avgPointsAllowed: homeDoc?.data?.ptsAgainst ?? null };
+        const awayOffDef =
+          league === "NBA" && awayDoc?.data?.offRtg != null && awayDoc?.data?.pace != null
+            ? { offRtg: awayDoc.data.offRtg, defRtg: awayDoc.data.defRtg, pace: awayDoc.data.pace }
+            : { avgPointsScored: awayDoc?.data?.ptsFor ?? null, avgPointsAllowed: awayDoc?.data?.ptsAgainst ?? null };
         const homeScheduleCtx = (await homeCtxRes.json())[0] || null;
         const awayScheduleCtx = (await awayCtxRes.json())[0] || null;
+
+        // Per-matchup variance: each team's own recent scoring-margin volatility, blended.
+        // Falls back to the league constant inside combinedMatchupStdDev when either side
+        // has too few games (see MIN_GAMES_FOR_VARIANCE).
+        let stdDevOverride = null;
+        try {
+          if (league === "NBA") {
+            const logsRes = await supabaseFetch(
+              `/nba_player_logs?team=in.(${g.homeTeam},${g.awayTeam})&order=date.desc&limit=600&select=game_id,team,opponent,home_away,date,points`
+            );
+            const totals = buildNbaTeamGameTotals(await logsRes.json());
+            stdDevOverride = combinedMatchupStdDev(league, teamMarginStdDev(totals, g.homeTeam), teamMarginStdDev(totals, g.awayTeam));
+          } else {
+            const logsRes = await supabaseFetch(
+              `/cbb_game_logs?or=(home_team.eq.${g.homeTeam},away_team.eq.${g.homeTeam},home_team.eq.${g.awayTeam},away_team.eq.${g.awayTeam})&order=date.desc&limit=400&select=date,home_team,away_team,home_score,away_score`
+            );
+            const margins = buildCbbTeamGameMargins(await logsRes.json());
+            stdDevOverride = combinedMatchupStdDev(league, teamMarginStdDev(margins, g.homeTeam), teamMarginStdDev(margins, g.awayTeam));
+          }
+        } catch (varErr) {
+          stdDevOverride = null; // falls back to the fixed league constant inside buildSidesTotalsProjection
+        }
 
         let dk = {};
         try {
@@ -4912,9 +4954,8 @@ app.get("/internal/jobs/sides-totals-projection", async (req, res) => {
           eventsUrl.searchParams.set("apiKey", ODDS_API_KEY);
           const events = await getOddsJson(eventsUrl.toString());
           oddsApiCallsMade++;
-          const match = events.find(
-            (e) => e.home_team?.includes(g.homeTeam) || e.away_team?.includes(g.awayTeam) || true
-          ) && events[0]; // best-effort match; a real wiring pass would map ESPN abbr -> Odds API team names
+          const { event: match, reason: noMatchReason } = matchOddsEvent(events, g.homeDisplayName, g.awayDisplayName, league);
+          if (!match && noMatchReason) skipped.push({ id: g.id, reason: noMatchReason, stage: "odds-match" });
           if (match) {
             const oddsUrl = new URL(`${ODDS_BASE}/sports/${ODDS_SPORT_KEY[league]}/events/${match.id}/odds`);
             oddsUrl.searchParams.set("apiKey", ODDS_API_KEY);
@@ -4947,7 +4988,7 @@ app.get("/internal/jobs/sides-totals-projection", async (req, res) => {
 
         const row = buildSidesTotalsProjection({
           league, homeTeam: g.homeTeam, awayTeam: g.awayTeam, date: dateIso,
-          homeOffDef, awayOffDef, homeScheduleCtx, awayScheduleCtx, dk,
+          homeOffDef, awayOffDef, homeScheduleCtx, awayScheduleCtx, dk, stdDevOverride,
         });
         row.game_id = g.id;
         rows.push(row);
@@ -5046,7 +5087,12 @@ app.get("/internal/jobs/nba-props-shadow", async (req, res) => {
       const away = comp?.competitors?.find((c) => c.homeAway === "away");
       const home = comp?.competitors?.find((c) => c.homeAway === "home");
       if (away?.team?.abbreviation && home?.team?.abbreviation) {
-        games.push({ homeTeam: nbaAbbr(home.team.abbreviation), awayTeam: nbaAbbr(away.team.abbreviation) });
+        games.push({
+          homeTeam: nbaAbbr(home.team.abbreviation),
+          awayTeam: nbaAbbr(away.team.abbreviation),
+          homeDisplayName: home.team.displayName || home.team.name,
+          awayDisplayName: away.team.displayName || away.team.name,
+        });
       }
     }
 
@@ -5090,7 +5136,8 @@ app.get("/internal/jobs/nba-props-shadow", async (req, res) => {
           eventsUrl.searchParams.set("apiKey", ODDS_API_KEY);
           const events = await getOddsJson(eventsUrl.toString());
           oddsApiCallsMade++;
-          const match = events[0]; // best-effort; real wiring needs an ESPN<->Odds-API team-name map
+          const { event: match, reason: noMatchReason } = matchOddsEvent(events, g.homeDisplayName, g.awayDisplayName, "NBA");
+          if (!match && noMatchReason) skipped.push({ homeTeam: g.homeTeam, awayTeam: g.awayTeam, reason: noMatchReason, stage: "odds-match" });
           if (match) {
             const url = new URL(`${ODDS_BASE}/sports/basketball_nba/events/${match.id}/odds`);
             url.searchParams.set("apiKey", ODDS_API_KEY);

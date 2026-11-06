@@ -1,26 +1,39 @@
-// NBA + CBB sides/totals projection engine, v1 (2026-11-06+, Seb's request -- phase 1 of
+// NBA + CBB sides/totals projection engine (2026-11-06+, Seb's request -- phase 1/1.1 of
 // the analytics-only engine). Pure logic; server.js's hook supplies the real
 // Supabase/ESPN-backed inputs (team ratings, schedule_context rows, DK lines).
 //
-// v1 approximations, flagged on purpose rather than hidden:
-//  - NBA team "offensive/defensive rating" here is just average points scored/allowed per
-//    game, NOT pace-adjusted efficiency (points per 100 possessions) -- nba_player_logs
-//    doesn't carry team-level FGA/TOV totals yet, only per-player box lines, so there's no
-//    possessions estimate to normalize by. CBB uses cbbTeams' existing marchProfile
-//    offRtg/defRtg, which IS pace-adjusted (and already labeled "approximate" there).
-//    Mixing a non-pace-adjusted NBA number with a pace-adjusted CBB number is fine since
-//    they're never compared to each other, only within their own league.
-//  - Margin/total -> win/cover/over probability assumes a normal distribution with a fixed
-//    league-typical standard deviation (NBA ~12 pts, CBB ~11 pts), not a per-matchup
-//    variance estimate. Good enough for a v1 edge signal, not a finished research model.
+// 2026-11-06 upgrade (phase 1.1) over the original v1:
+//  - NBA now uses TRUE pace-adjusted efficiency: nbaTeams' offRtg/defRtg (points per 100
+//    possessions, Dean-Oliver estimate from refreshNbaTeams()) blended with expected pace
+//    ((homePace+awayPace)/2), not raw points-per-game. This is the `paced` branch below.
+//  - CBB still has NO possessions estimate anywhere in this codebase -- refreshCbbTeams()
+//    tracks ptsFor/ptsAgainst/shooting splits/marchProfile but never persists FGA/OREB/TOV
+//    attempts needed for a Dean-Oliver-style possessions estimate. Inventing a league-wide
+//    assumed pace to fake a per-100 number would be LESS honest than what v1 already did,
+//    not more -- so CBB deliberately stays on the non-paced points-average branch below.
+//    ptsFor/ptsAgainst ARE each team's own realized scoring average this season, which
+//    already reflects their actual offense/defense quality; marchProfile's defense-allowed
+//    splits are highly correlated with ptsAgainst (same underlying games), so blending them
+//    in would mostly double-count rather than add real signal. Flagged here, not hidden.
+//  - Per-matchup variance: NBA and CBB both now derive a per-matchup stdDev from each
+//    team's own recent game-to-game scoring-margin volatility (via
+//    teamMarginStdDev/combinedMatchupStdDev below) instead of a single fixed league number.
+//    Falls back to the fixed league constant (NBA 12, CBB 11) when either team has fewer
+//    than MIN_GAMES_FOR_VARIANCE games of history -- a small sample's stdDev is noise, not
+//    signal.
 import { avgLastN } from "./util.js";
 import { probOverFromNormal, devigTwoWayFromAmerican } from "./probability.js";
 
 export const LEAGUE_MARGIN_STDDEV = { NBA: 12, CBB: 11 };
+const MIN_GAMES_FOR_VARIANCE = 5;
+// Per-matchup stdDev is clamped to a sane band around the league constant so a tiny,
+// noisy sample (5-9 games) can't blow the variance estimate out to something silly.
+const STDDEV_CLAMP = { NBA: [8, 18], CBB: [7, 16] };
 
 // Groups raw nba_player_logs rows (one row per player per game) into one row per
 // (game_id, team) with the team's total points for that game. Needed because
-// nba_player_logs has no team-level score column -- only per-player lines.
+// nba_player_logs has no team-level score column -- only per-player lines. Also used
+// (via the wiring layer) as the source for per-matchup variance -- see teamMarginStdDev.
 export function buildNbaTeamGameTotals(playerLogRows) {
   const byGameTeam = new Map();
   for (const r of playerLogRows) {
@@ -52,6 +65,63 @@ export function nbaTeamOffDefRating(teamGameTotals, team, n = 10) {
   };
 }
 
+// Sample stdDev of a team's own (points scored - points allowed) margin over its trailing
+// `n` games. Generic over both leagues: `teamGameTotals` is NBA's buildNbaTeamGameTotals
+// output ({ game_id, team, opponent, points }) OR CBB's buildCbbTeamGameMargins output
+// ({ game_id, team, opponent, margin }) -- whichever shape is passed, this only reads
+// `.margin` if present, else derives it from points via the opponent lookup (NBA shape).
+export function teamMarginStdDev(teamGameTotals, team, n = 10) {
+  const hasMarginField = teamGameTotals.some((g) => g.margin != null);
+  let margins;
+  if (hasMarginField) {
+    margins = teamGameTotals
+      .filter((g) => g.team === team)
+      .sort((a, b) => (a.date > b.date ? -1 : a.date < b.date ? 1 : 0))
+      .slice(0, n)
+      .map((g) => g.margin);
+  } else {
+    const pointsByGameTeam = new Map(teamGameTotals.map((g) => [`${g.game_id}|${g.team}`, g.points]));
+    margins = teamGameTotals
+      .filter((g) => g.team === team)
+      .sort((a, b) => (a.date > b.date ? -1 : a.date < b.date ? 1 : 0))
+      .slice(0, n)
+      .map((g) => {
+        const opp = pointsByGameTeam.get(`${g.game_id}|${g.opponent}`);
+        return opp != null ? g.points - opp : null;
+      });
+  }
+  margins = margins.filter((v) => v != null);
+  if (margins.length < MIN_GAMES_FOR_VARIANCE) return { stdDev: null, gamesUsed: margins.length };
+  const mean = margins.reduce((a, b) => a + b, 0) / margins.length;
+  const variance = margins.reduce((s, v) => s + (v - mean) ** 2, 0) / (margins.length - 1);
+  return { stdDev: Number(Math.sqrt(variance).toFixed(1)), gamesUsed: margins.length };
+}
+
+// Groups cbb_game_logs rows (one row per game, both teams' scores already on it) into one
+// row per (game_id, team) with that team's own scoring margin for the game -- the CBB
+// analog of buildNbaTeamGameTotals, used only for teamMarginStdDev (CBB has no per-player
+// logs to sum, so there's no separate "off/def rating" builder needed here).
+export function buildCbbTeamGameMargins(gameLogRows) {
+  const rows = [];
+  for (const g of gameLogRows) {
+    if (g.home_score == null || g.away_score == null) continue;
+    rows.push({ game_id: `${g.date}|${g.home_team}|${g.away_team}`, team: g.home_team, opponent: g.away_team, date: g.date, margin: g.home_score - g.away_score });
+    rows.push({ game_id: `${g.date}|${g.home_team}|${g.away_team}`, team: g.away_team, opponent: g.home_team, date: g.date, margin: g.away_score - g.home_score });
+  }
+  return rows;
+}
+
+// Blends both teams' own margin volatility into one per-matchup stdDev (variance of a
+// difference of two independent variables = sum of variances), clamped to a sane band and
+// falling back to the league constant when either side lacks enough games.
+export function combinedMatchupStdDev(league, homeStdDevInfo, awayStdDevInfo) {
+  const fallback = LEAGUE_MARGIN_STDDEV[league] ?? 12;
+  if (homeStdDevInfo?.stdDev == null || awayStdDevInfo?.stdDev == null) return fallback;
+  const combined = Math.sqrt(homeStdDevInfo.stdDev ** 2 + awayStdDevInfo.stdDev ** 2) / Math.SQRT2;
+  const [lo, hi] = STDDEV_CLAMP[league] ?? [8, 18];
+  return Number(Math.min(hi, Math.max(lo, combined)).toFixed(1));
+}
+
 // Point adjustment from a schedule_context row: back-to-back and a long road trip cost a
 // little, extra rest helps a little. Deliberately small, additive, and easy to retune once
 // the backtest has data -- not meant to be the last word on rest effects.
@@ -64,20 +134,41 @@ export function restAdjustmentPoints(scheduleContextRow) {
   return adj;
 }
 
-// Core margin/total projection. offDef inputs are { avgPointsScored, avgPointsAllowed }
-// (NBA) or { offRtg, defRtg } treated the same way for CBB (both are "points this team
-// produces/allows on an average night" on their own league's scale). `homeCourtEdge` is in
-// total points (split evenly between the two expected scores).
+// Core margin/total projection. Two input shapes for offDef, used for two genuinely
+// different models (see file header):
+//  - NBA (paced branch): { offRtg, defRtg, pace } -- true per-100-possession ratings blended
+//    with expected pace (average of both teams' own pace).
+//  - CBB / fallback (points branch): { avgPointsScored, avgPointsAllowed } -- raw per-game
+//    scoring averages, same as v1. Also used for NBA if pace/offRtg/defRtg aren't supplied
+//    (e.g. early season, team doc not yet refreshed).
+// `homeCourtEdge` is in total points (split evenly between the two expected scores).
 export function projectGameMargin({ homeOffDef, awayOffDef, homeCourtEdge = 2.5, restAdjHome = 0, restAdjAway = 0 }) {
-  const homeOff = homeOffDef.avgPointsScored ?? homeOffDef.offRtg;
-  const homeDef = homeOffDef.avgPointsAllowed ?? homeOffDef.defRtg;
-  const awayOff = awayOffDef.avgPointsScored ?? awayOffDef.offRtg;
-  const awayDef = awayOffDef.avgPointsAllowed ?? awayOffDef.defRtg;
-  if ([homeOff, homeDef, awayOff, awayDef].some((v) => v == null)) {
+  const paced =
+    homeOffDef.pace != null && awayOffDef.pace != null &&
+    homeOffDef.offRtg != null && homeOffDef.defRtg != null &&
+    awayOffDef.offRtg != null && awayOffDef.defRtg != null;
+
+  let projectedHomeScore, projectedAwayScore;
+  if (paced) {
+    const expectedPace = (homeOffDef.pace + awayOffDef.pace) / 2;
+    const homePer100 = (homeOffDef.offRtg + awayOffDef.defRtg) / 2;
+    const awayPer100 = (awayOffDef.offRtg + homeOffDef.defRtg) / 2;
+    projectedHomeScore = (homePer100 / 100) * expectedPace + homeCourtEdge / 2 + restAdjHome;
+    projectedAwayScore = (awayPer100 / 100) * expectedPace - homeCourtEdge / 2 + restAdjAway;
+  } else {
+    const homeOff = homeOffDef.avgPointsScored ?? homeOffDef.offRtg;
+    const homeDef = homeOffDef.avgPointsAllowed ?? homeOffDef.defRtg;
+    const awayOff = awayOffDef.avgPointsScored ?? awayOffDef.offRtg;
+    const awayDef = awayOffDef.avgPointsAllowed ?? awayOffDef.defRtg;
+    if ([homeOff, homeDef, awayOff, awayDef].some((v) => v == null)) {
+      return { projectedHomeScore: null, projectedAwayScore: null, projectedMargin: null, projectedTotal: null };
+    }
+    projectedHomeScore = (homeOff + awayDef) / 2 + homeCourtEdge / 2 + restAdjHome;
+    projectedAwayScore = (awayOff + homeDef) / 2 - homeCourtEdge / 2 + restAdjAway;
+  }
+  if (projectedHomeScore == null || projectedAwayScore == null || Number.isNaN(projectedHomeScore) || Number.isNaN(projectedAwayScore)) {
     return { projectedHomeScore: null, projectedAwayScore: null, projectedMargin: null, projectedTotal: null };
   }
-  const projectedHomeScore = (homeOff + awayDef) / 2 + homeCourtEdge / 2 + restAdjHome;
-  const projectedAwayScore = (awayOff + homeDef) / 2 - homeCourtEdge / 2 + restAdjAway;
   return {
     projectedHomeScore: Number(projectedHomeScore.toFixed(1)),
     projectedAwayScore: Number(projectedAwayScore.toFixed(1)),
@@ -106,8 +197,10 @@ export function totalOverProb(projectedTotal, dkTotalLine, stdDev) {
 // moneyline, spread, and total, in the shape the nba_projections/cbb_projections tables
 // expect. Any DK price omitted from `dk` simply leaves that market's edge fields null
 // instead of throwing -- a game with only a total posted still gets scored on the total.
-export function buildSidesTotalsProjection({ league, homeTeam, awayTeam, date, homeOffDef, awayOffDef, homeScheduleCtx, awayScheduleCtx, dk = {} }) {
-  const stdDev = LEAGUE_MARGIN_STDDEV[league] ?? 12;
+// `stdDevOverride`, when supplied by the wiring layer (see combinedMatchupStdDev), replaces
+// the fixed LEAGUE_MARGIN_STDDEV default with a per-matchup estimate.
+export function buildSidesTotalsProjection({ league, homeTeam, awayTeam, date, homeOffDef, awayOffDef, homeScheduleCtx, awayScheduleCtx, dk = {}, stdDevOverride = null }) {
+  const stdDev = stdDevOverride ?? LEAGUE_MARGIN_STDDEV[league] ?? 12;
   const restAdjHome = restAdjustmentPoints(homeScheduleCtx);
   const restAdjAway = restAdjustmentPoints(awayScheduleCtx);
   const proj = projectGameMargin({ homeOffDef, awayOffDef, restAdjHome, restAdjAway });
@@ -119,6 +212,7 @@ export function buildSidesTotalsProjection({ league, homeTeam, awayTeam, date, h
     date,
     projected_margin: proj.projectedMargin,
     projected_total: proj.projectedTotal,
+    margin_stddev_used: stdDev,
     dk_spread: dk.homeSpread ?? null,
     dk_total: dk.total ?? null,
     dk_ml_home: dk.mlHome ?? null,
