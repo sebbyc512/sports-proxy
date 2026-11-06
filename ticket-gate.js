@@ -14,7 +14,10 @@
 //   newsHazards     -- news-check (Out/Doubtful legs) + NFL backup-QB disclosure
 //   riskRange       -- three-unit-standard / one-unit-800 / bigger-min-500 / lotto-module
 //   hardExclusions  -- milan-exclusion, ncaab-ny-nj-exclusion/no-ny-nj-college
-//   sharedLegs      -- desk-priority's max-1-shared-leg-with-the-other-desk rule
+//   contradiction   -- no opposite side of the same game/market across desks (2026-11-06:
+//                       replaces desk-priority's shared-leg cap, now that Seb and Steve
+//                       are equal -- the only remaining cross-desk rule is "never take
+//                       literally opposing sides of the same game")
 
 export function parseAmericanOdds(raw) {
   if (raw == null) return null;
@@ -238,40 +241,78 @@ export function checkHardExclusions(ticket) {
   return { pass: true, detail: "no Milan or NY/NJ college legs" };
 }
 
-// --- Check 6: desk-priority (max 1 shared leg with the other desk's same-game ticket) --
-// Best-effort text comparison, scoped to the other desk's ticket(s) for the exact same
-// game/date (queried and passed in by the caller -- see server.js).
+// --- Check 6: cross-desk contradiction (replaces the retired desk-priority rule, 2026-11-06,
+// Seb's ask -- Seb and Steve are equal now, no more shared-leg cap. The only thing that
+// still matters is that the two desks never take LITERALLY OPPOSING sides of the exact
+// same game/market -- e.g. MAIN has Jaguars ML while Steve has Ravens ML, or MAIN has a
+// game total Over 44.5 while Steve has that same total Under. Same-subject-same-side
+// (including a plain leg overlap) is fine now; different subjects/markets are fine; only
+// a genuine contradiction fails.
 function normLegText(s) {
   return String(s || "").toLowerCase().replace(/\s*\*\(.*?\)\s*$/, "").trim();
 }
 
-export function checkSharedLegs(ticket, otherDeskTickets) {
+function gameTeams(gameStr) {
+  const parts = String(gameStr || "")
+    .split(/\s+@\s+|\s+vs\.?\s+|\s+v\.?\s+/i)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return parts.length === 2 ? parts : null;
+}
+
+const OVER_RE = /\bover\b|\bo\d/i;
+const UNDER_RE = /\bunder\b|\bu\d/i;
+
+// Classifies a leg as either a team-side pick (market "teamSide", subject = which of the
+// two game teams it backs) or an over/under pick (market "overUnder", subject = the leg
+// text with the over/under word+number stripped, e.g. the player/team+stat being lined).
+// Anything else (can't tell which team, or no over/under) returns null -- not classifiable,
+// so it can never be flagged as a contradiction (false negatives are the safe failure mode
+// here, not false positives).
+function classifyLeg(legText, teams) {
+  const text = String(legText || "").toLowerCase();
+  if (!text) return null;
+  if (OVER_RE.test(text) || UNDER_RE.test(text)) {
+    const side = OVER_RE.test(text) ? "over" : "under";
+    const subject = text.replace(OVER_RE, "").replace(UNDER_RE, "").replace(/[-+]?\d+(\.\d+)?/g, "").trim();
+    return { market: "overUnder", subject, side };
+  }
+  if (Array.isArray(teams) && teams.length === 2) {
+    const [a, b] = teams.map((t) => t.toLowerCase());
+    const hasA = a && text.includes(a.split(" ").pop());
+    const hasB = b && text.includes(b.split(" ").pop());
+    if (hasA && !hasB) return { market: "teamSide", subject: "game", side: "A" };
+    if (hasB && !hasA) return { market: "teamSide", subject: "game", side: "B" };
+  }
+  return null;
+}
+
+export function checkContradiction(ticket, otherDeskTickets) {
   if (!Array.isArray(otherDeskTickets) || otherDeskTickets.length === 0) {
     return { pass: true, detail: "no other-desk ticket for this game/date to compare against" };
   }
-  const myLegs = new Set((ticket.legs || []).map((l) => normLegText(l.text)));
-  let maxShared = 0;
-  let sharedWith = null;
+  const teams = gameTeams(ticket.game);
+  const myLegs = (ticket.legs || []).map((l) => classifyLeg(l.text, teams)).filter(Boolean);
+  const contradictions = [];
   for (const other of otherDeskTickets) {
-    const otherLegs = (other.legs || []).map((l) => normLegText(l.text));
-    const shared = otherLegs.filter((t) => myLegs.has(t));
-    if (shared.length > maxShared) {
-      maxShared = shared.length;
-      sharedWith = { ticketId: other.id || other.ticketId || null, shared };
+    const otherTeams = gameTeams(other.game) || teams;
+    for (const otherLeg of other.legs || []) {
+      const otherClassified = classifyLeg(otherLeg.text, otherTeams);
+      if (!otherClassified) continue;
+      for (const mine of myLegs) {
+        if (mine.market !== otherClassified.market) continue;
+        if (mine.market === "teamSide" && mine.side !== otherClassified.side) {
+          contradictions.push({ mine: null, other: otherLeg.text, ticketId: other.id || other.ticketId || null, reason: "opposite team side on the same game" });
+        } else if (mine.market === "overUnder" && mine.subject === otherClassified.subject && mine.side !== otherClassified.side) {
+          contradictions.push({ mine: null, other: otherLeg.text, ticketId: other.id || other.ticketId || null, reason: "opposite over/under on the same line" });
+        }
+      }
     }
   }
-  if (maxShared > 1) {
-    return {
-      pass: false,
-      detail: `shares ${maxShared} legs with the other desk's ticket on the same game (max 1 allowed per desk-priority)`,
-      sharedWith,
-    };
+  if (contradictions.length > 0) {
+    return { pass: false, detail: `${contradictions.length} leg(s) contradict the other desk's ticket on the same game/market`, contradictions };
   }
-  return {
-    pass: true,
-    detail: maxShared === 1 ? "shares exactly 1 leg with the other desk (allowed)" : "no shared legs with the other desk",
-    sharedWith,
-  };
+  return { pass: true, detail: "no opposite-side contradiction with the other desk's ticket" };
 }
 
 // --- Aggregate -----------------------------------------------------------------------
@@ -283,7 +324,7 @@ export function runTicketGate(ticket, deps = {}) {
     newsHazards: checkNewsHazards(ticket, newsByLeague, matchLegToInjury),
     riskRange: checkRiskRange(ticket),
     hardExclusions: checkHardExclusions(ticket),
-    sharedLegs: checkSharedLegs(ticket, otherDeskTickets),
+    contradiction: checkContradiction(ticket, otherDeskTickets),
   };
   const failures = Object.entries(checks)
     .filter(([, v]) => !v.pass)

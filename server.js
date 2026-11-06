@@ -6794,7 +6794,7 @@ app.get("/internal/jobs/ticket-gate", async (req, res) => {
 
     const newsByLeague = await fetchTicketGateNews([ticket.league]);
 
-    // desk-priority check: the OTHER desk's ticket(s) for the same game + date, if any.
+    // Cross-desk contradiction check: the OTHER desk's ticket(s) for the same game + date, if any.
     const otherDesk = desk === "main" ? "steve" : desk === "steve" ? "main" : null;
     let otherDeskTickets = [];
     if (otherDesk && ticket.game && ticket.date) {

@@ -6,6 +6,7 @@ import {
   checkPriceFreshness,
   checkNewsHazards,
   checkHardExclusions,
+  checkContradiction,
 } from "./ticket-gate.js";
 
 let pass = 0;
@@ -151,6 +152,35 @@ const nflNewsQbOut = {
   };
   const r = checkHardExclusions(cleanTicket);
   assert(r.pass === true, "a non-excluded soccer game must pass hardExclusions");
+}
+
+// --- Test case: cross-desk contradiction (replaces the retired desk-priority check) ----
+{
+  const mine = { game: "Jaguars @ Ravens", legs: [{ text: "Jacksonville Jaguars ML", type: "ml" }] };
+  const other = [{ game: "Jaguars @ Ravens", legs: [{ text: "Baltimore Ravens ML", type: "ml" }] }];
+  const r = checkContradiction(mine, other);
+  assert(r.pass === false, "opposite-team ML on the same game must fail contradiction");
+}
+{
+  const mine = { game: "Jaguars @ Ravens", legs: [{ text: "Game total Over 44.5", type: "total" }] };
+  const other = [{ game: "Jaguars @ Ravens", legs: [{ text: "Game total Under 44.5", type: "total" }] }];
+  const r = checkContradiction(mine, other);
+  assert(r.pass === false, "opposite over/under on the same line must fail contradiction");
+}
+{
+  // Same side (or just a plain shared leg) is now ALLOWED -- desk-priority's shared-leg
+  // cap is retired now that Seb and Steve are equal.
+  const mine = { game: "Jaguars @ Ravens", legs: [{ text: "Jacksonville Jaguars ML", type: "ml" }] };
+  const other = [{ game: "Jaguars @ Ravens", legs: [{ text: "Jacksonville Jaguars ML", type: "ml" }] }];
+  const r = checkContradiction(mine, other);
+  assert(r.pass === true, "same side on both desks must pass contradiction (shared-leg cap is retired)");
+}
+{
+  // Different market/subject (a player prop vs a team ML) is not a contradiction either.
+  const mine = { game: "Jaguars @ Ravens", legs: [{ text: "Trevor Lawrence 170+ passing yards", type: "stat" }] };
+  const other = [{ game: "Jaguars @ Ravens", legs: [{ text: "Baltimore Ravens ML", type: "ml" }] }];
+  const r = checkContradiction(mine, other);
+  assert(r.pass === true, "an unrelated market/subject on the other desk must not be flagged as a contradiction");
 }
 
 // --- Test case 5: a passing ticket (the real, corrected JAX@BAL "safer" ticket) ---------
