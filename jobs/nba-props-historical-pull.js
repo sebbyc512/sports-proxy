@@ -91,7 +91,12 @@ export async function pullHistoricalPropsForDate(yyyymmdd, deps) {
     }
     // Snapshot close to tip-off -- The Odds API's historical endpoint returns the odds AS OF
     // this timestamp, which is what "closing line" means here (last price before the game).
-    const snapshotAt = g.tipoff || event.commence_time;
+    // ESPN's own `comp.date` sometimes omits seconds (e.g. "2026-10-21T23:00Z"), which The
+    // Odds API's historical endpoint rejects outright (422 INVALID_HISTORICAL_TIMESTAMP) --
+    // round-tripping through Date gives a full timestamp, but the API rejects milliseconds
+    // too (still 422s) -- it wants exactly YYYY-MM-DDTHH:MM:SSZ, so strip the ".sss" part.
+    const rawSnapshot = g.tipoff || event.commence_time;
+    const snapshotAt = new Date(rawSnapshot).toISOString().replace(/\.\d{3}Z$/, "Z");
     let call;
     try {
       call = await deps.getHistoricalOdds(event.id, snapshotAt);

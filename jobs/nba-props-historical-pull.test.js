@@ -63,6 +63,20 @@ test("pullHistoricalPropsForDate: only processes final games, matches via team-a
   assert.ok(captured.some((r) => r.market === "rebounds" && r.dk_line === 7.5));
 });
 
+test("pullHistoricalPropsForDate: snapshot timestamp sent to getHistoricalOdds is always full HH:MM:SSZ, no bare-minute or millisecond ESPN timestamps", async () => {
+  let seenSnapshot = null;
+  const deps = baseDeps({
+    getHistoricalOdds: async (eventId, snapshotIso) => {
+      seenSnapshot = snapshotIso;
+      return { data: historicalOddsResponse, creditsUsedThisCall: 50, requestsRemaining: 15000 };
+    },
+  });
+  await pullHistoricalPropsForDate("20261022", deps);
+  // ESPN's own comp.date in the fixture is "2026-10-22T23:00Z" (no seconds) -- the real API
+  // 422s on that AND on a full millisecond timestamp; only exact YYYY-MM-DDTHH:MM:SSZ works.
+  assert.match(seenSnapshot, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+});
+
 test("pullHistoricalPropsForDate: no matching Odds API event is skipped with a reason, never guessed", async () => {
   const deps = baseDeps({ getOddsEvents: async () => [] });
   const result = await pullHistoricalPropsForDate("20261022", deps);
