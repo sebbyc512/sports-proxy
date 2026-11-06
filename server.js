@@ -1632,7 +1632,21 @@ function ledgerLooksLikeOtherDesk(desk, docId) {
   return otherDeskPrefix.test(String(docId));
 }
 
-function ledgerClassifyChange(desk, docId, beforeData, afterData, appEditIds) {
+// A new balance anchor is NORMAL only if it's actually linked to a real "balanceUpdate"
+// appEdit on this SAME desk -- i.e. the app's own DK-match box (Seb on main, Steve on
+// steve) -- never from matching the anchor's own desc text alone (2026-11-06, Seb's
+// correction: description text is trivially fakeable; the appEdit link is not). Checks
+// both an explicit appEditId field on the anchor doc (if ever added) and the real
+// production doc-id convention actually observed (syncNeededBackfillAppEditMirror):
+// appEdits doc "ed-<X>" produces pnlEntries mirror doc "adj-<X>".
+function ledgerAnchorLinkedAppEdit(docId, d, appEdits) {
+  const directId = d.appEditId ? String(d.appEditId) : null;
+  if (directId && appEdits.get(directId) === "balanceUpdate") return true;
+  const conventionId = `ed-${String(docId).replace(/^adj-/i, "")}`;
+  return appEdits.get(conventionId) === "balanceUpdate";
+}
+
+function ledgerClassifyChange(desk, docId, beforeData, afterData, appEdits) {
   if (beforeData && !afterData) return { label: "SUSPICIOUS", why: "doc deleted since the last good snapshot" };
   if (ledgerLooksLikeOtherDesk(desk, docId)) {
     return { label: "SUSPICIOUS", why: `doc id looks like it belongs to the other desk ("${docId}")` };
@@ -1645,17 +1659,16 @@ function ledgerClassifyChange(desk, docId, beforeData, afterData, appEditIds) {
   if (!beforeData) {
     // Added since the last good snapshot.
     if (isAdj) {
-      const desc = String(d.desc || d.note || "");
-      const looksLikeRealDkMatch = /set to \$?[\d,.]+ to match draftkings/i.test(desc);
-      return looksLikeRealDkMatch
-        ? { label: "NORMAL", why: "new DK-match balance anchor" }
+      const linked = ledgerAnchorLinkedAppEdit(docId, d, appEdits);
+      return linked
+        ? { label: "NORMAL", why: "new DK-match anchor linked to a balanceUpdate appEdit on this desk" }
         : {
             label: "SUSPICIOUS",
-            why: "new balance anchor with no 'set to $X to match DraftKings' description -- looks like a computed anchor, not a real DK reading",
+            why: "new balance anchor with no linked balanceUpdate appEdit on this desk -- matching 'set to $X to match DraftKings' description text alone is not enough",
           };
     }
     if (isCash) {
-      const linked = d.appEditId && appEditIds.has(String(d.appEditId));
+      const linked = d.appEditId && appEdits.has(String(d.appEditId));
       return linked
         ? { label: "NORMAL", why: `${d.type} tied to appEdit ${d.appEditId} on this desk` }
         : { label: "SUSPICIOUS", why: `new ${d.type || "cash"} entry with no matching appEdit on this desk` };
@@ -1666,7 +1679,7 @@ function ledgerClassifyChange(desk, docId, beforeData, afterData, appEditIds) {
   // Changed since the last good snapshot.
   if (isAdj) return { label: "SUSPICIOUS", why: "an existing balance anchor row was changed" };
   if (isCash) {
-    const linked = d.appEditId && appEditIds.has(String(d.appEditId));
+    const linked = d.appEditId && appEdits.has(String(d.appEditId));
     return linked
       ? { label: "NORMAL", why: "cash entry edited, still tied to an appEdit on this desk" }
       : { label: "SUSPICIOUS", why: "cash entry changed with no matching appEdit on this desk" };
@@ -1767,10 +1780,13 @@ async function ledgerDiffDesk(desk, { repair } = {}) {
     ledgerSnapshotDocsMap(snap.label, desk, "pnl"),
     supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.pnlEntries&select=doc_id,data,version`),
     getDoc(desk, "pnl", "settings"),
-    supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.appEdits&select=doc_id`),
+    supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.appEdits&select=doc_id,data`),
   ]);
   const liveEntries = await liveEntriesRes.json();
-  const appEditIds = new Set((await appEditsRes.json()).map((r) => r.doc_id));
+  // Map of appEdit doc_id -> its action (e.g. "balanceUpdate", "withdrawal", "deposit"),
+  // not just existence -- ledgerAnchorLinkedAppEdit needs the action to confirm an anchor
+  // is really tied to a balanceUpdate edit, not just any appEdit sharing an id.
+  const appEdits = new Map((await appEditsRes.json()).map((r) => [r.doc_id, r.data?.action]));
   const liveMap = new Map(liveEntries.map((r) => [r.doc_id, r]));
   const allIds = new Set([...snapEntries.keys(), ...liveMap.keys()]);
 
@@ -1783,7 +1799,7 @@ async function ledgerDiffDesk(desk, { repair } = {}) {
     if (JSON.stringify(beforeData) === JSON.stringify(afterData)) continue;
 
     const op = !before ? "added" : !live ? "deleted" : "changed";
-    const cls = ledgerClassifyChange(desk, docId, beforeData, afterData, appEditIds);
+    const cls = ledgerClassifyChange(desk, docId, beforeData, afterData, appEdits);
     changes.push({ docId, op, label: cls.label, why: cls.why, before: beforeData, after: afterData });
   }
 
