@@ -2222,10 +2222,25 @@ async function syncNeededBackfillAppEditMirror(desk, docId, d) {
     await upsertDoc(desk, "pnlEntries", targetId, { ...cd, status: action, ret, settledAt: cd.settledAt || new Date().toISOString() });
     return { ok: true, mirrorId: targetId };
   }
+  // Cashout -- same shape as PCS's own prompt (0b): the dollar figure is always a real,
+  // manually-entered amount (data.value on the appEdit), never recomputed/guessed.
+  if (action === "cashout") {
+    const amount = bgN(d.value);
+    if (!amount) return { ok: false, reason: "cashout needs a dollar amount" };
+    await upsertDoc(desk, "pnlEntries", targetId, {
+      ...cd,
+      status: "cashout",
+      ret: amount,
+      settledAt: cd.settledAt || new Date().toISOString(),
+      autoSettled: false,
+      needsCashAmount: false,
+    });
+    return { ok: true, mirrorId: targetId };
+  }
   // Simple field-set edits -- the app's own field names match these action names exactly
   // (confirmed against data.js's pick(x,'bonus','bonusBet',...) / pick(x,'matt','isMatt')
   // style field normalization), so the edit's `value` IS the new field value.
-  if (["stake", "bonus", "private", "live", "keepOut"].includes(action)) {
+  if (["stake", "bonus", "private", "live", "keepOut", "matt"].includes(action)) {
     if (d.value === undefined) return { ok: false, reason: `edit has no value to apply for action "${action}"` };
     await upsertDoc(desk, "pnlEntries", targetId, { ...cd, [action]: d.value });
     return { ok: true, mirrorId: targetId };
@@ -2272,6 +2287,179 @@ async function syncNeededBackfillIncompleteAppEdit(desk, docId, dryRun) {
   return { desk, docId, action: "backfill-failed-dmed", reason: result.reason };
 }
 
+// --- Retire-the-sync, Phase 1-2 (2026-11-06, Seb's request) --------------------------
+// Post-Cutover Sync (a Claude routine) stays ON as the backup/safety net -- nothing here
+// pauses or edits it. These two phases are an ADDITIVE fast path that tries to beat PCS to
+// the same work, purely in code, with zero Claude usage and sub-10-minute latency instead
+// of PCS's own cadence. Both are gated by ONE flag, checked live (no redeploy) every tick:
+//   desk "main", collection "systemFlags", doc_id "retireSync", {enabled: true|false}
+// Missing doc or enabled !== true => OFF => both phases no-op entirely and PCS does
+// everything exactly as before. Flip it with (the engine's existing generic doc-write
+// route, same PROXY_TOKEN auth as every other call):
+//   curl -X POST "https://sports-proxy-nv9n.onrender.com/api/main/docs/systemFlags/retireSync?token=<PROXY_TOKEN>" \
+//     -H "Content-Type: application/json" -d "{\"enabled\": false}"
+// (swap false->true to turn it back on). Takes effect on the very next sync-needed tick
+// (every 10 minutes), nothing to redeploy, nothing to restart.
+async function retireSyncEnabled() {
+  const doc = await getDoc("main", "systemFlags", "retireSync").catch(() => null);
+  return doc?.data?.enabled === true;
+}
+
+// PHASE 1 -- appEdits applied directly to the Supabase mirror, bypassing PCS's own Phase 0b
+// entirely for this fixed, judgment-free action set (ported straight from PCS's own prompt,
+// same field-level formulas -- see syncNeededBackfillAppEditMirror above, which this reuses
+// unchanged). Any appEdit whose action is OUTSIDE this set (e.g. "delete", "wonProtected",
+// reopening to "pending") is left completely untouched -- never claimed, never looked at --
+// so PCS remains the only writer for anything this fast path doesn't explicitly know.
+const PHASE1_APPEDIT_ACTIONS = new Set([
+  "withdrawal", "deposit", "balanceUpdate", "won", "lost", "push",
+  "stake", "cashout", "keepOut", "private", "live", "bonus", "matt",
+]);
+
+// One desk's pass. dryRun never claims anything (claiming itself mutates state) -- it just
+// reports what WOULD be claimed and applied, same convention as every other dryRun path in
+// this file.
+async function applyAppEditsDirectly(desk, dryRun) {
+  const res = await supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.appEdits&select=doc_id,data`);
+  const rows = await res.json();
+  const out = [];
+
+  for (const row of rows) {
+    const d = row.data || {};
+    if (d.status !== "pending") continue;
+    if (!PHASE1_APPEDIT_ACTIONS.has(d.action)) continue;
+
+    if (dryRun) {
+      out.push({ desk, docId: row.doc_id, action: "would-apply", editAction: d.action });
+      continue;
+    }
+
+    // Atomic claim -- the EXACT same claim_doc_status RPC PCS's own Phase 0b uses, so this
+    // and a PCS run can never both apply the same appEdit: whichever claims "pending" ->
+    // "processing" first wins, the other sees claimed:false and skips the row entirely.
+    const claimRes = await supabaseFetch(`/rpc/claim_doc_status`, {
+      method: "POST",
+      body: JSON.stringify({ p_desk_id: desk, p_collection: "appEdits", p_doc_id: row.doc_id, p_expected: "pending", p_next: "processing" }),
+    });
+    if ((await claimRes.json()) !== true) {
+      out.push({ desk, docId: row.doc_id, action: "skip-already-claimed" });
+      continue;
+    }
+
+    try {
+      const fresh = await getDoc(desk, "appEdits", row.doc_id);
+      const fd = fresh?.data || {};
+
+      // Idempotency guard (Seb's explicit ask): if the deterministic mirror doc this action
+      // would CREATE already exists -- PCS beat us to it on a prior tick, or an earlier
+      // Phase 1 attempt got this far before a crash -- never re-apply, just confirm and mark
+      // applied. Actions that PATCH an existing doc (won/lost/push/stake/cashout/etc.) are
+      // naturally idempotent re-applies of the same deterministic write, so no separate
+      // check is needed there.
+      let result;
+      const alreadyExpectedId = String(fd.target || "") === "pnlEntries/new" ? syncNeededExpectedMirrorDocId(fd.action, row.doc_id) : null;
+      if (alreadyExpectedId && (await getDoc(desk, "pnlEntries", alreadyExpectedId))) {
+        result = { ok: true, mirrorId: alreadyExpectedId, alreadyExisted: true };
+      } else {
+        result = await syncNeededBackfillAppEditMirror(desk, row.doc_id, fd);
+      }
+
+      if (!result.ok) {
+        // Shouldn't happen for anything in PHASE1_APPEDIT_ACTIONS -- revert the claim so PCS
+        // (which handles a far wider action set with real judgment) can still pick this row
+        // up, instead of leaving it stuck at "processing" for 20 minutes.
+        await upsertDoc(desk, "appEdits", row.doc_id, { ...fd, status: "pending" });
+        out.push({ desk, docId: row.doc_id, action: "reverted-to-pcs", reason: result.reason });
+        continue;
+      }
+
+      // Mark applied only after read-back confirms the mirror write actually landed.
+      const confirmed = await getDoc(desk, "pnlEntries", result.mirrorId);
+      if (!confirmed) {
+        await upsertDoc(desk, "appEdits", row.doc_id, { ...fd, status: "pending" });
+        out.push({ desk, docId: row.doc_id, action: "reverted-readback-failed", mirrorId: result.mirrorId });
+        continue;
+      }
+
+      await upsertDoc(desk, "appEdits", row.doc_id, {
+        ...fd,
+        status: "applied",
+        appliedBy: "engine-phase1",
+        appliedAt: new Date().toISOString(),
+      });
+      out.push({ desk, docId: row.doc_id, action: result.alreadyExisted ? "already-applied" : "applied", mirrorId: result.mirrorId });
+    } catch (err) {
+      await mergeUpsertDoc(desk, "appEdits", row.doc_id, { status: "pending" }).catch(() => {});
+      out.push({ desk, docId: row.doc_id, action: "error", error: err.message });
+    }
+  }
+  return out;
+}
+
+// PHASE 2 -- appUploads: wake a dedicated Sonnet "Slip Reader v2" routine the moment either
+// desk has a pending upload, instead of waiting for PCS's own inline Phase 0c. Same Fire-URL
+// + cooldown + trailing-fire shape as triggerSyncWake/triggerBuilderFire above -- the routine
+// itself claims each appUpload via the SAME /claim endpoint PCS already uses, so the two can
+// never double-process the same upload no matter which one wakes first.
+const SLIP_READER_V2_FIRE_URL = process.env.SLIP_READER_V2_FIRE_URL;
+const SLIP_READER_V2_FIRE_TOKEN = process.env.SLIP_READER_V2_FIRE_TOKEN;
+const SLIP_READER_V2_COOLDOWN_MS = 90_000;
+let lastSlipReaderV2FireAt = 0;
+let trailingSlipReaderV2Timer = null;
+
+async function sendSlipReaderV2Fire() {
+  lastSlipReaderV2FireAt = Date.now();
+  const fireRes = await fetch(SLIP_READER_V2_FIRE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${SLIP_READER_V2_FIRE_TOKEN}`,
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "experimental-cc-routine-2026-04-01",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+  if (!fireRes.ok) {
+    const body = await fireRes.text();
+    throw new Error(`Slip reader v2 fire -> HTTP ${fireRes.status}: ${body}`);
+  }
+}
+
+async function triggerSlipReaderV2Fire() {
+  if (!SLIP_READER_V2_FIRE_URL || !SLIP_READER_V2_FIRE_TOKEN) {
+    return { ok: false, reason: "SLIP_READER_V2_FIRE_URL/SLIP_READER_V2_FIRE_TOKEN not configured" };
+  }
+  const sinceLast = Date.now() - lastSlipReaderV2FireAt;
+  if (sinceLast >= SLIP_READER_V2_COOLDOWN_MS) {
+    await sendSlipReaderV2Fire();
+    return { ok: true, fired: true };
+  }
+  if (trailingSlipReaderV2Timer) {
+    return { ok: true, fired: false, reason: "cooldown", trailingAlreadyScheduled: true };
+  }
+  const delay = SLIP_READER_V2_COOLDOWN_MS - sinceLast;
+  trailingSlipReaderV2Timer = setTimeout(async () => {
+    trailingSlipReaderV2Timer = null;
+    try {
+      await sendSlipReaderV2Fire();
+    } catch (err) {
+      console.error("Trailing slip reader v2 fire failed:", err.message);
+    }
+  }, delay);
+  return { ok: true, fired: false, reason: "cooldown", trailingScheduledInMs: delay };
+}
+
+async function wakeSlipReaderV2IfPending(desks, dryRun) {
+  for (const desk of desks) {
+    const res = await supabaseFetch(`/docs?desk_id=eq.${encodeURIComponent(desk)}&collection=eq.appUploads&select=doc_id,data`);
+    const rows = await res.json();
+    if (rows.some((r) => r.data?.status === "pending")) {
+      return dryRun ? { ok: true, wouldFire: true } : await triggerSlipReaderV2Fire().catch((err) => ({ ok: false, error: err.message }));
+    }
+  }
+  return { ok: true, fired: false, reason: "nothing-pending" };
+}
+
 async function syncNeededCheckDesk(desk) {
   const now = Date.now();
   const backlog = [];
@@ -2312,12 +2500,28 @@ async function syncNeededCheckDesk(desk) {
 app.get("/internal/jobs/sync-needed", async (req, res) => {
   const dryRun = req.query.dryRun === "true";
   try {
+    // Retire-the-sync Phase 1-2 -- OFF unless the "retireSync" flag doc says enabled:true
+    // (see that function's own comment for exactly how to flip it). Runs BEFORE the
+    // staleness-based backlog check below, against EVERY pending row, not just stale
+    // ones -- that's the whole point: beat PCS to it on this same 10-minute tick instead
+    // of waiting for a row to go stale first.
+    let phase1 = null;
+    const phase1On = await retireSyncEnabled().catch(() => false);
+    if (phase1On) {
+      const [mainEdits, steveEdits, uploadWake] = await Promise.all([
+        applyAppEditsDirectly("main", dryRun),
+        applyAppEditsDirectly("steve", dryRun),
+        wakeSlipReaderV2IfPending(["main", "steve"], dryRun),
+      ]);
+      phase1 = { appEdits: { main: mainEdits, steve: steveEdits }, slipReaderV2Wake: uploadWake };
+    }
+
     const results = await Promise.all(["main", "steve"].map(syncNeededCheckDesk));
     const allBacklog = results.flatMap((r) => r.backlog);
     const allStuck = results.flatMap((r) => r.stuck);
 
     if (allBacklog.length === 0 && allStuck.length === 0) {
-      return res.json({ ok: true, action: "none", dryRun });
+      return res.json({ ok: true, action: "none", dryRun, phase1 });
     }
 
     const actions = {};
@@ -2412,18 +2616,34 @@ app.get("/internal/jobs/sync-needed", async (req, res) => {
     }
 
     if (dryRun) {
-      return res.json({ ok: true, action: "would-handle", dryRun, backlog: allBacklog, stuck: allStuck, actions });
+      return res.json({ ok: true, action: "would-handle", dryRun, phase1, backlog: allBacklog, stuck: allStuck, actions });
     }
 
     await upsertDoc("main", "selfHealLog", `sn-${Date.now()}`, {
       source: "sync-needed",
       foundAt: new Date().toISOString(),
+      phase1,
       backlog: allBacklog,
       stuck: allStuck,
       actions,
     });
 
-    res.json({ ok: true, action: "handled", backlog: allBacklog, stuck: allStuck, actions });
+    res.json({ ok: true, action: "handled", phase1, backlog: allBacklog, stuck: allStuck, actions });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+// Diagnostic for the retire-the-sync Phase 1-2 kill switch -- reports current on/off state
+// and whether the Phase 2 Fire URL/token are configured, without flipping anything.
+app.get("/internal/jobs/retire-sync-status", async (req, res) => {
+  try {
+    const enabled = await retireSyncEnabled();
+    res.json({
+      ok: true,
+      enabled,
+      slipReaderV2FireConfigured: !!(SLIP_READER_V2_FIRE_URL && SLIP_READER_V2_FIRE_TOKEN),
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
