@@ -76,6 +76,42 @@ test("pullCbbdHistoricalLinesForSeason: happy path writes normalized rows and re
   assert.equal(written[0].game_id, "cbbd-1");
 });
 
+test("pullCbbdHistoricalLinesForSeason: dedupes multiple top-level entries sharing the same game id (one per provider), as CBBD's live API actually returns", async () => {
+  // This is the real live shape discovered 2026-11-06 -- NOT the one-entry-per-game shape
+  // originally assumed. Same `id` repeats across entries, each carrying one provider's line.
+  const games = [
+    {
+      id: 42,
+      season: 2025,
+      startDate: "2025-11-10",
+      homeTeam: "Duke",
+      awayTeam: "Kansas",
+      lines: [{ provider: "consensus", spread: -3, overUnder: 144, homeMoneyline: -180, awayMoneyline: 155 }],
+    },
+    {
+      id: 42,
+      season: 2025,
+      startDate: "2025-11-10",
+      homeTeam: "Duke",
+      awayTeam: "Kansas",
+      lines: [{ provider: "DraftKings", spread: -4.5, overUnder: 145.5, homeMoneyline: -200, awayMoneyline: 170 }],
+    },
+  ];
+  let written = null;
+  const result = await pullCbbdHistoricalLinesForSeason(2025, {
+    getJson: async () => games,
+    upsertRows: async (rows) => {
+      written = rows;
+    },
+  });
+  assert.equal(result.gamesFound, 2);
+  assert.equal(result.rowsWritten, 1, "must collapse to exactly one row per game id");
+  assert.equal(written.length, 1);
+  assert.equal(written[0].game_id, "cbbd-42");
+  assert.equal(written[0].provider, "DraftKings", "merged lines, then preferred DK over consensus");
+  assert.equal(written[0].home_spread, -4.5);
+});
+
 test("pullCbbdHistoricalLinesForSeason: records a fetch error instead of throwing", async () => {
   const result = await pullCbbdHistoricalLinesForSeason(2025, {
     getJson: async () => {

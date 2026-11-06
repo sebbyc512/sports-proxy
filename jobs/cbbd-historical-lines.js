@@ -54,6 +54,28 @@ export function normalizeCbbdGame(game) {
 // jobs/closing-lines.js. `season` is CBBD's convention: the year the season STARTS (e.g.
 // 2025 for the 2025-26 season) -- matches this repo's seasonForDate() start-year convention
 // in jobs/util.js.
+// BUG FIX 2026-11-06: CBBD's real /lines response does NOT match the one-entry-per-game
+// shape assumed above (confirmed live: upserting on_conflict=game_id threw Postgres error
+// 21000 "ON CONFLICT DO UPDATE command cannot affect row a second time", which only happens
+// when the SAME conflict key appears twice in one insert batch). The live API returns
+// multiple top-level entries sharing the same `id` -- apparently one entry per (game,
+// provider) rather than one entry per game with a nested multi-provider `lines` array. Fix:
+// group all entries by `id` first and merge their `lines` arrays before picking a preferred
+// provider, so every game is normalized exactly once. A final dedupe-by-game_id right before
+// the upsert is kept as a defensive backstop regardless of the root cause.
+function groupCbbdGamesById(games) {
+  const byId = new Map();
+  for (const g of games) {
+    const existing = byId.get(g.id);
+    if (!existing) {
+      byId.set(g.id, { ...g, lines: Array.isArray(g.lines) ? [...g.lines] : [] });
+    } else {
+      existing.lines.push(...(Array.isArray(g.lines) ? g.lines : []));
+    }
+  }
+  return [...byId.values()];
+}
+
 export async function pullCbbdHistoricalLinesForSeason(season, deps) {
   const result = { season, gamesFound: 0, rowsWritten: 0, skipped: [] };
   let games;
@@ -69,15 +91,17 @@ export async function pullCbbdHistoricalLinesForSeason(season, deps) {
   }
   result.gamesFound = games.length;
 
-  const rows = [];
-  for (const g of games) {
+  const grouped = groupCbbdGamesById(games);
+  const rowsByGameId = new Map();
+  for (const g of grouped) {
     const row = normalizeCbbdGame(g);
     if (!row) {
       result.skipped.push({ id: g.id, reason: "no usable line" });
       continue;
     }
-    rows.push(row);
+    rowsByGameId.set(row.game_id, row); // defensive: last-wins if game_id still collides
   }
+  const rows = [...rowsByGameId.values()];
   if (rows.length) await deps.upsertRows(rows);
   result.rowsWritten = rows.length;
   return result;
