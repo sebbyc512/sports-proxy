@@ -34,3 +34,5 @@ sql/schedule-context-cron-run-me.sql
 sql/nhl-player-logs-cron-run-me.sql
 sql/soccer-form-cron-run-me.sql
 sql/cbb-daily-form-cron-run-me.sql
+sql/nflverse-cron-run-me.sql
+sql/nhl-moneypuck-cron-run-me.sql

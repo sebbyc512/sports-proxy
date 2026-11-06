@@ -2864,6 +2864,62 @@ app.post("/telegram/webhook", async (req, res) => {
           message_id: cq.message.message_id,
           text: `${cq.message.text}\n\n${action === "balok" ? "✅ Approved" : "❌ Rejected"}`,
         });
+      } else if ((action === "fixok" || action === "fixno") && desk && requestId) {
+        // Approve-to-fix (2026-11-06) -- see the "Approve-to-fix via Telegram" section
+        // further down (function declarations are hoisted) for proposeApproveFix /
+        // APPROVE_FIX_ACTIONS. One-time use, 6h expiry, every action logged, Seb-only
+        // (already enforced by the isSebChat check above this whole block).
+        const incidentDoc = await getDoc(desk, "approveFixIncidents", requestId);
+        const incident = incidentDoc?.data;
+        if (!incident) {
+          await telegramApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Not found (may have already been handled).", show_alert: true });
+          return res.json({ ok: true });
+        }
+        if (incident.status !== "pending") {
+          await telegramApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Already handled.", show_alert: true });
+          return res.json({ ok: true });
+        }
+        if (Date.now() > new Date(incident.expiresAt).getTime()) {
+          await mergeUpsertDoc(desk, "approveFixIncidents", requestId, { status: "expired" });
+          await telegramApi("answerCallbackQuery", { callback_query_id: cq.id, text: "This expired (6h). Nothing was run.", show_alert: true });
+          await telegramApi("editMessageText", {
+            chat_id: cq.message.chat.id,
+            message_id: cq.message.message_id,
+            text: `${cq.message.text}\n\n⏱ Expired -- nothing was run.`,
+          });
+          return res.json({ ok: true });
+        }
+
+        if (action === "fixno") {
+          await mergeUpsertDoc(desk, "approveFixIncidents", requestId, { status: "skipped", decidedAt: new Date().toISOString(), decidedBy: "seb-telegram" });
+          await upsertDoc(desk, "approveFixLog", `${requestId}-decision`, { incidentId: requestId, kind: incident.kind, actionKey: incident.actionKey, decision: "skipped", at: new Date().toISOString() });
+          await telegramApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Skipped." });
+          await telegramApi("editMessageText", { chat_id: cq.message.chat.id, message_id: cq.message.message_id, text: `${cq.message.text}\n\n❌ Skipped` });
+          return res.json({ ok: true });
+        }
+
+        // fixok -- mark approved FIRST (before running anything) so a double-tap can never
+        // run the same whitelisted action twice.
+        await mergeUpsertDoc(desk, "approveFixIncidents", requestId, { status: "approved", decidedAt: new Date().toISOString(), decidedBy: "seb-telegram" });
+        await telegramApi("answerCallbackQuery", { callback_query_id: cq.id, text: "Approved -- running the fix..." });
+        await telegramApi("editMessageText", { chat_id: cq.message.chat.id, message_id: cq.message.message_id, text: `${cq.message.text}\n\n✅ Approved -- running...` });
+
+        let runResult;
+        try {
+          const fn = APPROVE_FIX_ACTIONS[incident.actionKey];
+          if (!fn) throw new Error(`unknown actionKey "${incident.actionKey}"`);
+          runResult = await fn(desk, incident.actionParams);
+        } catch (err) {
+          runResult = { ok: false, detail: err.message };
+        }
+
+        const finalStatus = runResult.ok ? "done" : "failed";
+        await mergeUpsertDoc(desk, "approveFixIncidents", requestId, { status: finalStatus, result: runResult.detail });
+        await upsertDoc(desk, "approveFixLog", `${requestId}-result`, {
+          incidentId: requestId, kind: incident.kind, actionKey: incident.actionKey, decision: "approved", result: runResult, at: new Date().toISOString(),
+        });
+        const resultText = runResult.ok ? "done ✓" : "failed — left as is";
+        await telegramApi("sendMessage", { chat_id: TELEGRAM_SEB_CHAT_ID, text: resultText });
       } else {
         await telegramApi("answerCallbackQuery", { callback_query_id: cq.id });
       }
@@ -2912,6 +2968,138 @@ app.get("/internal/telegram/set-webhook", async (req, res) => {
     res.json({ ok: true, webhookUrl, result });
   } catch (err) {
     res.status(502).json({ error: err.message });
+  }
+});
+
+// --- Approve-to-fix via Telegram (2026-11-06, Seb's request) -------------------------
+// ADDITIVE ONLY: nothing in self-heal / balance-guard / stuck-bet-gate / sync-needed /
+// retire-the-sync above is touched or changed by this. Those keep auto-fixing exactly as
+// they already do. This is a SEPARATE, manually-triggered path: call
+// POST /internal/jobs/approve-fix/propose to raise one incident, Seb gets a plain-
+// language DM with Approve/Skip, and ONLY on a tap does any of the 6 whitelisted actions
+// below actually run. No improvised code, no rule changes -- every action is one of these
+// fixed, pre-written functions. Confirmed with Seb (2026-11-06): additive / zero behavior
+// change to the existing live jobs is the intended design.
+const APPROVE_FIX_EXPIRY_MS = 6 * 60 * 60 * 1000; // 6 hours
+const APPROVE_FIX_DESKS = new Set(["main", "steve"]);
+
+// Each entry: plain-language "what's wrong" template is supplied by the caller of propose()
+// (never generated here with $ amounts or jargon, per Seb's ask) -- this table only holds the
+// EXECUTE function for when Approve is tapped. Every function is read from this fixed object,
+// never constructed from request input.
+const APPROVE_FIX_ACTIONS = {
+  // balance drift -> ledger-diff repair for that desk (restores ONLY the doc(s) ledgerDiffDesk
+  // itself already labels SUSPICIOUS against the last good snapshot -- never a blanket revert).
+  balanceDrift: async (desk) => {
+    const result = await ledgerDiffDesk(desk, { repair: true });
+    return { ok: true, detail: { restored: result.repaired?.length || 0, suspicious: result.suspicious?.length || 0 } };
+  },
+  // request stuck after retries -> re-fire that desk's builder (same function the cooldown/
+  // retry jobs already call automatically).
+  refireBuilder: async (desk) => {
+    const r = await triggerBuilderFire(desk, "APPROVED_FIX");
+    return { ok: true, detail: r };
+  },
+  // appUpload/appEdit stuck -> retry it. Params: {collection: "appEdits"|"appUploads", docId}.
+  // A manual approval bypasses the normal retry-count/cooldown caps on purpose -- Seb looked at
+  // it and said go, so this always resets the doc to "pending" and clears any prior give-up.
+  retryAppDoc: async (desk, params) => {
+    const { collection, docId } = params || {};
+    if (!["appEdits", "appUploads"].includes(collection) || !docId) {
+      return { ok: false, detail: "retryAppDoc needs {collection: appEdits|appUploads, docId}" };
+    }
+    await mergeUpsertDoc(desk, collection, docId, {
+      status: "pending",
+      retryGaveUp: false,
+      retryCount: 0,
+      lastRetryAt: new Date().toISOString(),
+      approvedFixAt: new Date().toISOString(),
+    });
+    return { ok: true, detail: { collection, docId, setTo: "pending" } };
+  },
+  // Phase 1 errors -> set retireSync OFF (same flag doc Phase 1/2 already check live, no
+  // redeploy needed -- see retireSyncEnabled() above).
+  retireSyncOff: async () => {
+    await upsertDoc("main", "systemFlags", "retireSync", { enabled: false, turnedOffBy: "approve-to-fix", turnedOffAt: new Date().toISOString() });
+    return { ok: true, detail: "systemFlags/retireSync.enabled = false" };
+  },
+  // a data job failing 3x / crashing -> disable that one job's flag. Params: {jobName}.
+  // NOTE (be upfront about this): this only writes the flag doc -- today nothing in
+  // sports-proxy or sports-proxy-daily-data reads a per-job "job-<name>" flag yet, so
+  // disabling a job this way has no live effect until that job's own loop is wired to check
+  // it. Safe to write (it's inert), but don't rely on it to actually stop a job until that
+  // follow-up lands.
+  disableJobFlag: async (_desk, params) => {
+    const { jobName } = params || {};
+    if (!jobName) return { ok: false, detail: "disableJobFlag needs {jobName}" };
+    await upsertDoc("main", "systemFlags", `job-${jobName}`, { enabled: false, disabledBy: "approve-to-fix", disabledAt: new Date().toISOString() });
+    return { ok: true, detail: `systemFlags/job-${jobName}.enabled = false (not yet consumed by any job loop)` };
+  },
+  // bet ungraded 2h+ after game end -> grade from final scores. Runs the SAME live grading
+  // pass the grader cron already runs (gradeCollectionForDesk, mode "live") -- never a second
+  // grading formula.
+  gradeFromFinalScores: async (desk) => {
+    const graded = await gradeCollectionForDesk(desk, "pnlEntries", "live");
+    return { ok: true, detail: { gradedCount: graded.length } };
+  },
+  // Inert on purpose -- used ONLY for the one-time test DM Seb asked for before any real
+  // incident type is wired up. Touches nothing.
+  test: async () => ({ ok: true, detail: "test action -- no real effect" }),
+};
+
+function approveFixId(desk, kind) {
+  return `af-${desk}-${kind}-${Date.now()}`;
+}
+
+// plainWhat/plainFix must already be plain language with no $ amounts and no technical
+// jargon -- callers (not this function) are responsible for that, per Seb's ask.
+async function proposeApproveFix({ desk, kind, actionKey, actionParams, plainWhat, plainFix, dryRun = true }) {
+  if (!APPROVE_FIX_DESKS.has(desk)) throw new Error(`unknown desk: ${desk}`);
+  if (!APPROVE_FIX_ACTIONS[actionKey]) throw new Error(`unknown actionKey: ${actionKey}`);
+  if (!plainWhat || !plainFix) throw new Error("plainWhat and plainFix are both required");
+
+  const incidentId = approveFixId(desk, kind);
+  const now = Date.now();
+  const doc = {
+    desk,
+    kind,
+    actionKey,
+    actionParams: actionParams || {},
+    plainWhat,
+    plainFix,
+    status: "pending",
+    createdAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + APPROVE_FIX_EXPIRY_MS).toISOString(),
+  };
+
+  if (dryRun) return { dryRun: true, wouldSend: true, incidentId, ...doc };
+
+  await upsertDoc(desk, "approveFixIncidents", incidentId, doc);
+  const text = `${plainWhat}\n\nProposed fix: ${plainFix}`;
+  const sent = await telegramApi("sendMessage", {
+    chat_id: TELEGRAM_SEB_CHAT_ID,
+    text,
+    reply_markup: {
+      inline_keyboard: [[
+        { text: "✅ Approve", callback_data: `fixok:${desk}:${incidentId}` },
+        { text: "❌ Skip", callback_data: `fixno:${desk}:${incidentId}` },
+      ]],
+    },
+  });
+  await mergeUpsertDoc(desk, "approveFixIncidents", incidentId, { messageId: sent.message_id });
+  return { dryRun: false, sent: true, incidentId };
+}
+
+// kind is free-form (used only for logging/labeling); actionKey must be one of
+// APPROVE_FIX_ACTIONS above. dryRun defaults true, same convention as every other job here --
+// nothing is ever sent/run unless the caller explicitly passes dryRun:false.
+app.post("/internal/jobs/approve-fix/propose", async (req, res) => {
+  try {
+    const { desk, kind, actionKey, actionParams, plainWhat, plainFix, dryRun = true } = req.body || {};
+    const result = await proposeApproveFix({ desk, kind, actionKey, actionParams, plainWhat, plainFix, dryRun });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 
